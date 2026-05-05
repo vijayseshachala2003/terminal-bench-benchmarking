@@ -86,12 +86,35 @@ Each run folder contains a `result.json`. Every run is classified into one of th
 
 ---
 
+## Post-sanity results (`post_sanity_results/`)
+
+The [`post_sanity_results/`](./post_sanity_results/) directory holds **one JSON file per evaluated task** (11 files, same task names as in [Tasks Evaluated](#tasks-evaluated)). Each file is a **post-run sanity summary**: how failures distribute across trials, whether the task looks sound versus underspecified, and structured evidence from runs.
+
+Typical fields in each `{task_name}.json`:
+
+| Field | Meaning |
+|-------|---------|
+| `task` | Task id (matches directory name) |
+| `total_trials` | Number of runs summarized |
+| `total_failed` | Count of failed trials |
+| `pass_rate` | Aggregate pass rate string |
+| `outcome` | High-level sanity outcome (e.g. whether the task passes sanity checks) |
+| `explanation` | Short narrative on failure patterns and task quality |
+| `consistent_failures` | Failures that show up across trials |
+| `trials_evidence` | Per-trial rows: model, paths to trajectories, failed/passed tests, messages |
+
+Use these files to review **whether failures look like legitimate task difficulty versus specification or harness issues**, without opening every `result.json` by hand.
+
+---
+
 ## Folder Structure
 
 ```
 jobs_new/
-├── results/                          ← you are here
-│   ├── README.md                     ← this file
+├── README.md                         ← this file (repo root)
+├── post_sanity_results/              ← per-task post-sanity summaries (JSON)
+│   └── {task_name}.json
+├── results/
 │   └── {task_name}/README.md         ← per-task breakdown (11 files)
 ├── 2026-04-30__11-18-27/
 │   ├── config.json                   ← job configuration
