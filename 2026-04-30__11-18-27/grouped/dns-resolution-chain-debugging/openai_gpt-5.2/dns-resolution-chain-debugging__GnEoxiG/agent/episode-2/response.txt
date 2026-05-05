@@ -1,0 +1,139 @@
+{
+  "analysis": "Edits partially applied: directory paths are now under /app/dns/*/cache (good). However, TSIG secrets in transfer.key (and thus in named.conf) are not valid base64, so named-checkconf still fails on both primary and secondary. The attempted perl one-liners to splice key blocks failed due to quoting/newline issues, but the key files themselves contain the same invalid-looking secrets. Resolver now fails because a stray token 'BUG:' exists in resolver named.conf (likely an uncommented note line). DNSSEC re-signing wasn’t reached due to earlier failures. Next: generate a valid TSIG secret and update both primary/secondary key blocks (and optionally key files) to match; remove the 'BUG:' line from resolver config; then proceed with DNSSEC keygen/signing and service start/verification.",
+  "plan": "1) Inspect resolver named.conf around line 12 and comment/remove the BUG line. 2) Generate a valid base64 TSIG secret (dnssec-keygen -a HMAC-SHA256 -b 256 -n HOST transfer-key) and use it to overwrite both /app/dns/*/keys/transfer.key and the inline key blocks (simplest: include the key file instead of inline, or just paste the generated secret into both named.conf). 3) Re-run named-checkconf for all. 4) Re-sign secure.example.com zone (generate KSK/ZSK, dnssec-signzone) and ensure primary serves the new .signed. 5) Restart all named instances and verify AXFR + test queries + DNSSEC validation.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,80p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -ne 'print unless /BUG:/' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/keys\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f Ktransfer-key.* transfer-key.key transfer-key.private\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-keygen -a HMAC-SHA256 -b 256 -n HOST transfer-key\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "TSIG_SECRET=$(awk '/^Key: /{print $2}' Ktransfer-key.*.private | head -n1); echo \"$TSIG_SECRET\" | wc -c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/primary/keys/transfer.key <<EOF\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"$TSIG_SECRET\";\n};\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/secondary/keys/transfer.key <<EOF\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"$TSIG_SECRET\";\n};\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[\\s\\S]*?\\};/key \"transfer-key\" {\\n    algorithm hmac-sha256;\\n    secret \"'\"$TSIG_SECRET\"'\";\\n};/m' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[\\s\\S]*?\\};/key \"transfer-key\" {\\n    algorithm hmac-sha256;\\n    secret \"'\"$TSIG_SECRET\"'\";\\n};/m' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f Ksecure.example.com.*.key Ksecure.example.com.*.private dsset-secure.example.com. keyset-secure.example.com. secure.example.com.zone.signed secure.example.com.zone.signed.jnl\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-keygen -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dnssec-keygen -f KSK -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "KSK=$(ls Ksecure.example.com.*KSK*.key | sed 's/\\.key$//' | head -n1); ZSK=$(ls Ksecure.example.com.*.key | grep -v KSK | sed 's/\\.key$//' | head -n1); echo \"KSK=$KSK\"; echo \"ZSK=$ZSK\"\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-signzone -o secure.example.com -N increment -t -k \"$KSK\" secure.example.com.zone \"$ZSK\"\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | egrep 'status:|flags:|secure\\.example\\.com\\.|RRSIG|DNSKEY' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

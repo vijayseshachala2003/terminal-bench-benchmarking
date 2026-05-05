@@ -1,0 +1,207 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@6d803280dd6e:/app# cat /app/app/indexer.py
+import os
+import hashlib
+import sqlite3
+import unicodedata
+import tempfile
+import fnmatch
+import re
+
+
+def _parse_ignore_patterns(ignore_path="/data/ignore.txt"):
+    """Parse ignore patterns from file. Returns list of (pattern_nfc, match_type) tuples.
+    match_type: 'rooted' (leading /), 'basename' (no / in pattern), 'free' (contains / but no leading /)
+    """
+    patterns = []
+    try:
+        with open(ignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n").rstrip("\r")
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pat = line.strip()
+                if not pat:
+                    continue
+                # NFC normalize
+                pat = unicodedata.normalize("NFC", pat)
+                if pat.startswith("/"):
+                    # Rooted pattern: match against full relative path
+                    pat = pat[1:]  # strip leading /
+                    patterns.append((pat, "rooted"))
+                elif "/" in pat:
+                    # Contains / but no leading /: match full path or any suffix after /
+                    patterns.append((pat, "free"))
+                else:
+                    # No /: match against each path component
+                    patterns.append((pat, "basename"))
+    except (FileNotFoundError, OSError):
+        pass
+    return patterns
+
+
+def _pattern_to_regex(pattern):
+    """Convert a pattern with * (but not **) to a regex.
+    * matches zero or more non-slash characters.
+    ** is two literal * characters (match literal **).
+    All other characters are escaped.
+    """
+    # We need to handle ** as literal two stars.
+    # Strategy: first replace ** with a placeholder, then handle *, then restore.
+    # Actually, let's parse character by character.
+    result = []
+    i = 0
+    while i < len(pattern):
+        if i + 1 < len(pattern) and pattern[i] == '*' and pattern[i+1] == '*':
+            # ** means literal two * characters
+            result.append(re.escape('**'))
+            i += 2
+        elif pattern[i] == '*':
+            # single * matches zero or more non-slash chars
+            result.append('[^/]*')
+            i += 1
+        else:
+            result.append(re.escape(pattern[i]))
+            i += 1
+    return ''.join(result)
+
+
+def _should_ignore(rel_path_nfc, patterns):
+    """Check if a NFC-normalized relative path should be ignored.
+    rel_path_nfc uses / as separator.
+    """
+    components = rel_path_nfc.split("/")
+    for pat, match_type in patterns:
+        regex = _pattern_to_regex(pat)
+        if match_type == "basename":
+            # Match against each path component
+            for comp in components:
+                if re.fullmatch(regex, comp):
+                    return True
+        elif match_type == "rooted":
+            # Match against the full relative path only
+            if re.fullmatch(regex, rel_path_nfc):
+                return True
+        elif match_type == "free":
+            # Match against full relative path or any suffix starting after /
+            if re.fullmatch(regex, rel_path_nfc):
+                return True
+            # Try suffixes: for path a/b/c/d, try b/c/d, c/d, d
+            for idx in range(len(components) - 1):
+                suffix = "/".join(components[idx + 1:])
+                if re.fullmatch(regex, suffix):
+                    return True
+    return False
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash of file contents, return lowercase hex string and size."""
+    h = hashlib.sha256()
+    size = 0
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    patterns = _parse_ignore_patterns()
+
+    # Collect all files: {nfc_rel_path: (original_rel_path, abs_path)}
+    # For unicode collisions, keep the entry with the largest original rel path
+    file_map = {}
+
+    # os.walk with followlinks=False (default) to not follow symlinks for dirs
+    # But we also need to skip symlink files
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Remove symlinked directories from dirnames to prevent traversal
+        dirnames[:] = [
+            d for d in dirnames
+            if not os.path.islink(os.path.join(dirpath, d))
+        ]
+        # Sort dirnames for deterministic traversal
+        dirnames.sort()
+
+        for filename in filenames:
+            abs_path = os.path.join(dirpath, filename)
+            # Skip symlinks
+            if os.path.islink(abs_path):
+                continue
+
+            # Compute relative path with forward slashes
+            rel_path = os.path.relpath(abs_path, root_dir)
+            rel_path = rel_path.replace(os.sep, "/")
+
+            # NFC normalize
+            rel_path_nfc = unicodedata.normalize("NFC", rel_path)
+
+            # Check ignore patterns
+            if _should_ignore(rel_path_nfc, patterns):
+                continue
+
+            # Handle unicode collisions: keep largest original rel_path
+            if rel_path_nfc in file_map:
+                existing_orig, existing_abs = file_map[rel_path_nfc]
+                if rel_path > existing_orig:
+                    file_map[rel_path_nfc] = (rel_path, abs_path)
+            else:
+                file_map[rel_path_nfc] = (rel_path, abs_path)
+
+    # Build rows sorted by NFC path for determinism
+    rows = []
+    for nfc_path in sorted(file_map.keys()):
+        orig_rel, abs_path = file_map[nfc_path]
+        try:
+            sha256_hex, size = _hash_file(abs_path)
+        except (OSError, IOError):
+            continue
+        rows.append((nfc_path, sha256_hex, size))
+
+    # Write to a temporary database file, then atomically rename to db_path
+    # This ensures concurrency safety: each writer creates its own temp file
+    # and the final rename is atomic on the same filesystem.
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(db_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+    os.close(fd)
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute(
+                "CREATE TABLE files ("
+                "path TEXT PRIMARY KEY, "
+                "sha256 TEXT NOT NULL, "
+                "size INTEGER NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO files VALUES (?, ?, ?)",
+                rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        # Atomic rename
+        os.replace(tmp_path, db_path)
+    except BaseException:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+root@6d803280dd6e:/app# python3 -c "import app.indexer; print('Module imports OK')"
+Module imports OK
+root@6d803280dd6e:/app#

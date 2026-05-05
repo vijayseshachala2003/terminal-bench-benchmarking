@@ -1,0 +1,213 @@
+New Terminal Output:
+
+root@3949dbffe080:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+oot_dir, followlinks=False):
+        # Filter out symlinked directories from dirn> import unicodedata
+> import fnmatch
+> import tempfile
+> import shutil
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read ignore patterns from file, return list of NFC-normalized patterns."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 # Normalize pattern to NFC
+>                 pat = unicodedata.normalize("NFC", line.rstrip())
+>                 patterns.append(pat)
+>     except (OSError, IOError):
+>         pass
+>     return patterns
+e(os.sep, "/")
+
+            # NFC normalize
+            rel_path_nfc = unicodedata.normal>
+>
+> def _pattern_match(pattern, text):
+>     """
+>     Match pattern against text where * matches zero or more non-/ characters.
+>     ** is treated as two literal * characters (matching zero or more non-/ chars each).
+>
+>     We implement this by translating to a regex-like approach using fnmatch style,
+>     but fnmatch treats * as matching everything including /, so we do our own.
+>     """
+>     import re
+>     # Translate pattern to regex
+>     # * matches any character except /
+>     # ? would match any single character except / but the spec doesn't mention ?
+>     # We'll treat ? as literal since spec only mentions *
+>     i = 0
+>     regex = "^"
+>     while i < len(pattern):
+>         c = pattern[i]
+>         if c == '*':
+>             regex += "[^/]*"
+>             i += 1
+>         elif c in r"\.+^${}()|[]":
+>             regex += "\\" + c
+>             i += 1
+>         elif c == '?':
+>             # Treat ? as matching any single non-/ character (common glob behavior)
+>             regex += "[^/]"
+>             i += 1
+>         else:
+>             regex += c
+>             i += 1
+>     regex += "$"
+>     try:
+>         return re.match(regex, text) is not None
+>     except re.error:
+>         return False
+>
+>
+> def _should_ignore(rel_path_nfc, patterns):
+>     """
+>     Check if a NFC-normalized relative path should be ignored based on patterns.
+>     rel_path_nfc uses / as separator.
+>     """
+>     components = rel_path_nfc.split("/")
+>
+>     for pat in patterns:
+>         if pat.startswith("/"):
+>             # Rule 1: Leading / means match only against full relative path
+>             stripped_pat = pat[1:]
+>             if _pattern_match(stripped_pat, rel_path_nfc):
+>                 return True
+>         elif "/" in pat:
+>             # Rule 3: Contains / but doesn't start with /
+>             # Match against full relative path OR any suffix starting after a / boundary
+>             if _pattern_match(pat, rel_path_nfc):
+>                 return True
+>             # Try matching against suffixes
+>             for i, c in enumerate(rel_path_nfc):
+>                 if c == "/":
+>                     suffix = rel_path_nfc[i+1:]
+>                     if _pattern_match(pat, suffix):
+>                         return True
+>         else:
+>             # Rule 2: No / in pattern - match against each path component
+>             for comp in components:
+>                 if _pattern_match(pat, comp):
+>                     return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of file contents, return lowercase hex string."""
+>     h = hashlib.sha256()
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>     return h.hexdigest()
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     ignore_patterns = _read_ignore_patterns()
+>
+>     # Normalize root_dir to absolute path
+>     root_dir = os.path.abspath(root_dir)
+>
+>     # Collect all files: map from NFC relative path -> (original_rel_path, full_path)
+>     # For Unicode collisions, keep the entry with lexicographically largest original rel path
+>     nfc_map = {}  # nfc_rel_path -> (original_rel_path_str, full_filesystem_path)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories from dirnames (in-place modification)
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         # Sort dirnames for deterministic traversal
+>         dirnames.sort()
+>
+>         for filename in sorted(filenames):
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Compute relative path with forward slashes
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, "/")
+>
+>             # NFC normalize
+>             rel_path_nfc = unicodedata.normalize("NFC", rel_path)
+>
+>             # Check ignore patterns (using NFC path)
+>             if _should_ignore(rel_path_nfc, ignore_patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original rel path
+>             if rel_path_nfc in nfc_map:
+>                 existing_orig = nfc_map[rel_path_nfc][0]
+>                 if rel_path > existing_orig:
+>                     nfc_map[rel_path_nfc] = (rel_path, full_path)
+>             else:
+>                 nfc_map[rel_path_nfc] = (rel_path, full_path)
+>
+>     # Now hash all files and prepare rows
+>     rows = []
+>     for nfc_path in sorted(nfc_map.keys()):
+>         orig_rel, full_path = nfc_map[nfc_path]
+>         try:
+>             size = os.path.getsize(full_path)
+>             sha = _hash_file(full_path)
+>             rows.append((nfc_path, sha, size))
+>         except (OSError, IOError):
+>             # Skip files that can't be read
+>             continue
+>
+>     # Write to database using a temp file then atomic rename for concurrency safety
+>     # Use a temp file in the same directory as db_path so os.replace works atomically
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=FULL")
+>             conn.execute(
+>                 "CREATE TABLE files ("
+>                 "path TEXT PRIMARY KEY, "
+>                 "sha256 TEXT NOT NULL, "
+>                 "size INTEGER NOT NULL)"
+>             )
+>             conn.executemany(
+>                 "INSERT INTO VALUES (?, ?, ?)",
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         # Atomic replace
+>         os.replace(tmp_path, os.path.abspath(db_path))
+>     except Exception:
+>         # Clean up temp file on error
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> PYTHON_EOF
+root@3949dbffe080:/app# python3 -c "from app.indexer import build_index; print('Import OK')"
+Import OK
+root@3949dbffe080:/app#

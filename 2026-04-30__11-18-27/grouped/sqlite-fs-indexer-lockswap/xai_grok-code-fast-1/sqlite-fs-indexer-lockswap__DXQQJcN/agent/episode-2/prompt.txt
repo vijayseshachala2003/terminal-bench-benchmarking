@@ -1,0 +1,110 @@
+Current terminal state:
+New Terminal Output:
+
+root@3c2a5e399408:/app# cat > app/indexer.py << 'EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import re
+> from typing import List, Tuple
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     # Read ignore patterns
+>     ignore_patterns = []
+>     ignore_path = '/data/ignore.txt'
+>     if os.path.exists(ignore_path):
+>         with open(ignore_path, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip()
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 pattern = unicodedata.normalize('NFC', line)
+>                 ignore_patterns.append(pattern)
+>
+>     # Collect files
+>     files = {}  # nfc_path -> (original_rel, full_path)
+>     def collect(root: str, rel_prefix: str = '') -> None:
+>         try:
+>             entries = os.scandir(root)
+>         except PermissionError:
+>             return
+>         for entry in entries:
+>             if os.islink(entry.path):
+>                 continue
+>             rel = rel_prefix + entry.name
+>             nfc_rel = unicodedata.normalize('NFC', rel)
+>             full = entry.path
+>             if entry.is_dir():
+>                 collect(full, rel + '/')
+>             else:
+>                 if nfc_rel in files:
+>                     if rel > files[nfc_rel][0]:
+>                         files[nfc_rel] = (rel, full)
+>                 else:
+>                     files[nfc_rel] = (rel, full)
+>
+>     collect(root_dir)
+>
+>     # Filter ignores
+>     def matches_ignore(rel_path: str) -> bool:
+>         for pattern in ignore_patterns:
+>             if should_ignore(rel_path, pattern):
+>                 return True
+>         return False
+>
+>     def should_ignore(rel_path: str, pattern: str) -> bool:
+>         placeholder = '\x00'
+>         pat = pattern.replace('**', placeholder)
+>         pat = re.escape(pat)
+>         pat = pat.replace(r'\\*', r'[^/]*')
+>         pat = pat.replace(placeholder, r'\\*\\*')
+>         regex = re.compile('^' + pat + '$')
+>         if pattern.startswith('/'):
+>             stripped = pattern[1:]
+>             pat_s = stripped.replace('**', placeholder)
+>             pat_s = re.escape(pat_s)
+>             pat_s = pat_s.replace(r'\\*', r'[^/]*')
+>             pat_s = pat_s.replace(placeholder, r'\\*\\*')
+>             regex_s = re.compile('^' + pat_s + '$')
+>             if regex_s.fullmatch(rel_path):
+>                 return True
+>         elif '/' not in pattern:
+>             for comp in rel_path.split('/'):
+>                 if regex.fullmatch(comp):
+>                     return True
+>         else:
+>             if regex.fullmatch(rel_path):
+>                 return True
+>             if rel_path.endswith('/' + pattern):
+>                 return True
+>         return False
+>
+>     filtered = {k: v for k, v in files.items() if not matches_ignore(k)}
+>
+>     # Build temp db
+>     import tempfile
+>     with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp:
+>         temp_path = tmp.name
+>     conn = sqlite3.connect(temp_path)
+>     conn.execute('PRAGMA journal_mode=WAL')
+>     conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')
+>     conn.commit()
+>     for nfc_path, (orig, full_path) in sorted(filtered.items()):
+>         try:
+>             with open(full_path, 'rb') as f:
+>                 data = f.read()
+>                 sha = hashlib.sha256(data).hexdigest()
+>                 size = len(data)
+>             conn.execute('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)', (nfc_path, sha, size))
+>         except (PermissionError, OSError):
+>             pass
+>     conn.commit()
+>     conn.close()
+>     os.replace(temp_path, db_path)
+> EOF
+root@3c2a5e399408:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

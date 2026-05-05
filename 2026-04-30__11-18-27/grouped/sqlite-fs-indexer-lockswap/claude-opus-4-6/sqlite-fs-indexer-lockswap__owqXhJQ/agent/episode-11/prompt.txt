@@ -1,0 +1,208 @@
+New Terminal Output:
+
+root@9ab2e6980c83:/app# python3 << 'TESTEOF'
+> import os, sys, sqlite3, unicodedata, tempfile, shutil
+> sys.path.insert(0, '/app')
+> from app.indexer import build_index
+>
+> def test_unicode_collision():
+>     """Test that two filesystem entries producing same NFC path keep the largest original."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         # Create two files that normalize to the same NFC path
+>         # U+00E9 (é) is NFC, U+0065 U+0301 (e + combining accent) is NFD
+>         nfc_name = '\u00e9.txt'  # NFC form
+>         nfd_name = 'e\u0301.txt'  # NFD form
+>
+>         # Both should normalize to the same NFC: é.txt
+>         assert unicodedata.normalize('NFC', nfc_name) == unicodedata.normalize('NFC', nfd_name)
+>
+>         # Create both files (filesystem may or may not allow this)
+>         try:
+>             with open(os.path.join(d, nfc_name), 'w') as f:
+>                 f.write('nfc content')
+>             with open(os.path.join(d, nfd_name), 'w') as f:
+>                 f.write('nfd content')
+>         except OSError:
+>             print('SKIP: filesystem cannot create both NFC and NFD variants')
+>             return
+>
+>         # Check if both files actually exist as separate entries
+>         entries = os.listdir(d)
+>         if len(entries) < 2:
+>             print('SKIP: filesystem merged NFC/NFD into one entry')
+>             return
+>
+>         db = os.path.join(d, 'test.db')
+>         build_index(d, db)
+>
+>         conn = sqlite3.connect(db)
+>         rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+>         conn.close()
+>
+>         # Should have exactly one row with NFC path
+>         assert len(rows) == 1, f'Expected 1 row, got {len(rows)}: {rows}'
+>         assert rows[0][0] == unicodedata.normalize('NFC', nfc_name)
+>         print('PASS: unicode collision test')
+>     finally:
+>         shutil.rmtree(d)
+>
+> def test_ignore_component_pattern():
+>     """Test Rule 2: pattern with no / matches each component."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'sub'))
+>         with open(os.path.join(d, 'keep.txt'), 'w') as f:
+>             f.write('keep')
+>         with open(os.path.join(d, 'sub', 'skip.log'), 'w') as f:
+>             f.write('skip')
+>         with open(os.path.join(d, 'top.log'), 'w') as f:
+>             f.write('skip2')
+>
+>         with open('/data/ignore.txt', 'w') as f:
+>             f.write('*.log\n')
+>
+>         db = os.path.join(d, 'test.db')
+>         build_index(d, db)
+>
+>         conn = sqlite3.connect(db)
+>         rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+>         conn.close()
+>
+>         paths = [r[0] for r in rows]
+>         assert paths == ['keep.txt'], f'Expected [keep.txt], got {paths}'
+>         print('PASS: ignore component pattern test')
+>     finally:
+>         os.unlink('/data/ignore.txt')
+>         shutil.rmtree(d)
+>
+> def test_ignore_leading_slash():
+>     """Test Rule 1: leading / means match full path only."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'sub'))
+>         with open(os.path.join(d, 'foo.txt'), 'w') as f:
+>             f.write('top')
+>         with open(os.path.join(d, 'sub', 'foo.txt'), 'w') as f:
+>             f.write('nested')
+>
+>         with open('/data/ignore.txt', 'w') as f:
+>             f.write('/foo.txt\n')  # Should only match top-level foo.txt
+>
+>         db = os.path.join(d, 'test.db')
+>         build_index(d, db)
+>
+>         conn = sqlite3.connect(db)
+>         rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+>         conn.close()
+>
+>         paths = [r[0] for r in rows]
+>         assert paths == ['sub/foo.txt'], f'Expected [sub/foo.txt], got {paths}'
+>         print('PASS: ignore leading slash test')
+>     finally:
+>         os.unlink('/data/ignore.txt')
+>         shutil.rmtree(d)
+>
+> def test_ignore_with_slash_no_leading():
+>     """Test Rule 3: pattern with / but no leading / matches full path or suffix."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'a', 'b', 'c'))
+>         with open(os.path.join(d, 'a', 'b', 'c', 'file.txt'), 'w') as f:
+>             f.write('deep')
+>         with open(os.path.join(d, 'a', 'top.txt'), 'w') as f:
+>             f.write('top')
+>
+>         with open('/data/ignore.txt', 'w') as f:
+>             f.write('b/c/file.txt\n')  # Should match a/b/c/file.txt via suffix
+>
+>         db = os.path.join(d, 'test.db')
+>         build_index(d, db)
+>
+>         conn = sqlite3.connect(db)
+>         rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+>         conn.close()
+>
+>         paths = [r[0] for r in rows]
+>         assert paths == ['a/top.txt'], f'Expected [a/top.txt], got {paths}'
+>         print('PASS: ignore with slash no leading test')
+>     finally:
+>         os.unlink('/data/ignore.txt')
+>         shutil.rmtree(d)
+>
+> def test_symlinks():
+>     """Test that symlinks are completely ignored."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'real'))
+>         with open(os.path.join(d, 'real', 'file.txt'), 'w') as f:
+>             f.write('real')
+>         os.symlink(os.path.join(d, 'real', 'file.txt'), os.path.join(d, 'link.txt'))
+>         os.symlink(os.path.join(d, 'real'), os.path.join(d, 'linkdir'))
+>
+>         db = os.path.join(d, 'test.db')
+>         build_index(d, db)
+>
+>         conn = sqlite3.connect(db)
+>         rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+>         conn.close()
+>
+>         paths = [r[0] for r in rows]
+>         assert paths == ['real/file.txt'], f'Expected [real/file.txt], got {paths}'
+>         print('PASS: symlinks test')
+>     finally:
+>         shutil.rmtree(d)
+>
+> def test_determinism():
+>     """Two runs produce identical results."""
+>     d = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'b'))
+>         os.makedirs(os.path.join(d, 'a'))
+>         with open(os.path.join(d, 'b', 'z.txt'), 'w') as f:
+>             f.write('z')
+>         with open(os.path.join(d, 'a', 'y.txt'), 'w') as f:
+>             f.write('y')
+>         with open(os.path.join(d, 'c.txt'), 'w') as f:
+>             f.write('c')
+>
+>         db1 = os.path.join(d, 'test1.db')
+>         db2 = os.path.join(d, 'test2.db')
+>         build_index(d, db1)
+>         build_index(d, db2)
+>
+>         conn1 = sqlite3.connect(db1)
+>         conn2 = sqlite3.connect(db2)
+>         rows1 = conn1.execute('SELECT * FROM files ORDER BY path').fetchall()
+>         rows2 = conn2.execute('SELECT * FROM files ORDER BY path').fetchall()
+>         conn1.close()
+>         conn2.close()
+>
+>         assert rows1 == rows2, f'Runs differ:\n{rows1}\n{rows2}'
+>         print('PASS: determinism test')
+>     finally:
+>         shutil.rmtree(d)
+>
+> test_unicode_collision()
+> test_ignore_component_pattern()
+> test_ignore_leading_slash()
+> test_ignore_with_slash_no_leading()
+> test_symlinks()
+> test_determinism()
+> print('\nAll tests passed!')
+> TESTEOF
+PASS: unicode collision test
+PASS: ignore component pattern test
+PASS: ignore leading slash test
+PASS: ignore with slash no leading test
+PASS: symlinks test
+Traceback (most recent call last):
+  File "<stdin>", line 188, in <module>
+  File "<stdin>", line 178, in test_determinism
+AssertionError: Runs differ:
+[('a/y.txt', 'a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa', 1), ('b/z.txt', '594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b
+06', 1), ('c.txt', '2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6', 1)]
+[('a/y.txt', 'a1fce4363854ff888cff4b8e7875d600c2682390412a8cf79b37d0b11148b0fa', 1), ('b/z.txt', '594e519ae499312b29433b7dd8a97ff068defcba9755b6d5d00e84c524d67b
+06', 1), ('c.txt', '2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6', 1), ('test1.db', 'f4aeaa3d418e43f693cd65c998020dc083afef9c0c43619fb8c5fbf
+3fa0ba628', 12288)]
+root@9ab2e6980c83:/app#

@@ -1,0 +1,265 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@1d1687f29edb:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+> import fcntl
+> import re
+>
+>
+> def _nfc(s: str) -> str:
+>     """Normalize a string to Unicode NFC form."""
+>     return unicodedata.normalize('NFC', s)
+>
+>
+> def _read_ignore_patterns(ignore_path: str = '/data/ignore.txt'):
+>     """Read ignore patterns from file. Returns list of (pattern_nfc, pattern_type) tuples.
+>     pattern_type is one of: 'rooted', 'component', 'path_suffix'
+>     """
+>     patterns = []
+>     try:
+>         with open(ignore_path, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.rstrip('\n').rstrip('\r')
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith('#'):
+>                     continue
+>                 pattern = line.strip()
+>                 if not pattern:
+>                     continue
+>                 try:
+>                     pattern = _nfc(pattern)
+>                 except Exception:
+>                     continue
+>                 # Determine pattern type
+>                 if pattern.startswith('/'):
+>                     # Rooted pattern: match against full relative path
+>                     patterns.append((pattern[1:], 'rooted'))
+>                 elif '/' in pattern:
+>                     # Contains slash but doesn't start with /: match full path or any suffix after /
+>                     patterns.append((pattern, 'path_suffix'))
+>                 else:
+>                     # No slash: match against each path component
+>                     patterns.append((pattern, 'component'))
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _pattern_to_regex(pattern: str) -> str:
+>     """Convert a glob pattern to regex string.
+>     * matches zero or more characters except /
+>     ** (two stars) matches literal ** in the path
+>     ? matches any single character except /
+>     [...] character classes work as usual
+>     """
+>     i = 0
+>     n = len(pattern)
+>     res = ''
+>     while i < n:
+>         c = pattern[i]
+>         if c == '*':
+>             if i + 1 < n and pattern[i + 1] == '*':
+>                 # ** matches literal ** in the path
+>                 res += re.escape('*') + re.escape('*')
+>                 i += 2
+>             else:
+>                 res += '[^/]*'
+>                 i += 1
+>         elif c == '?':
+>             res += '[^/]'
+>             i += 1
+>         elif c == '[':
+>             j = i + 1
+>             if j < n and pattern[j] in ('!', '^'):
+>                 j += 1
+>             if j < n and pattern[j] == ']':
+>                 j += 1
+>             while j < n and pattern[j] != ']':
+>                 j += 1
+>             if j >= n:
+>                 res += re.escape(c)
+>                 i += 1
+>             else:
+>                 stuff = pattern[i+1:j]
+>                 i = j + 1
+>                 if stuff and stuff[0] == '!':
+>                     stuff = '^' + stuff[1:]
+>                 res += '[' + stuff + ']'
+>         else:
+>             res += re.escape(c)
+>             i += 1
+>     return res
+>
+>
+> _regex_cache = {}
+>
+> def _fnmatch_custom(name: str, pattern: str) -> bool:
+>     """Match name against pattern with custom glob rules."""
+>     try:
+>         if pattern not in _regex_cache:
+>             _regex_cache[pattern] = re.compile(_pattern_to_regex(pattern))
+>         return _regex_cache[pattern].fullmatch(name) is not None
+>     except re.error:
+>         return False
+>
+>
+> def _is_ignored(rel_path_nfc: str, patterns) -> bool:
+>     """Check if a NFC-normalized relative path should be ignored."""
+>     if not patterns:
+>         return False
+>     components = rel_path_nfc.split('/')
+>     for pattern, ptype in patterns:
+>         try:
+>             if ptype == 'rooted':
+>                 if _fnmatch_custom(rel_path_nfc, pattern):
+>                     return True
+>             elif ptype == 'component':
+>                 for comp in components:
+>                     if _fnmatch_custom(comp, pattern):
+>                         return True
+>             elif ptype == 'path_suffix':
+>                 if _fnmatch_custom(rel_path_nfc, pattern):
+>                     return True
+>                 for idx in range(len(components) - 1):
+>                     suffix = '/'.join(components[idx + 1:])
+>                     if _fnmatch_custom(suffix, pattern):
+>                         return True
+>         except Exception:
+>             continue
+>     return False
+>
+>
+> def _hash_file(filepath: str) -> tuple:
+>     """Compute SHA-256 hash and size of a file. Returns (hex_digest, size)."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, 'rb') as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     root_dir = os.path.abspath(root_dir)
+>     ignore_patterns = _read_ignore_patterns()
+>
+>     # Collect all files: map from nfc_rel_path -> (original_rel_path, abs_path)
+>     # For unicode collisions, keep the entry with largest original rel path
+>     nfc_map = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Compute relative dir path
+>         rel_dir = os.path.relpath(dirpath, root_dir)
+>         if rel_dir == '.':
+>             rel_dir = ''
+>         else:
+>             rel_dir = rel_dir.replace(os.sep, '/')
+>
+>         rel_dir_nfc = _nfc(rel_dir)
+>
+>         # Prune symlinked directories and ignored directories
+>         # Sort for deterministic traversal order
+>         new_dirnames = []
+>         for d in sorted(dirnames):
+>             full_d = os.path.join(dirpath, d)
+>             if os.path.islink(full_d):
+>                 continue
+>             if rel_dir_nfc:
+>                 child_nfc = rel_dir_nfc + '/' + _nfc(d)
+>             else:
+>                 child_nfc = _nfc(d)
+>             if _is_ignored(child_nfc, ignore_patterns):
+>                 continue
+>             new_dirnames.append(d)
+>         dirnames[:] = new_dirnames
+>
+>         for fname in filenames:
+>             full_path = os.path.join(dirpath, fname)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Build relative path with forward slashes
+>             if rel_dir:
+>                 rel_path = rel_dir + '/' + fname
+>             else:
+>                 rel_path = fname
+>
+>             orig_rel = rel_path.replace(os.sep, '/')
+>             rel_path_nfc = _nfc(orig_rel)
+>
+>             # Check ignore
+>             if _is_ignored(rel_path_nfc, ignore_patterns):
+>                 continue
+>
+>             # Handle unicode collisions: keep largest original rel path
+>             if rel_path_nfc in nfc_map:
+>                 existing_orig, _ = nfc_map[rel_path_nfc]
+>                 if orig_rel > existing_orig:
+>                     nfc_map[rel_path_nfc] = (orig_rel, full_path)
+>             else:
+>                 nfc_map[rel_path_nfc] = (orig_rel, full_path)
+>
+>     # Now hash all files and prepare rows, sorted by NFC path for determinism
+>     rows = []
+>     for nfc_path in sorted(nfc_map.keys()):
+>         _, full_path = nfc_map[nfc_path]
+>         try:
+>             hex_digest, size = _hash_file(full_path)
+>             rows.append((nfc_path, hex_digest, size))
+>         except (OSError, IOError):
+>             continue
+>
+>     # Use file locking to serialize concurrent writes to the same db_path
+>     abs_db_path = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(abs_db_path)
+>     os.makedirs(db_dir, exist_ok=True)
+>     lock_path = abs_db_path + '.lock'
+>
+>     with open(lock_path, 'w') as lock_file:
+>         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+>         try:
+>             # Write to a temp file, then atomically rename
+>             fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db.tmp')
+>             os.close(fd)
+>             try:
+>                 conn = sqlite3.connect(tmp_path)
+>                 conn.execute('PRAGMA journal_mode=DELETE')
+>                 conn.execute('PRAGMA synchronous=FULL')
+>                 conn.execute(
+>                     'CREATE TABLE files ('
+>                     '  path TEXT PRIMARY KEY,'
+>                     '  sha256 TEXT NOT NULL,'
+>                     '  size INTEGER NOT NULL'
+>                     ')'
+>                 )
+>                 conn.executemany(
+>                     'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+>                     rows
+>                 )
+>                 conn.commit()
+>                 conn.close()
+>                 os.replace(tmp_path, abs_db_path)
+>             except Exception:
+>                 try:
+>                     os.unlink(tmp_path)
+>                 except OSError:
+>                     pass
+>                 raise
+>         finally:
+>             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+> PYTHON_EOF
+root@1d1687f29edb:/app#

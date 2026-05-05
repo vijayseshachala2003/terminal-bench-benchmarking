@@ -1,0 +1,235 @@
+Current terminal state:
+New Terminal Output:
+
+root@4662ce3cec09:/app# ls -la /app
+total 44
+drwxr-xr-x. 1 root root 16384 Apr 30 09:48 .
+drwxr-xr-x. 1 root root    74 Apr 30 12:40 ..
+-rwxr-xr-x. 1 root root  2454 Apr 30 09:48 generate_sensor_data.sh
+-rw-r--r--. 1 root root  2208 Apr 30 09:48 sensor_001.json
+-rw-r--r--. 1 root root  1810 Apr 30 09:48 sensor_002.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_003.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_004.json
+-rw-r--r--. 1 root root     0 Apr 30 09:48 sensor_empty.json
+-rw-r--r--. 1 root root   181 Apr 30 09:48 sensor_issues_only.json
+-rw-r--r--. 1 root root    79 Apr 30 09:48 sensor_malformed.json
+root@4662ce3cec09:/app# python3 - <<'PY'
+> import os, json, math, glob
+> from collections import defaultdict
+>
+> def is_missing(v):
+>     return v is None or (isinstance(v,str) and v.strip()=="")
+>
+> def to_number(v):
+>     if isinstance(v,(int,float)) and not isinstance(v,bool):
+>         return float(v)
+>     if isinstance(v,str):
+>         s=v.strip()
+>         if s=="":
+>             return None
+>         try:
+>             return float(s)
+>         except Exception:
+>             return None
+>     return None
+>
+> def to_int(v):
+>     if isinstance(v,int) and not isinstance(v,bool):
+>         return int(v)
+>     if isinstance(v,float) and v.is_integer():
+>         return int(v)
+>     if isinstance(v,str):
+>         s=v.strip()
+>         if s=="":
+>             return None
+>         try:
+>             # allow "123" or "123.0"
+>             f=float(s)
+>             if f.is_integer():
+>                 return int(f)
+>         except Exception:
+>             return None
+>     return None
+>
+a> def fmt1(x):
+>     return float(f"{x:.1f}")
+>
+> files = sorted(glob.glob('/app/sensor_*.json'))
+> # Exclude our own output if present
+> files = [f for f in files if os.path.basename(f) != 'sensor_analysis.json']
+>
+> all_rows = []
+e> parsed_rows = []
+> all_device_ids = set()
+> connectivity_issues = []
+> valid_temps = []  # global
+> per_dev_temps = defaultdict(list)
+>
+> for path in files:
+>     try:
+>         with open(path,'r',encoding='utf-8') as fh:
+>             raw = fh.read()
+>     except Exception:
+>         continue
+>     if raw.strip()=="":
+>         # empty file tolerated
+>         continue
+>     try:
+>         data = json.loads(raw)
+>     except Exception:
+>         # malformed tolerated
+>         continue
+>
+>     # normalize to list of readings
+>     readings = None
+>     if isinstance(data, list):
+>         readings = data
+>     elif isinstance(data, dict):
+>         if isinstance(data.get('readings'), list):
+>             readings = data['readings']
+>         elif isinstance(data.get('data'), list):
+>             readings = data['data']
+>         else:
+>             # if dict looks like a single reading, wrap it
+>             if any(k in data for k in ('device_id','timestamp','temperature')):
+>                 readings = [data]
+>     if readings is None:
+>         continue
+>
+>     for row in readings:
+>         if not isinstance(row, dict):
+>             continue
+>         device_id = row.get('device_id')
+>         if device_id is None:
+>             # if no device_id, we can't count device; still can be a connectivity issue but schema requires device_id string
+>             continue
+>         device_id = str(device_id)
+>         all_device_ids.add(device_id)
+>
+>         ts_raw = row.get('timestamp')
+>         temp_raw = row.get('temperature')
+>
+>         missing = False
+>         if is_missing(ts_raw) or is_missing(temp_raw):
+>             missing = True
+>         ts = None if is_missing(ts_raw) else to_int(ts_raw)
+>         temp = None if is_missing(temp_raw) else to_number(temp_raw)
+>
+>         if missing or ts is None or temp is None:
+>             connectivity_issues.append({"device_id": device_id, "issue_type": "missing_data"})
+>             continue
+>
+>         parsed_rows.append((device_id, ts, float(temp)))
+>         valid_temps.append(float(temp))
+>         per_dev_temps[device_id].append(float(temp))
+>
+> # Global stats
+> if valid_temps:
+>     gmin = min(valid_temps)
+>     gmax = max(valid_temps)
+>     gavg = sum(valid_temps)/len(valid_temps)
+>     mean = gavg
+>     var = sum((x-mean)**2 for x in valid_temps)/len(valid_temps)  # population variance
+>     std = math.sqrt(var)
+> else:
+>     gmin = gmax = gavg = None
+>     mean = 0.0
+>     std = 0.0
+>
+> # Anomalies
+> anomalies = []
+> if valid_temps and std > 0:
+>     lo = mean - 2*std
+>     hi = mean + 2*std
+>     for device_id, ts, temp in parsed_rows:
+>         if temp < lo or temp > hi:
+>             anomalies.append({"device_id": device_id, "timestamp": int(ts), "temperature": fmt1(temp)})
+>
+> # Device stats
+> device_stats = []
+> for device_id in sorted(per_dev_temps.keys()):
+>     temps = per_dev_temps[device_id]
+>     if not temps:
+>         continue
+>     device_stats.append({
+>         "device_id": device_id,
+>         "min_temp": fmt1(min(temps)),
+>         "max_temp": fmt1(max(temps)),
+>         "avg_temp": fmt1(sum(temps)/len(temps)),
+>         "reading_count": int(len(temps))
+>     })
+>
+> # Sort anomalies by timestamp asc
+> anomalies.sort(key=lambda a: a.get('timestamp', 0))
+>
+> summary = {
+>     "total_devices": int(len(all_device_ids)),
+>     "total_readings": int(len(valid_temps)),
+>     "min_temperature": fmt1(gmin) if gmin is not None else None,
+>     "max_temperature": fmt1(gmax) if gmax is not None else None,
+>     "avg_temperature": fmt1(gavg) if gavg is not None else None,
+>     "anomaly_count": int(len(anomalies)),
+>     "connectivity_issues_count": int(len(connectivity_issues))
+> }
+>
+> out = {
+>     "device_stats": device_stats,
+>     "anomalies": anomalies,
+>     "connectivity_issues": connectivity_issues,
+>     "summary": summary
+> }
+>
+> with open('/app/sensor_analysis.json','w',encoding='utf-8') as fh:
+>     json.dump(out, fh, indent=2, sort_keys=False)
+>     fh.write("\n")
+>
+> # Text report
+> min_s = f"{summary['min_temperature']:.1f}" if isinstance(summary['min_temperature'], (int,float)) else "N/A"
+> max_s = f"{summary['max_temperature']:.1f}" if isinstance(summary['max_temperature'], (int,float)) else "N/A"
+> avg_s = f"{summary['avg_temperature']:.1f}" if isinstance(summary['avg_temperature'], (int,float)) else "N/A"
+>
+> report = """IOT SENSOR ANALYSIS REPORT
+> ==========================
+> Total Devices: {td}
+> Total Readings: {tr}
+> Temperature Range: {mn}°C to {mx}°C
+> Average Temperature: {av}°C
+> Anomalies Detected: {ac}
+> Connectivity Issues: {cc}
+> ==========================
+> """.format(
+>     td=summary['total_devices'],
+>     tr=summary['total_readings'],
+>     mn=min_s,
+>     mx=max_s,
+>     av=avg_s,
+>     ac=summary['anomaly_count'],
+>     cc=summary['connectivity_issues_count']
+> )
+>
+> with open('/app/sensor_report.txt','w',encoding='utf-8') as fh:
+>     fh.write(report)
+>
+> print("Wrote /app/sensor_analysis.json and /app/sensor_report.txt")
+> PY
+Wrote /app/sensor_analysis.json and /app/sensor_report.txt
+root@4662ce3cec09:/app# ls -la /app/sensor_analysis.json /app/sensor_report.txt
+-rw-r--r--. 1 root root 1886 Apr 30 12:41 /app/sensor_analysis.json
+-rw-r--r--. 1 root root  232 Apr 30 12:41 /app/sensor_report.txt
+root@4662ce3cec09:/app# python3 -c "import json; d=json.load(open('/app/sensor_analysis.json')); print('devices',d['summary']['total_devices'],'readings',d['sum
+mary']['total_readings'],'anomalies',d['summary']['anomaly_count'],'issues',d['summary']['connectivity_issues_count'])"
+devices 5 readings 70 anomalies 5 issues 6
+root@4662ce3cec09:/app# head -n 20 /app/sensor_report.txt
+IOT SENSOR ANALYSIS REPORT
+==========================
+Total Devices: 5
+Total Readings: 70
+Temperature Range: -20.0°C to 971.0°C
+Average Temperature: 101.3°C
+Anomalies Detected: 5
+Connectivity Issues: 6
+==========================
+root@4662ce3cec09:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

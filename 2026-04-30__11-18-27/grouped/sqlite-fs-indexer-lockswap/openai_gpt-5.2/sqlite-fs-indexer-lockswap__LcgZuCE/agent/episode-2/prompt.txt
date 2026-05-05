@@ -1,0 +1,280 @@
+New Terminal Output:
+
+root@fba43893dbb0:/app# cat > /app/app/indexer.py <<'PY'
+> """Filesystem to SQLite indexer.
+>
+r> This module provides build_index(root_dir, db_path).
+>
+> Requirements implemented:
+> - Deterministic traversal (sorted directory entries).
+> - SHA256 + size recorded.
+> - Relative paths stored with forward slashes and NFC normalization.
+> - Ignore rules loaded from /data/ignore.txt with custom '*' matcher (no '/' match);
+>   '**' is treated as two literal '*' characters.
+> - Symlinks are ignored entirely.
+> - NFC collisions are resolved by choosing the lexicographically largest *original*
+>   relative path string and storing only the NFC-normalized path.
+> - Concurrency safety: build a complete temp SQLite DB then atomically replace the
+>   target under a cross-process lock.
+>
+> Standard library only.
+> """
+>
+> from __future__ import annotations
+>
+> import hashlib
+> import os
+> import re
+> import sqlite3
+> import tempfile
+> import unicodedata
+> from dataclasses import dataclass
+> from typing import Iterable, List, Optional, Tuple
+>
+>
+> # -------------------------
+> # Helpers: normalization
+> # -------------------------
+>
+> def _nfc(s: str) -> str:
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> def _relpath_posix(path: str, root_dir: str) -> str:
+>     """Return relative path from root_dir using forward slashes."""
+>     rel = os.path.relpath(path, root_dir)
+>     # Ensure forward slashes regardless of platform.
+>     if os.sep != "/":
+>         rel = rel.replace(os.sep, "/")
+>     # Also normalize any stray backslashes.
+>     rel = rel.replace("\\", "/")
+>     return rel
+>
+r>
+e> # -------------------------
+> # Ignore pattern matching
+> # -------------------------
+>
+> @dataclass(frozen=True)
+> class _Pattern:
+>     raw: str          # NFC normalized, as read (after stripping comments/whitespace)
+>     anchored: bool    # starts with '/'
+>     has_slash: bool   # contains '/'
+>
+>
+> def _load_patterns(ignore_path: str = "/data/ignore.txt") -> List[_Pattern]:
+>     pats: List[_Pattern] = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8", errors="replace") as f:
+>             for line in f:
+>                 # Strip newline; keep other whitespace for "first non-whitespace" comment logic.
+>                 line = line.rstrip("\n")
+>                 if not line.strip():
+>                     continue
+>                 # Comment lines: first non-whitespace is '#'
+>                 stripped = line.lstrip()
+>                 if stripped.startswith("#"):
+>                     continue
+>                 # Pattern is the line stripped of surrounding whitespace.
+>                 pat = _nfc(line.strip())
+>                 if not pat:
+>                     continue
+>                 anchored = pat.startswith("/")
+>                 if anchored:
+>                     pat2 = pat[1:]
+>                 else:
+>                     pat2 = pat
+>                 pats.append(_Pattern(raw=pat2, anchored=anchored, has_slash=("/" in pat2)))
+>     except FileNotFoundError:
+>         return []
+>     except OSError:
+>         # Malformed/unreadable ignore file must not crash the indexer.
+>         return []
+>     return pats
+>
+>
+> def _compile_component_regex(pat: str) -> re.Pattern:
+>     """Compile pattern where '*' matches 0+ chars excluding '/'.
+>
+>     Important: '**' is not special; it means two literal '*' characters.
+>     We implement this by treating backslash-escaped '*' as literal and by
+>     interpreting '*' as wildcard only when not part of a '**' pair.
+>
+>     Since '/' never appears in a component, this is safe for component patterns.
+>     """
+>     # Build regex manually.
+>     out = ["^"]
+>     i = 0
+>     while i < len(pat):
+>         ch = pat[i]
+>         if ch == "*":
+>             # '**' => literal '*' then continue with next '*' as literal too.
+>             if i + 1 < len(pat) and pat[i + 1] == "*":
+>                 out.append(re.escape("*"))
+>                 out.append(re.escape("*"))
+>                 i += 2
+>                 continue
+>             out.append("[^/]*")
+>             i += 1
+>             continue
+>         out.append(re.escape(ch))
+>         i += 1
+>     out.append("$")
+>     return re.compile("".join(out))
+>
+>
+> def _compile_path_regex(pat: str) -> re.Pattern:
+>     """Compile pattern for full relative paths (may contain '/').
+>
+>     '*' matches 0+ chars excluding '/'.
+>     '**' is literal '**' (two literal '*' chars).
+>     """
+>     out = ["^"]
+>     i = 0
+>     while i < len(pat):
+>         ch = pat[i]
+>         if ch == "*":
+>             if i + 1 < len(pat) and pat[i + 1] == "*":
+>                 out.append(re.escape("*"))
+>                 out.append(re.escape("*"))
+>                 i += 2
+>                 continue
+>             out.append("[^/]*")
+>             i += 1
+>             continue
+>         out.append(re.escape(ch))
+>         i += 1
+>     out.append("$")
+>     return re.compile("".join(out))
+>
+>
+> def _is_ignored(rel_nfc: str, patt
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+plete DB in a temp file in the same directory (so os.replace is atomic).
+>     fd, tmp_path = tempfile.mkstemp(prefix=".index_tmp_", suffix=".sqlite", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path, isolation_level=None)
+>         try:
+>             _init_db(conn)
+>             conn.execute("BEGIN;")
+>             conn.execute("DELETE FROM files;")
+>             conn.executemany("INSERT OR REPLACE INTO files(path, sha256, size) VALUES (?, ?, ?)", rows)
+>             conn.execute("COMMIT;")
+>         finally:
+>             conn.close()
+>
+>         # Cross-process lock around replacement to avoid races between writers.
+>         lock_path = db_path + ".lock"
+>         with open(lock_path, "a+b") as lockf:
+>             try:
+>                 import fcntl  # POSIX
+>
+>                 fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+>             except Exception:
+>                 # If flock isn't available, proceed; os.replace is still atomic.
+>                 pass
+>             os.replace(tmp_path, db_path)
+>             try:
+>                 import fcntl
+>
+>                 fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+>             except Exception:
+>                 pass
+>
+>         # Quick sanity check: DB must be readable.
+>         conn2 = sqlite3.connect(db_path)
+>         try:
+>             conn2.execute("PRAGMA busy_timeout=5000;")
+>             ok = conn2.execute("PRAGMA integrity_check;").fetchone()
+>             # If integrity_check fails, raise to signal failure.
+>             if not ok or ok[0] != "ok":
+>                 raise RuntimeError(f"SQLite integrity_check failed: {ok!r}")
+>         finally:
+>             conn2.close()
+>
+>     finally:
+>         # If tmp_path still exists (e.g., exception before replace), remove it.
+>         try:
+>             if os.path.exists(tmp_path):
+>                 os.remove(tmp_path)
+>         except OSError:
+>             pass
+>
+>
+> # -------------------------
+> # Public API
+> # -------------------------
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     root_dir = os.path.abspath(root_dir)
+>
+>     patterns = _load_patterns("/data/ignore.txt")
+>
+>     # Map NFC relative path -> (original_rel, abs_path)
+>     chosen: dict[str, Tuple[str, str]] = {}
+>
+>     def consider_file(abs_path: str) -> None:
+>         rel = _relpath_posix(abs_path, root_dir)
+>         # Rel is "original" relative path string for collision resolution.
+>         rel_nfc = _nfc(rel)
+>
+>         # Ignore matching uses NFC path.
+>         if _is_ignored(rel_nfc, patterns):
+>             return
+>
+>         prev = chosen.get(rel_nfc)
+>         if prev is None or rel > prev[0]:
+>             chosen[rel_nfc] = (rel, abs_path)
+>
+>     # Deterministic walk: sort entries by name at each directory.
+>     def walk_dir(abs_dir: str) -> None:
+>         try:
+>             with os.scandir(abs_dir) as it:
+>                 entries = sorted(it, key=lambda e: e.name)
+>         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+>             return
+>
+>         for e in entries:
+>             try:
+>                 # Never follow symlinks; ignore symlink entries entirely.
+>                 if e.is_symlink():
+>                     continue
+>
+>                 full = os.path.join(abs_dir, e.name)
+>
+>                 if e.is_dir(follow_symlinks=False):
+>                     # Apply ignore rules to directories as well, so we can skip traversal.
+>                     rel_dir = _relpath_posix(full, root_dir)
+>                     rel_dir_nfc = _nfc(rel_dir)
+>                     if _is_ignored(rel_dir_nfc, patterns):
+>                         continue
+>                     walk_dir(full)
+>                 elif e.is_file(follow_symlinks=False):
+>                     consider_file(full)
+>                 else:
+>                     # Skip special files.
+>                     continue
+>             except OSError:
+>                 continue
+>
+>     walk_dir(root_dir)
+>
+>     # Hash and emit rows in deterministic order by NFC path.
+>     rows: List[Tuple[str, str, int]] = []
+>     for rel_nfc in sorted(chosen.keys()):
+>         _, abs_path = chosen[rel_nfc]
+>         sha, size = _hash_file(abs_path)
+>         rows.append((rel_nfc, sha, int(size)))
+>
+>     _write_db_atomic(rows, db_path)
+> PY
+root@fba43893dbb0:/app# python3 -c "import app.indexer as ix; import os; os.makedirs('/output', exist_ok=True); ix.build_index('/data','/output/index.sqlite');
+import sqlite3; con=sqlite3.connect('/output/index.sqlite'); print(con.execute('PRAGMA integrity_check').fetchone()); print(con.execute('SELECT name, sql FROM s
+qlite_master WHERE type=\"table\"').fetchall()); print(con.execute('SELECT COUNT(*) FROM files').fetchone()); con.close()"
+('ok',)
+[('files', 'CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')]
+(0,)
+root@fba43893dbb0:/app#

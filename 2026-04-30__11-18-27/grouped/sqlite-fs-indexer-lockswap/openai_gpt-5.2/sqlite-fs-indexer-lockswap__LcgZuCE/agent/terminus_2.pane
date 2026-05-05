@@ -1,0 +1,425 @@
+[?2004hroot@fba43893dbb0:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@fba43893dbb0:/app# clear
+[?2004l[H[J[3J[?2004hroot@fba43893dbb0:/app# ls -ლა
+[?2004lls: invalid option -- '�'
+Try 'ls --help' for more information.
+[?2004hroot@fba43893dbb0:/app# find /app -maxdepth 3 -type f -name 'indexer.py' -o -name '__init__.py'
+[?2004l/app/app/__init__.py
+/app/app/indexer.py
+[?2004hroot@fba43893dbb0:/app# sed -n '1,200p' /app/app/indexer.py
+[?2004l# Implement build_index here.
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    raise NotImplementedError
+[?2004hroot@fba43893dbb0:/app# ls -la /app/app
+[?2004ltotal 4
+drwxr-xr-x. 2 root root  43 Apr 30 09:49 .
+drwxr-xr-x. 1 root root  17 Apr 30 09:49 ..
+-rw-r--r--. 1 root root   0 Apr 30 09:49 __init__.py
+-rw-r--r--. 1 root root 203 Apr 30 09:49 indexer.py
+[?2004hroot@fba43893dbb0:/app# pytest -q /tests/test_outputs.py
+[?2004lbash: pytest: command not found
+[?2004hroot@fba43893dbb0:/app# cat > /app/app/indexer.py <<'PY'
+[?2004l[?2004h> """Filesystem to SQLite indexer.
+[?2004l[?2004h> 
+[?2004lr[?2004h> This module provides build_index(root_dir, db_path).
+[?2004l[?2004h> 
+[?2004l[?2004h> Requirements implemented:
+[?2004l[?2004h> - Deterministic traversal (sorted directory entries).
+[?2004l[?2004h> - SHA256 + size recorded.
+[?2004l[?2004h> - Relative paths stored with forward slashes and NFC normalization.
+[?2004l[?2004h> - Ignore rules loaded from /data/ignore.txt with custom '*' matcher (no '/' match);
+[?2004l[?2004h>   '**' is treated as two literal '*' characters.
+[?2004l[?2004h> - Symlinks are ignored entirely.
+[?2004l[?2004h> - NFC collisions are resolved by choosing the lexicographically largest *original*
+[?2004l[?2004h>   relative path string and storing only the NFC-normalized path.
+[?2004l[?2004h> - Concurrency safety: build a complete temp SQLite DB then atomically replace the
+[?2004l[?2004h>   target under a cross-process lock.
+[?2004l[?2004h> 
+[?2004l[?2004h> Standard library only.
+[?2004l[?2004h> """
+[?2004l[?2004h> 
+[?2004l[?2004h> from __future__ import annotations
+[?2004l[?2004h> 
+[?2004l[?2004h> import hashlib
+[?2004l[?2004h> import os
+[?2004l[?2004h> import re
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> import tempfile
+[?2004l[?2004h> import unicodedata
+[?2004l[?2004h> from dataclasses import dataclass
+[?2004l[?2004h> from typing import Iterable, List, Optional, Tuple
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> # Helpers: normalization
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def _nfc(s: str) -> str:
+[?2004l[?2004h>     return unicodedata.normalize("NFC", s)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _relpath_posix(path: str, root_dir: str) -> str:
+[?2004l[?2004h>     """Return relative path from root_dir using forward slashes."""
+[?2004l[?2004h>     rel = os.path.relpath(path, root_dir)
+[?2004l[?2004h>     # Ensure forward slashes regardless of platform.
+[?2004l[?2004h>     if os.sep != "/":
+[?2004l[?2004h>         rel = rel.replace(os.sep, "/")
+[?2004l[?2004h>     # Also normalize any stray backslashes.
+[?2004l[?2004h>     rel = rel.replace("\\", "/")
+[?2004l[?2004h>     return rel
+[?2004l[?2004h> 
+[?2004lr[?2004h> 
+[?2004le[?2004h> # -------------------------
+[?2004l[?2004h> # Ignore pattern matching
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> @dataclass(frozen=True)
+[?2004l[?2004h> class _Pattern:
+[?2004l[?2004h>     raw: str          # NFC normalized, as read (after stripping comments/whitespace)
+[?2004l[?2004h>     anchored: bool    # starts with '/'
+[?2004l[?2004h>     has_slash: bool   # contains '/'
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _load_patterns(ignore_path: str = "/data/ignore.txt") -> List[_Pattern]:
+[?2004l[?2004h>     pats: List[_Pattern] = []
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         with open(ignore_path, "r", encoding="utf-8", errors="replace") as f:
+[?2004l[?2004h>             for line in f:
+[?2004l[?2004h>                 # Strip newline; keep other whitespace for "first non-whitespace" comment logic.
+[?2004l[?2004h>                 line = line.rstrip("\n")
+[?2004l[?2004h>                 if not line.strip():
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 # Comment lines: first non-whitespace is '#'
+[?2004l[?2004h>                 stripped = line.lstrip()
+[?2004l[?2004h>                 if stripped.startswith("#"):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 # Pattern is the line stripped of surrounding whitespace.
+[?2004l[?2004h>                 pat = _nfc(line.strip())
+[?2004l[?2004h>                 if not pat:
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 anchored = pat.startswith("/")
+[?2004l[?2004h>                 if anchored:
+[?2004l[?2004h>                     pat2 = pat[1:]
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     pat2 = pat
+[?2004l[?2004h>                 pats.append(_Pattern(raw=pat2, anchored=anchored, has_slash=("/" in pat2)))
+[?2004l[?2004h>     except FileNotFoundError:
+[?2004l[?2004h>         return []
+[?2004l[?2004h>     except OSError:
+[?2004l[?2004h>         # Malformed/unreadable ignore file must not crash the indexer.
+[?2004l[?2004h>         return []
+[?2004l[?2004h>     return pats
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _compile_component_regex(pat: str) -> re.Pattern:
+[?2004l[?2004h>     """Compile pattern where '*' matches 0+ chars excluding '/'.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Important: '**' is not special; it means two literal '*' characters.
+[?2004l[?2004h>     We implement this by treating backslash-escaped '*' as literal and by
+[?2004l[?2004h>     interpreting '*' as wildcard only when not part of a '**' pair.
+[?2004l[?2004h> 
+[?2004l[?2004h>     Since '/' never appears in a component, this is safe for component patterns.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     # Build regex manually.
+[?2004l[?2004h>     out = ["^"]
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(pat):
+[?2004l[?2004h>         ch = pat[i]
+[?2004l[?2004h>         if ch == "*":
+[?2004l[?2004h>             # '**' => literal '*' then continue with next '*' as literal too.
+[?2004l[?2004h>             if i + 1 < len(pat) and pat[i + 1] == "*":
+[?2004l[?2004h>                 out.append(re.escape("*"))
+[?2004l[?2004h>                 out.append(re.escape("*"))
+[?2004l[?2004h>                 i += 2
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             out.append("[^/]*")
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         out.append(re.escape(ch))
+[?2004l[?2004h>         i += 1
+[?2004l[?2004h>     out.append("$")
+[?2004l[?2004h>     return re.compile("".join(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _compile_path_regex(pat: str) -> re.Pattern:
+[?2004l[?2004h>     """Compile pattern for full relative paths (may contain '/').
+[?2004l[?2004h> 
+[?2004l[?2004h>     '*' matches 0+ chars excluding '/'.
+[?2004l[?2004h>     '**' is literal '**' (two literal '*' chars).
+[?2004l[?2004h>     """
+[?2004l[?2004h>     out = ["^"]
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(pat):
+[?2004l[?2004h>         ch = pat[i]
+[?2004l[?2004h>         if ch == "*":
+[?2004l[?2004h>             if i + 1 < len(pat) and pat[i + 1] == "*":
+[?2004l[?2004h>                 out.append(re.escape("*"))
+[?2004l[?2004h>                 out.append(re.escape("*"))
+[?2004l[?2004h>                 i += 2
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             out.append("[^/]*")
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         out.append(re.escape(ch))
+[?2004l[?2004h>         i += 1
+[?2004l[?2004h>     out.append("$")
+[?2004l[?2004h>     return re.compile("".join(out))
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _is_ignored(rel_nfc: str, patterns: List[_Pattern]) -> bool:
+[?2004l[?2004h>     """Check ignore rules against NFC-normalized relative path using '/' separators."""
+[?2004l[?2004h>     # Ensure no leading './'
+[?2004l[?2004h>     if rel_nfc == ".":
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     rel_nfc = rel_nfc.lstrip("./")
+[?2004l[?2004h> 
+[?2004l[?2004h>     comps = rel_nfc.split("/") if rel_nfc else []
+[?2004l[?2004h> 
+[?2004l[?2004h>     for p in patterns:
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             if not p.has_slash:
+[?2004l[?2004h>                 # Match against each component.
+[?2004l[?2004h>                 rx = _compile_component_regex(p.raw)
+[?2004l[?2004h>                 for c in comps:
+[?2004l[?2004h>                     if rx.match(c):
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 rx = _compile_path_regex(p.raw)
+[?2004l[?2004h>                 if p.anchored:
+[?2004l[?2004h>                     # Only full path match.
+[?2004l[?2004h>                     if rx.match(rel_nfc):
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     # Full path OR any suffix starting after a '/' boundary.
+[?2004l[?2004h>                     if rx.match(rel_nfc):
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>                     # Suffixes: start at each component boundary after a '/'
+[?2004l[?2004h>                     for i in range(1, len(comps)):
+[?2004l[?2004h>                         suffix = "/".join(comps[i:])
+[?2004l[?2004h>                         if rx.match(suffix):
+[?2004l[?2004h>                             return True
+[?2004l[?2004h>         except re.error:
+[?2004l[?2004h>             # Malformed patterns must not crash.
+[?2004l[?2004h>             continue
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> # Hashing
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def _hash_file(path: str) -> Tuple[str, int]:
+[?2004l[?2004h>     h = hashlib.sha256()
+[?2004l[?2004h>     size = 0
+[?2004l[?2004h>     with open(path, "rb") as f:
+[?2004l[?2004h>         for chunk in iter(lambda: f.read(1024 * 1024), b""):
+[?2004l[?2004h>             size += len(chunk)
+[?2004l[?2004h>             h.update(chunk)
+[?2004l[?2004h>     return h.hexdigest(), size
+[?2004l[?2004h> 
+[?2004l [?2004h> 
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> # SQLite writing (atomic)
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def _init_db(conn: sqlite3.Connection) -> None:
+[?2004l[?2004h>     conn.execute("PRAGMA journal_mode=WAL;")
+[?2004l[?2004h>     conn.execute("PRAGMA synchronous=NORMAL;")
+[?2004l[?2004h>     conn.execute("PRAGMA temp_store=MEMORY;")
+[?2004l[?2004h>     conn.execute("PRAGMA foreign_keys=OFF;")
+[?2004l[?2004h>     conn.execute("PRAGMA busy_timeout=5000;")
+[?2004l[?2004h>     conn.execute(
+[?2004l[?2004h>         "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)"
+[?2004l[?2004h>     )
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _write_db_atomic(rows: Iterable[Tuple[str, str, int]], db_path: str) -> None:
+[?2004l[?2004h>     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+[?2004l[?2004h>     os.makedirs(db_dir, exist_ok=True)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Build a complete DB in a temp file in the same directory (so os.replace is atomic).
+[?2004l[?2004h>     fd, tmp_path = tempfile.mkstemp(prefix=".index_tmp_", suffix=".sqlite", dir=db_dir)
+[?2004l[?2004h>     os.close(fd)
+[?2004l[?2004h> 
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         conn = sqlite3.connect(tmp_path, isolation_level=None)
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             _init_db(conn)
+[?2004l[?2004h>             conn.execute("BEGIN;")
+[?2004l[?2004h>             conn.execute("DELETE FROM files;")
+[?2004l[?2004h>             conn.executemany("INSERT OR REPLACE INTO files(path, sha256, size) VALUES (?, ?, ?)", rows)
+[?2004l[?2004h>             conn.execute("COMMIT;")
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             conn.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Cross-process lock around replacement to avoid races between writers.
+[?2004l[?2004h>         lock_path = db_path + ".lock"
+[?2004l[?2004h>         with open(lock_path, "a+b") as lockf:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 import fcntl  # POSIX
+[?2004l[?2004h> 
+[?2004l[?2004h>                 fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 # If flock isn't available, proceed; os.replace is still atomic.
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             os.replace(tmp_path, db_path)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 import fcntl
+[?2004l[?2004h> 
+[?2004l[?2004h>                 fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Quick sanity check: DB must be readable.
+[?2004l[?2004h>         conn2 = sqlite3.connect(db_path)
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             conn2.execute("PRAGMA busy_timeout=5000;")
+[?2004l[?2004h>             ok = conn2.execute("PRAGMA integrity_check;").fetchone()
+[?2004l[?2004h>             # If integrity_check fails, raise to signal failure.
+[?2004l[?2004h>             if not ok or ok[0] != "ok":
+[?2004l[?2004h>                 raise RuntimeError(f"SQLite integrity_check failed: {ok!r}")
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             conn2.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         # If tmp_path still exists (e.g., exception before replace), remove it.
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             if os.path.exists(tmp_path):
+[?2004l[?2004h>                 os.remove(tmp_path)
+[?2004l[?2004h>         except OSError:
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> # Public API
+[?2004l[?2004h> # -------------------------
+[?2004l[?2004h> 
+[?2004l[?2004h> def build_index(root_dir: str, db_path: str) -> None:
+[?2004l[?2004h>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+[?2004l[?2004h>     root_dir = os.path.abspath(root_dir)
+[?2004l[?2004h> 
+[?2004l[?2004h>     patterns = _load_patterns("/data/ignore.txt")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Map NFC relative path -> (original_rel, abs_path)
+[?2004l[?2004h>     chosen: dict[str, Tuple[str, str]] = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     def consider_file(abs_path: str) -> None:
+[?2004l[?2004h>         rel = _relpath_posix(abs_path, root_dir)
+[?2004l[?2004h>         # Rel is "original" relative path string for collision resolution.
+[?2004l[?2004h>         rel_nfc = _nfc(rel)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Ignore matching uses NFC path.
+[?2004l[?2004h>         if _is_ignored(rel_nfc, patterns):
+[?2004l[?2004h>             return
+[?2004l[?2004h> 
+[?2004l[?2004h>         prev = chosen.get(rel_nfc)
+[?2004l[?2004h>         if prev is None or rel > prev[0]:
+[?2004l[?2004h>             chosen[rel_nfc] = (rel, abs_path)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Deterministic walk: sort entries by name at each directory.
+[?2004l[?2004h>     def walk_dir(abs_dir: str) -> None:
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with os.scandir(abs_dir) as it:
+[?2004l[?2004h>                 entries = sorted(it, key=lambda e: e.name)
+[?2004l[?2004h>         except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+[?2004l[?2004h>             return
+[?2004l[?2004h> 
+[?2004l[?2004h>         for e in entries:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 # Never follow symlinks; ignore symlink entries entirely.
+[?2004l[?2004h>                 if e.is_symlink():
+[?2004l[?2004h>                     continue
+[?2004l[?2004h> 
+[?2004l[?2004h>                 full = os.path.join(abs_dir, e.name)
+[?2004l[?2004h> 
+[?2004l[?2004h>                 if e.is_dir(follow_symlinks=False):
+[?2004l[?2004h>                     # Apply ignore rules to directories as well, so we can skip traversal.
+[?2004l[?2004h>                     rel_dir = _relpath_posix(full, root_dir)
+[?2004l[?2004h>                     rel_dir_nfc = _nfc(rel_dir)
+[?2004l[?2004h>                     if _is_ignored(rel_dir_nfc, patterns):
+[?2004l[?2004h>                         continue
+[?2004l[?2004h>                     walk_dir(full)
+[?2004l[?2004h>                 elif e.is_file(follow_symlinks=False):
+[?2004l[?2004h>                     consider_file(full)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     # Skip special files.
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     walk_dir(root_dir)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Hash and emit rows in deterministic order by NFC path.
+[?2004l[?2004h>     rows: List[Tuple[str, str, int]] = []
+[?2004l[?2004h>     for rel_nfc in sorted(chosen.keys()):
+[?2004l[?2004h>         _, abs_path = chosen[rel_nfc]
+[?2004l[?2004h>         sha, size = _hash_file(abs_path)
+[?2004l[?2004h>         rows.append((rel_nfc, sha, int(size)))
+[?2004l[?2004h> 
+[?2004l[?2004h>     _write_db_atomic(rows, db_path)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@fba43893dbb0:/app# python3 -c "import app.indexer as ix; import os; os.makedirs('/output', exist_ok=True); ix.build_index('/data','/output/index.sqlite'); import sqlite3; con=sqlite3.connect('/output/index.sqlite'); print(con.execute('PRAGMA integrity_check').fetchone()); print(con.execute('SELECT name, sql FROM sqlite_master WHERE type=\"table\"').fetchall()); print(con.execute('SELECT COUNT(*) FROM files').fetchone()); con.close()"
+[?2004l('ok',)
+[('files', 'CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')]
+(0,)
+[?2004hroot@fba43893dbb0:/app# python3 -m py_compile /app/app/indexer.py
+[?2004l[?2004hroot@fba43893dbb0:/app# python3 - <<'PY'
+[?2004l[?2004h> import multiprocessing as mp
+[?2004l[?2004h> import os, sqlite3, tempfile
+[?2004l[?2004h> from app import indexer
+[?2004l[?2004h> 
+[?2004l[?2004h> # Unit-ish tests for ignore matching
+[?2004l[?2004h> p = [indexer._Pattern(raw='a*', anchored=False, has_slash=False)]
+[?2004l[?2004h> assert indexer._is_ignored('foo/a123/bar', p) is True  # component match
+[?2004l[?2004h> assert indexer._is_ignored('foo/b123/bar', p) is False
+[?2004l[?2004h> 
+[?2004l[?2004h> p = [indexer._Pattern(raw='dir/*.txt', anchored=False, has_slash=True)]
+[?2004l[?2004h> assert indexer._is_ignored('dir/x.txt', p) is True
+[?2004l[?2004h> assert indexer._is_ignored('a/dir/x.txt', p) is True  # suffix match
+[?2004l[?2004h> assert indexer._is_ignored('dir/sub/x.txt', p) is False  # '*' must not match '/'
+[?2004l[?2004h> 
+[?2004l[?2004h> p = [indexer._Pattern(raw='dir/**.txt', anchored=False, has_slash=True)]
+[?2004l[?2004h> assert indexer._is_ignored('dir/**.txt', p) is True
+[?2004l[?2004h> assert indexer._is_ignored('dir/xx.txt', p) is False  # '**' is literal
+[?2004l[?2004h> 
+[?2004l[?2004h> p = [indexer._Pattern(raw='a/b', anchored=True, has_slash=True)]
+[?2004l[?2004h> assert indexer._is_ignored('a/b', p) is True
+[?2004l[?2004h> assert indexer._is_ignored('x/a/b', p) is False
+[?2004l[?2004h> 
+[?2004l[?2004h> # Concurrency smoke test
+[?2004l[?2004h> root = '/data'
+[?2004l[?2004h> db = '/output/concurrent.sqlite'
+[?2004l[?2004h> 
+[?2004l[?2004h> def worker():
+[?2004l[?2004h>     indexer.build_index(root, db)
+[?2004l[?2004h> 
+[?2004l[?2004h> procs = [mp.Process(target=worker) for _ in range(8)]
+[?2004l[?2004h> for pr in procs: pr.start()
+[?2004l[?2004h> for pr in procs: pr.join(30)
+[?2004l[?2004h> assert all(pr.exitcode == 0 for pr in procs), [pr.exitcode for pr in procs]
+[?2004l[?2004h> 
+[?2004l[?2004h> con = sqlite3.connect(db)
+[?2004l[?2004h> try:
+[?2004l[?2004h>     print('integrity_check:', con.execute('PRAGMA integrity_check').fetchone())
+[?2004l[?2004h>     print('rows:', con.execute('SELECT COUNT(*) FROM files').fetchone())
+[?2004l[?2004h> finally:
+[?2004l[?2004h>     con.close()
+[?2004l[?2004h> print('OK')
+[?2004l[?2004h> PY
+[?2004lintegrity_check: ('ok',)
+rows: (0,)
+OK
+[?2004hroot@fba43893dbb0:/app# python3 - <<'PY'
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> con=sqlite3.connect('/output/concurrent.sqlite')
+[?2004l[?2004h> try:
+[?2004l[?2004h>     print(con.execute("PRAGMA table_info(files)").fetchall())
+[?2004l[?2004h> finally:
+[?2004l[?2004h>     con.close()
+[?2004l[?2004h> PY
+[?2004l[(0, 'path', 'TEXT', 0, None, 1), (1, 'sha256', 'TEXT', 1, None, 0), (2, 'size', 'INTEGER', 1, None, 0)]
+[?2004hroot@fba43893dbb0:/app# 

@@ -1,0 +1,304 @@
+[?2004hroot@15713b410231:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@15713b410231:/app# clear
+[?2004l[H[J[3J[?2004hroot@15713b410231:/app# ls -la
+[?2004ltotal 0
+drwxr-xr-x. 2 root root  6 Apr 30 09:48 .
+drwxr-xr-x. 1 root root 74 Apr 30 13:03 ..
+[?2004hroot@15713b410231:/app# cat > analyze_deps.py << 'EOF'
+[?2004l[?2004h> import ast
+[?2004l[?2004h> import json
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import argparse
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> from collections import defaultdict, deque
+[?2004l[?2004h> 
+[?2004l[?2004h> class StaticAnalyzer:
+[?2004l[?2004h>     def __init__(self, project_dir):
+[?2004l[?2004h>         self.project_dir = Path(project_dir)
+[?2004l[?2004h>         self.errors = []
+[?2004l[?2004h>         self.files = list(self.project_dir.rglob('*.py'))
+[?2004l[?2004h>         self.modules = {}  # file -> module info
+[?2004l[?2004h>         self.import_graph = defaultdict(list)  # module -> list of imported modules
+[?2004l[?2004h>         self.reverse_graph = defaultdict(list)
+[?2004l[?2004h>         self.visited = set()
+[?2004l[?2004h>         self.rec_stack = set()
+[?2004l[?2004h>         self.builtins = set(dir(__builtins__))
+[?2004l[?2004h> 
+[?2004l[?2004h>     def analyze(self):
+[?2004l[?2004h>         for file in self.files:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content, filename=str(file))
+[?2004l[?2004h>                 self.modules[file] = {
+[?2004l[?2004h>                     'tree': tree,
+[?2004l[?2004h>                     'content': content,
+[?2004l[?2004h>                     'imports': [],
+[?2004l[?2004h>                     'exports': set(),
+[?2004l[?2004h>                     'used_names': set(),
+[?2004l[?2004h>                     'defined_names': set(),
+[?2004l[?2004h>                     'function_defs': {},
+[?2004l[?2004h>                 }
+[?2004l[?2004h>                 self.parse_file(file, tree)
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 # Skip unparseable files
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l [?2004h>         self.build_import_graph()
+[?2004l[?2004h>         self.check_categories()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def parse_file(self, file, tree):
+[?2004l[?2004h>         class Visitor(ast.NodeVisitor):
+[?2004l[?2004h>             def __init__(self, analyzer, file):
+[?2004l[?2004h>                 self.analyzer = analyzer
+[?2004l[?2004h>                 self.file = file
+[?2004l[?2004h>                 self.scopes = [set()]
+[?2004l[?2004h>                 self.current_func = None
+[?2004l[?2004h> 
+[?2004l[?2004h>             def visit_Import(self, node):
+[?2004l[?2004h>                 for alias in node.names:
+[?2004l[?2004h>                     mod_name = alias.name
+[?2004l[?2004h>                     self.analyzer.modules[file]['imports'].append((mod_name, alias.asname or mod_name))
+[?2004l[?2004h>                 self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>             def visit_ImportFrom(self, node):
+[?2004l[?2004h>                 mod_name = node.module
+[?2004l[?2004h>                 for alias in node.names:
+[?2004l[?2004h>                     if alias.name == '*':
+[?2004l[?2004h>                         self.analyzer.modules[file]['imports'].append((mod_name, '*'))
+[?2004l[?2004h>                     else:
+[?2004l[?2004h>                         self.analyzer.modules[file]['imports'].append((mod_name, alias.asname or alias.name))
+[?2004l[?2004h>                 self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>             def visit_FunctionDef(self, node):
+[?2004l[?2004h>                 self.analyzer.modules[file]['function_defs'][node.name] = {
+[?2004l[?2004h>                     'args': [arg.arg for arg in node.args.args],
+[?2004l[?2004h>                     'defaults': len(node.args.defaults),
+[?2004l[?2004h>                     'vararg': node.args.vararg,
+[?2004l[?2004h>                     'kwarg': node.args.kwarg
+[?2004l[?2004h>                 }
+[?2004l[?2004h>                 self.scopes.append(set())
+[?2004l[?2004h>                 self.scopes[-1].update([arg.arg for arg in node.args.args])
+[?2004l[?2004h>                 self.current_func = node.name
+[?2004l[?2004h>                 self.generic_visit(node)
+[?2004l[?2004h>                 self.scopes.pop()
+[?2004l[?2004h>                 self.current_func = None
+[?2004l[?2004h> 
+[?2004l[?2004h>             def visit_Name(self, node):
+[?2004l[?2004h>                 if isinstance(node.ctx, ast.Load):
+[?2004l[?2004h>                     self.analyzer.modules[file]['used_names'].add(node.id)
+[?2004l[?2004h>                 elif isinstance(node.ctx, ast.Store):
+[?2004l[?2004h>                     self.scopes[-1].add(node.id)
+[?2004l[?2004h>                     self.analyzer.modules[file]['defined_names'].add(node.id)
+[?2004l[?2004h>                 self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l:[?2004h>         visitor = Visitor(self, file)
+[?2004l[?2004h>         visitor.visit(tree)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Collect exports
+[?2004l[?2004h>         for node in ast.walk(tree):
+[?2004l[?2004h>             if isinstance(node, ast.Assign):
+[?2004l[?2004h>                 for target in node.targets:
+[?2004l[?2004h>                     if isinstance(target, ast.Name):
+[?2004l[?2004h>                         self.modules[file]['exports'].add(target.id)
+[?2004l[?2004h>             elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+[?2004l[?2004h>                 self.modules[file]['exports'].add(node.name)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Handle __all__
+[?2004l[?2004h>         for node in ast.walk(tree):
+[?2004l[?2004h>             if isinstance(node, ast.Assign):
+[?2004l[?2004h>                 for target in node.targets:
+[?2004l[?2004h>                     if isinstance(target, ast.Name) and target.id == '__all__':
+[?2004l[?2004h>                         if isinstance(node.value, ast.List):
+[?2004l[?2004h>                             all_list = [elt.s for elt in node.value.elts if isinstance(elt, ast.Str)]
+[?2004l[?2004h>                             self.modules[file]['exports'] = set(all_list)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def build_import_graph(self):
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             rel_path = file.relative_to(self.project_dir)
+[?2004l[?2004h>             mod_name = str(rel_path).replace('/', '.').replace('\\', '.').rstrip('.py')
+[?2004l[?2004h>             for imp_mod, _ in info['imports']:
+[?2004l[?2004h>                 if not self.is_stdlib(imp_mod):
+[?2004l[?2004h>                     resolved = self.resolve_import(mod_name, imp_mod)
+[?2004l[?2004h>                     if resolved:
+[?2004l[?2004h>                         self.import_graph[mod_name].append(resolved)
+[?2004l[?2004h>                         self.reverse_graph[resolved].append(mod_name)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def resolve_import(self, from_mod, imp_mod):
+[?2004l[?2004h>         # Simple resolver: assume relative or absolute
+[?2004l[?2004h>         if imp_mod.startswith('.'):
+[?2004l[?2004h>             # Relative
+[?2004l[?2004h>             parts = from_mod.split('.')
+[?2004l[?2004h>             imp_parts = imp_mod.split('.')
+[?2004l[?2004h>             level = len([p for p in imp_parts if p == ''])
+[?2004l[?2004h>             parts = parts[:-level]
+[?2004l[?2004h>             for p in imp_parts[level:]:
+[?2004l[?2004h>                 if p:
+[?2004l[?2004h>                     parts.append(p)
+[?2004l[?2004h>             return '.'.join(parts)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Absolute
+[?2004l[?2004h>             return imp_mod
+[?2004l[?2004h> 
+[?2004l[?2004h>     def is_stdlib(self, mod):
+[?2004l[?2004h>         return mod in ['os', 'sys', 'json', 'ast', 'pathlib', 'collections', 'argparse']  # Simplified
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_categories(self):
+[?2004l[?2004h>         # 1. Valid Imports
+[?2004l[?2004h>         self.check_valid_imports()
+[?2004l[?2004h>         # 2. No Circular Deps
+[?2004l[?2004h>         self.check_circular_deps()
+[?2004l[?2004h>         # 3. No Unused Imports
+[?2004l[?2004h>         self.check_unused_imports()
+[?2004l[?2004h>         # 4. All Refs Defined
+[?2004l[?2004h>         self.check_refs_defined()
+[?2004l[?2004h>         # 5. Valid Attribute Access
+[?2004l[?2004h>         self.check_attribute_access()
+[?2004l[?2004h>         # 6. Type Consistency
+[?2004l[?2004h>         self.check_type_consistency()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_valid_imports(self):
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             for imp_mod, _ in info['imports']:
+[?2004l[?2004h>                 if not self.is_stdlib(imp_mod):
+[?2004l[?2004h>                     resolved = self.resolve_import(str(file.relative_to(self.project_dir)).replace('/', '.').replace('\\', '.').rstrip('.py'), imp_mod)
+[?2004l[?2004h>                     if not any(resolved == str(f.relative_to(self.project_dir)).replace('/', '.').replace('\\', '.').rstrip('.py') for f in self.files):
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'invalid_import',
+[?2004l[?2004h>                             'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                             'message': f'Cannot resolve import {imp_mod}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_circular_deps(self):
+[?2004l[?2004h>         for node in self.import_graph:
+[?2004l[?2004h>             if self.has_cycle(node):
+[?2004l[?2004h>                 # Find cycle path
+[?2004l[?2004h>                 path = self.get_cycle_path(node)
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'circular_dependency',
+[?2004l[?2004h>                     'file': f'/app/{node.replace(".", "/")}.py',
+[?2004l[?2004h>                     'message': f'Circular dependency: {" -> ".join(path)}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h> 
+[?2004lr[?2004h>     def has_cycle(self, node):
+[?2004l[?2004h>         self.visited.add(node)
+[?2004l[?2004h>         self.rec_stack.add(node)
+[?2004l[?2004h>         for neigh in self.import_graph[node]:
+[?2004l[?2004h>             if neigh not in self.visited and self.has_cycle(neigh):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>             elif neigh in self.rec_stack:
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         self.rec_stack.remove(node)
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004lt[?2004h>     def get_cycle_path(self, node):
+[?2004l[?2004h>         # Simplified: just return the node
+[?2004l[?2004h>         return [node]
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_unused_imports(self):
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             for imp_mod, name in info['imports']:
+[?2004l[?2004h>                 if name == '*':
+[?2004l[?2004h>                     # Check if any exported symbols are used
+[?2004l[?2004h>                     if imp_mod in self.modules:
+[?2004l[?2004h>                         exported = self.modules[imp_mod]['exports']
+[?2004l[?2004h>                         if not any(e in info['used_names'] for e in exported):
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'unused_import',
+[?2004l[?2004h>                                 'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                                 'message': f'Unused wildcard import from {imp_mod}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h>                 elif name not in info['used_names']:
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'unused_import',
+[?2004l[?2004h>                         'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                         'message': f'Unused import {name}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_refs_defined(self):
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             for name in info['used_names']:
+[?2004l[?2004h>                 if name not in info['defined_names'] and name not in [n for _, n in info['imports']] and name not in self.builtins:
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'undefined_reference',
+[?2004l[?2004h>                         'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                         'message': f'Undefined reference to {name}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_attribute_access(self):
+[?2004l[?2004h>         # Simplified: check for module.attr
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             for node in ast.walk(info['tree']):
+[?2004l[?2004h>                 if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+[?2004l[?2004h>                     mod = node.value.id
+[?2004l[?2004h>                     attr = node.attr
+[?2004l[?2004h>                     if mod in [n for _, n in info['imports']]:
+[?2004l[?2004h>                         # Find the module
+[?2004l[?2004h>                         imp_mod = next((i[0] for i in info['imports'] if i[1] == mod), None)
+[?2004l[?2004h>                         if imp_mod and imp_mod in self.modules and attr not in self.modules[imp_mod]['exports']:
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'invalid_attribute_access',
+[?2004l[?2004h>                                 'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                                 'message': f'Invalid attribute {attr} on module {mod}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_type_consistency(self):
+[?2004l[?2004h>         for file, info in self.modules.items():
+[?2004l[?2004h>             for node in ast.walk(info['tree']):
+[?2004l[?2004h>                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+[?2004l[?2004h>                     func_name = node.func.name
+[?2004l[?2004h>                     if func_name in info['function_defs']:
+[?2004l[?2004h>                         func_info = info['function_defs'][func_name]
+[?2004l[?2004h>                         num_args = len(node.args)
+[?2004l[?2004h>                         min_args = len(func_info['args']) - func_info['defaults']
+[?2004l[?2004h>                         max_args = len(func_info['args']) + (1 if func_info['vararg'] else 0)
+[?2004l[?2004h>                         if not (min_args <= num_args <= max_args):
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'type_error',
+[?2004l[?2004h>                                 'file': f'/app/{file.relative_to(self.project_dir)}',
+[?2004l[?2004h>                                 'message': f'Function {func_name} called with {num_args} args, expected {min_args}-{max_args}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     parser = argparse.ArgumentParser()
+[?2004l[?2004h>     parser.add_argument('--project-dir', required=True)
+[?2004l[?2004h>     parser.add_argument('--out', required=True)
+[?2004l[?2004h>     args = parser.parse_args()
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not Path(args.project_dir).exists():
+[?2004l[?2004h>         result = {
+[?2004l[?2004h>             'valid_imports': False,
+[?2004l[?2004h>             'no_circular_deps': False,
+[?2004l[?2004h>             'no_unused_imports': False,
+[?2004l[?2004h>             'all_refs_defined': False,
+[?2004l[?2004h>             'valid_attribute_access': False,
+[?2004l[?2004h>             'type_consistent': False,
+[?2004l[?2004h>             'errors': [{'type': 'invalid_import', 'file': '/app/', 'message': 'Project directory does not exist'}]
+[?2004l[?2004h>         }
+[?2004l[?2004h>         with open(args.out, 'w') as f:
+[?2004l[?2004h>             json.dump(result, f)
+[?2004l[?2004h>         return
+[?2004l[?2004h> 
+[?2004l[?2004h>     analyzer = StaticAnalyzer(args.project_dir)
+[?2004l[?2004h>     analyzer.analyze()
+[?2004l[?2004h> 
+[?2004l[?2004h>     result = {
+[?2004l[?2004h>         'valid_imports': not any(e['type'] == 'invalid_import' for e in analyzer.errors),
+[?2004l[?2004h>         'no_circular_deps': not any(e['type'] == 'circular_dependency' for e in analyzer.errors),
+[?2004l[?2004h>         'no_unused_imports': not any(e['type'] == 'unused_import' for e in analyzer.errors),
+[?2004l[?2004h>         'all_refs_defined': not any(e['type'] == 'undefined_reference' for e in analyzer.errors),
+[?2004l[?2004h>         'valid_attribute_access': not any(e['type'] == 'invalid_attribute_access' for e in analyzer.errors),
+[?2004l[?2004h>         'type_consistent': not any(e['type'] == 'type_error' for e in analyzer.errors),
+[?2004l[?2004h>         'errors': analyzer.errors
+[?2004l[?2004h>     }
+[?2004l[?2004h> 
+[?2004l[?2004h>     with open(args.out, 'w') as f:
+[?2004l[?2004h>         json.dump(result, f, indent=2)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     main()
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@15713b410231:/app# 

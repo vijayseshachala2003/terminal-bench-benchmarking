@@ -1,0 +1,106 @@
+[?2004hroot@0c7a6cc5bb38:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@0c7a6cc5bb38:/app# clear
+[?2004l[H[J[3J[?2004hroot@0c7a6cc5bb38:/app# cat /app/app/indexer.py
+[?2004l# Implement build_index here.
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    raise NotImplementedError
+[?2004hroot@0c7a6cc5bb38:/app# cat > /app/app/indexer.py << 'EOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> import hashlib
+[?2004l[?2004h> import unicodedata
+[?2004l[?2004h> import fcntl
+[?2004l[?2004h> import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def pattern_to_regex(pat):
+[?2004l[?2004h>     pat = pat.replace('**', '__DOUBLESTAR__')
+[?2004l[?2004h>     pat = re.escape(pat)
+[?2004l[?2004h>     pat = pat.replace('__DOUBLESTAR__', r'\*\*')
+[?2004l[?2004h>     pat = pat.replace(r'\*', r'[^/]*')
+[?2004l[?2004h>     return pat
+[?2004l[?2004h> 
+[?2004l[?2004h> def matches_pattern(path, pattern):
+[?2004l[?2004h>     if pattern.startswith('/'):
+[?2004l[?2004h>         pat = pattern[1:]
+[?2004l[?2004h>         regex = '^' + pattern_to_regex(pat) + '$'
+[?2004l[?2004h>         return bool(re.match(regex, path))
+[?2004l[?2004h>     elif '/' not in pattern:
+[?2004l[?2004h>         regex = '^' + pattern_to_regex(pattern) + '$'
+[?2004l[?2004h>         return any(re.fullmatch(regex, comp) for comp in path.split('/'))
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         regex = '^' + pattern_to_regex(pattern) + '$'
+[?2004l[?2004h>         if re.fullmatch(regex, path):
+[?2004l[?2004h>             return True
+[?2004l[?2004h>         parts = path.split('/')
+[?2004l[?2004h>         for i in range(len(parts)):
+[?2004l[?2004h>             suffix = '/'.join(parts[i:])
+[?2004l[?2004h>             if re.fullmatch(regex, suffix):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h> def _do_build(root_dir, db_path):
+[?2004l[?2004h>     ignore_patterns = []
+[?2004l[?2004h>     ignore_file = '/data/ignore.txt'
+[?2004l[?2004h>     if os.path.exists(ignore_file):
+[?2004l[?2004h>         with open(ignore_file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>             for line in f:
+[?2004l[?2004h>                 line = line.strip()
+[?2004l[?2004h>                 if not line or line.startswith('#'):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 ignore_patterns.append(unicodedata.normalize('NFC', line))
+[?2004l[?2004h>     
+[?2004l[?2004h>     entries = {}
+[?2004l[?2004h>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+[?2004l[?2004h>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+[?2004l[?2004h>         rel_dir = os.path.relpath(dirpath, root_dir)
+[?2004l[?2004h>         if rel_dir == '.':
+[?2004l[?2004h>             rel_dir = ''
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             rel_dir = rel_dir.replace(os.sep, '/')
+[?2004l[?2004h>         for filename in filenames:
+[?2004l[?2004h>             filepath = os.path.join(dirpath, filename)
+[?2004l[?2004h>             if os.path.islink(filepath):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             rel_path = os.path.relpath(filepath, root_dir).replace(os.sep, '/')
+[?2004l[?2004h>             nfc_path = unicodedata.normalize('NFC', rel_path)
+[?2004l[?2004h>             original = rel_path
+[?2004l[?2004h>             if nfc_path in entries:
+[?2004l[?2004h>                 if original > entries[nfc_path]['original']:
+[?2004l[?2004h>                     entries[nfc_path] = {'original': original, 'filepath': filepath}
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 entries[nfc_path] = {'original': original, 'filepath': filepath}
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Filter ignored
+[?2004l[?2004h>     filtered_entries = {}
+[?2004l[?2004h>     for path, data in entries.items():
+[?2004l[?2004h>         if not any(matches_pattern(path, pat) for pat in ignore_patterns):
+[?2004l[?2004h>             filtered_entries[path] = data
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Connect to db
+[?2004l[?2004h>     conn = sqlite3.connect(db_path)
+[?2004l[?2004h>     conn.execute('PRAGMA journal_mode=WAL;')
+[?2004l[?2004h>     conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL);')
+[?2004l[?2004h>     conn.execute('DELETE FROM files;')
+[?2004l[?2004h>     cursor = conn.cursor()
+[?2004l[?2004h>     for path in sorted(filtered_entries.keys()):
+[?2004l[?2004h>         filepath = filtered_entries[path]['filepath']
+[?2004l[?2004h>         with open(filepath, 'rb') as f:
+[?2004l[?2004h>             data = f.read()
+[?2004l[?2004h>         sha = hashlib.sha256(data).hexdigest()
+[?2004l[?2004h>         size = len(data)
+[?2004l[?2004h>         cursor.execute('INSERT INTO files VALUES (?, ?, ?)', (path, sha, size))
+[?2004l[?2004h>     conn.commit()
+[?2004l[?2004h>     conn.close()
+[?2004l[?2004h> 
+[?2004l[?2004h> def build_index(root_dir: str, db_path: str) -> None:
+[?2004l[?2004h>     lock_path = db_path + '.lock'
+[?2004l[?2004h>     with open(lock_path, 'w') as lock_file:
+[?2004l[?2004h>         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+[?2004l[?2004h>         _do_build(root_dir, db_path)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0c7a6cc5bb38:/app# touch /app/app/__init__.py
+[?2004l[?2004hroot@0c7a6cc5bb38:/app# 

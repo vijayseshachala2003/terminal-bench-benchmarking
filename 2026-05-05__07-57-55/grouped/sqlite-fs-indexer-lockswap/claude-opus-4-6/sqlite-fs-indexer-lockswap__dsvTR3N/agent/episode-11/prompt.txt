@@ -1,0 +1,110 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@583e03e4c1be:/app# python3 << 'TEST_EOF'
+> from app.indexer import _custom_match
+>
+> # ** should match literal ** in text, not be a recursive glob
+> assert _custom_match('**', '**') == True, 'literal ** should match **'
+> assert _custom_match('**', 'abc') == False, '** should not match abc'
+> assert _custom_match('a/**/b', 'a/**/b') == True
+> assert _custom_match('a/**/b', 'a/x/y/b') == False  # ** is literal, not recursive
+>
+> # Single * should not match /
+> assert _custom_match('*.txt', 'hello.txt') == True
+> assert _custom_match('*.txt', 'a/hello.txt') == False  # * can't match /
+> assert _custom_match('*/*', 'a/b') == True
+> assert _custom_match('*/*', 'a/b/c') == False
+>
+> print('Pattern matching PASS')
+> TEST_EOF
+Pattern matching PASS
+root@583e03e4c1be:/app# python3 << 'TEST_EOF'
+> import os, tempfile, sqlite3, unicodedata
+> from app.indexer import build_index
+>
+> # Test Unicode NFC collision
+> # e-acute can be represented as U+00E9 (NFC) or U+0065 U+0301 (NFD)
+> td = tempfile.mkdtemp()
+>
+> # Create two files that normalize to the same NFC path
+> nfc_name = 'caf\u00e9.txt'  # NFC form
+> nfd_name = 'cafe\u0301.txt'  # NFD form
+>
+> print('NFC name:', repr(nfc_name))
+> print('NFD name:', repr(nfd_name))
+> print('NFC of NFC:', repr(unicodedata.normalize('NFC', nfc_name)))
+> print('NFC of NFD:', repr(unicodedata.normalize('NFC', nfd_name)))
+> print('Same after NFC?', unicodedata.normalize('NFC', nfc_name) == unicodedata.normalize('NFC', nfd_name))
+>
+> # Write both files
+> with open(os.path.join(td, nfc_name), 'w') as f:
+>     f.write('nfc content')
+> with open(os.path.join(td, nfd_name), 'w') as f:
+>     f.write('nfd content')
+>
+> # Check what files exist
+> for entry in sorted(os.listdir(td)):
+>     print('Entry:', repr(entry), 'NFC:', repr(unicodedata.normalize('NFC', entry)))
+>
+> db = os.path.join(tempfile.mkdtemp(), 'test.db')
+> build_index(td, db)
+>
+> conn = sqlite3.connect(db)
+> rows = conn.execute('SELECT path, sha256, size FROM files ORDER BY path').fetchall()
+> for r in rows:
+>     print('Row:', r)
+>
+> # On Linux, both files may actually exist as separate entries
+> # The collision handling should keep the lexicographically largest original
+> print(f'Row count: {len(rows)}')
+> conn.close()
+> print('Unicode collision test done')
+> TEST_EOF
+NFC name: 'café.txt'
+NFD name: 'café.txt'
+NFC of NFC: 'café.txt'
+NFC of NFD: 'café.txt'
+Same after NFC? True
+Entry: 'café.txt' NFC: 'café.txt'
+Entry: 'café.txt' NFC: 'café.txt'
+Row: ('café.txt', '37ebbb1863a2f037aa9eebccc30a3e140695450cf01977b32725d24bd9f64d5f', 11)
+Row count: 1
+Unicode collision test done
+root@583e03e4c1be:/app# python3 << 'TEST_EOF'
+> import os, tempfile, sqlite3
+> from app.indexer import build_index
+>
+> # Test: rooted pattern /build should match file 'build' at root
+> # but also test if it matches 'build/obj/out.o' - it shouldn't because
+> # the pattern 'build' (after stripping /) is matched against full path 'build/obj/out.o'
+> # and * doesn't match /, so 'build' won't match 'build/obj/out.o'
+> td = tempfile.mkdtemp()
+> os.makedirs(os.path.join(td, 'build', 'obj'))
+> with open(os.path.join(td, 'build', 'obj', 'out.o'), 'w') as f:
+>     f.write('object')
+> with open(os.path.join(td, 'build', 'output.bin'), 'w') as f:
+>     f.write('binary')
+> with open(os.path.join(td, 'README.md'), 'w') as f:
+>     f.write('readme')
+>
+> with open('/data/ignore.txt', 'w') as f:
+>     f.write('/build/*\n')  # rooted: match build/* at root level only
+>
+> db = os.path.join(tempfile.mkdtemp(), 'test.db')
+> build_index(td, db)
+>
+> conn = sqlite3.connect(db)
+> rows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()
+> print('With /build/*:', rows)
+> # /build/* should match build/output.bin (full path) but NOT build/obj/out.o (* can't match /)
+> conn.close()
+>
+> os.remove('/data/ignore.txt')
+> print('Rooted pattern test done')
+> TEST_EOF
+With /build/*: [('README.md',), ('build/obj/out.o',)]
+Rooted pattern test done
+root@583e03e4c1be:/app#

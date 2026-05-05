@@ -1,0 +1,186 @@
+Current terminal state:
+New Terminal Output:
+
+root@8cec43762512:/app# cat << 'EOF' > /app/solution.py
+> import re
+> from collections import defaultdict
+>
+> def is_malformed(line):
+>     parts = line.split()
+>     if len(parts) < 3:
+>         return True
+>     idx, tx, op = parts[0], parts[1], parts[2]
+>     try:
+>         i = int(idx)
+>         if i <= 0:
+>             return True
+>     except ValueError:
+>         return True
+>     if not re.match(r'^[a-z0-9]{1,8}$', tx):
+>         return True
+>     if op in ['BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'] and len(parts) != 3:
+>         return True
+>     if op == 'VOTE':
+>         if len(parts) != 4 or parts[3] not in ['YES', 'NO']:
+>             return True
+>     if op == 'FENCE':
+>         if len(parts) != 4 or not re.match(r'^[A-F0-9]{8}$', parts[3]):
+>             return True
+>     if op == 'EPOCH':
+>         if len(parts) != 4 or not re.match(r'^[A-F0-9]{8}$', parts[3]):
+>             return True
+>     if op not in ['BEGIN', 'PREPARE', 'VOTE', 'COMMIT', 'ABORT', 'END', 'FENCE', 'EPOCH']:
+>         return True
+>     return False
+>
+> def solve(lines):
+>     bad_shards = set()
+>     shard_epochs = defaultdict(lambda: -1)  # last nonce as int, start with -1
+>     tx_events = defaultdict(list)
+>     tx_votes = defaultdict(set)
+>     tx_fences = defaultdict(list)
+>     all_tx = set()
+>     for line in lines:
+>         line = line.strip()
+>         if not line or line.startswith('#'):
+>             continue
+>         if is_malformed(line):
+>             break
+>         parts = line.split()
+>         idx, tx, op = int(parts[0]), parts[1], parts[2]
+>         arg = parts[3] if len(parts) > 3 else None
+>         shard = tx[0]
+>         all_tx.add(tx)
+>         if op == 'EPOCH':
+>             nonce_int = int(arg, 16)
+>             if nonce_int <= shard_epochs[shard]:
+>                 bad_shards.add(shard)
+>             else:
+>                 shard_epochs[shard] = nonce_int
+>         else:
+>             tx_events[tx].append((op, arg))
+>             if op == 'VOTE':
+>                 tx_votes[tx].add(arg)
+>             if op == 'FENCE':
+>                 tx_fences[tx].append(arg)
+>     bad_tx = set()
+>     bads = []
+>     ins_dict = defaultdict(list)
+>     for tx in all_tx:
+>         shard = tx[0]
+>         if shard in bad_shards:
+>             bad_tx.add(tx)
+>             bads.append(f'BAD {tx} BAD_EPOCH')
+>             continue
+>         # check fences
+>         if tx_fences[tx]:
+>             fences_int = [int(f, 16) for f in tx_fences[tx]]
+>             if any(f <= p for p, f in zip(fences_int, fences_int[1:])):
+>                 bad_tx.add(tx)
+>                 bads.append(f'BAD {tx} BAD_FENCE')
+>                 continue
+>         # check votes
+>         if len(tx_votes[tx]) > 1 and 'YES' in tx_votes[tx] and 'NO' in tx_votes[tx]:
+>             bad_tx.add(tx)
+>             bads.append(f'BAD {tx} BAD_VOTE')
+>             continue
+>         # check state machine
+>         state = 'NEW'
+>         has_decision = False
+>         has_end = False
+>         decision = None
+>         has_prepare = False
+>         bad_order = False
+>         for op, arg in tx_events[tx]:
+>             if op == 'BEGIN':
+>                 if state != 'NEW':
+>                     bad_order = True
+>                     break
+>                 state = 'BEGUN'
+>             elif op == 'PREPARE':
+>                 if state != 'BEGUN':
+>                     bad_order = True
+>                     break
+>                 state = 'PREPARED'
+>                 has_prepare = True
+>             elif op == 'VOTE':
+>                 if state != 'PREPARED':
+>                     bad_order = True
+>                     break
+>             elif op == 'COMMIT':
+>                 if state != 'PREPARED':
+>                     bad_order = True
+>                     break
+>                 if 'NO' in tx_votes[tx]:
+>                     bad_order = True
+>                     break
+>                 state = 'DECIDED_COMMIT'
+>                 decision = 'COMMIT'
+>                 has_decision = True
+>             elif op == 'ABORT':
+>                 if state not in ['BEGUN', 'PREPARED', 'DECIDED_ABORT']:
+>                     bad_order = True
+>                     break
+>                 state = 'DECIDED_ABORT'
+>                 decision = 'ABORT'
+>                 has_decision = True
+>             elif op == 'END':
+>                 if state not in ['DECIDED_COMMIT', 'DECIDED_ABORT']:
+>                     bad_order = True
+>                     break
+>                 state = 'ENDED'
+>                 has_end = True
+>             elif op == 'FENCE':
+>                 pass
+>         if not bad_order:
+>             if has_end and not has_decision:
+>                 bad_order = True
+>             elif has_decision and not has_prepare:
+>                 bad_order = True
+>         if bad_order:
+>             bad_tx.add(tx)
+>             bads.append(f'BAD {tx} BAD_ORDER')
+>             continue
+>         # compute insertions
+>         ins = []
+>         ops = [op for op, arg in tx_events[tx]]
+>         has_begin = 'BEGIN' in ops
+>         has_prepare = 'PREPARE' in ops
+>         has_vote = any(op == 'VOTE' for op in ops)
+>         has_decision = 'COMMIT' in ops or 'ABORT' in ops
+>         has_end = 'END' in ops
+>         if not has_begin:
+>             ins.append(('BEGIN', None))
+>         if has_vote and not has_prepare:
+>             if not has_begin:
+>                 pass  # already added
+>             ins.append(('PREPARE', None))
+>         if not has_decision:
+>             if 'NO' in tx_votes[tx]:
+>                 ins.append(('ABORT', None))
+>             else:
+>                 ins.append(('COMMIT', None))
+>         if has_decision and not has_end:
+>             ins.append(('END', None))
+>         ins_dict[tx] = ins
+>     # output
+>     if not bads and not any(ins_dict.values()):
+>         return 'OK'
+>     op_order = {'BEGIN': 1, 'PREPARE': 2, 'VOTE': 3, 'COMMIT': 4, 'ABORT': 5, 'END': 6, 'FENCE': 7, 'EPOCH': 8}
+>     ins_lines = []
+>     for tx in sorted(all_tx):
+>         if tx in bad_tx:
+>             continue
+>         for op, arg in ins_dict[tx]:
+>             line = f'INS {tx} {op}'
+>             if arg:
+>                 line += f' {arg}'
+>             ins_lines.append(line)
+>     ins_lines.sort(key=lambda x: (x.split()[1], op_order[x.split()[2]], x.split()[3] if len(x.split()) > 3 else ''))
+>     bads.sort()
+>     return '\n'.join(bads + ins_lines)
+> EOF
+root@8cec43762512:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

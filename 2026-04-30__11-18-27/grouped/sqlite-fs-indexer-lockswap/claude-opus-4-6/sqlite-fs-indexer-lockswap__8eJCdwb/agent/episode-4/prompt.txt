@@ -1,0 +1,210 @@
+New Terminal Output:
+
+root@b483ba2e11ac:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+> import fcntl
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read ignore patterns from file. Returns list of NFC-normalized pattern strings."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 pat = unicodedata.normalize("NFC", line.rstrip())
+>                 patterns.append(pat)
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _wildcard_match(pattern, text):
+>     """Match where * matches zero or more chars except '/'. No special meaning for **."""
+>     p_len = len(pattern)
+>     t_len = len(text)
+>
+>     prev = [False] * (t_len + 1)
+>     prev[0] = True
+>
+>     for i in range(1, p_len + 1):
+>         curr = [False] * (t_len + 1)
+>         pc = pattern[i - 1]
+>         if pc == '*':
+>             curr[0] = prev[0]
+>             for j in range(1, t_len + 1):
+>                 curr[j] = prev[j] or (curr[j - 1] and text[j - 1] != '/')
+>         elif pc == '?':
+>             for j in range(1, t_len + 1):
+>                 curr[j] = prev[j - 1] and text[j - 1] != '/'
+>         else:
+>             for j in range(1, t_len + 1):
+>                 curr[j] = prev[j - 1] and text[j - 1] == pc
+>         prev = curr
+>
+>     return prev[t_len]
+>
+a>
+> def _should_ignore(rel_path_nfc, patterns):
+>     """Check if a NFC-normalized relative path should be ignored based on patterns."""
+>     for pat in patterns:
+>         if _check_pattern(pat, rel_path_nfc):
+>             return True
+>     return False
+>
+>
+> def _check_pattern(pattern, rel_path):
+>     """
+>     Check a single pattern against a relative path.
+>
+>     Rules:
+>     1. Leading '/' - match against full relative path (strip the leading '/' from pattern)
+>     2. No '/' in pattern - match against each path component
+>     3. Contains '/' but no leading '/' - match against full path or any suffix starting after '/'
+>     """
+>     if pattern.startswith('/'):
+>         anchored_pat = pattern[1:]
+>         return _wildcard_match(anchored_pat, rel_path)
+>
+>     if '/' not in pattern:
+>         components = rel_path.split('/')
+>         for comp in components:
+>             if _wildcard_match(pattern, comp):
+>                 return True
+>         return False
+>
+>     # Contains '/' but no leading '/'
+>     if _wildcard_match(pattern, rel_path):
+>         return True
+>     idx = 0
+>     while True:
+>         idx = rel_path.find('/', idx)
+>         if idx == -1:
+>             break
+>         suffix = rel_path[idx + 1:]
+>         if _wildcard_match(pattern, suffix):
+>             return True
+>         idx += 1
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of a file, return lowercase hex string and size."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     patterns = _read_ignore_patterns()
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     # Dict: nfc_rel_path -> (original_rel_path, nfc_rel_path, sha256, size)
+>     file_map = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         dirnames.sort()
+>
+>         for filename in sorted(filenames):
+>             full_path = os.path.join(dirpath, filename)
+>
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, '/')
+>
+>             nfc_rel_path = unicodedata.normalize("NFC", rel_path)
+>
+>             if _should_ignore(nfc_rel_path, patterns):
+>                 continue
+>
+>             # Unicode collision: keep lexicographically largest original path
+>             if nfc_rel_path in file_map:
+>                 existing_orig = file_map[nfc_rel_path][0]
+>                 if rel_path <= existing_orig:
+>                     continue
+>
+>             try:
+>                 sha256, size = _hash_file(full_path)
+>             except (OSError, IOError):
+>                 continue
+>
+>             file_map[nfc_rel_path] = (rel_path, nfc_rel_path, sha256, size)
+>
+>     rows = sorted(file_map.values(), key=lambda x: x[1])
+>
+>     db_abs = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_abs)
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     lock_path = db_abs + ".lock"
+>
+>     with open(lock_path, "w") as lock_file:
+>         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+>         try:
+>             fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix=".db.tmp")
+>             os.close(fd)
+>
+>             try:
+>                 conn = sqlite3.connect(tmp_path)
+>                 conn.execute("PRAGMA journal_mode=WAL")
+>                 conn.execute("PRAGMA synchronous=FULL")
+>                 conn.execute(
+>                     "CREATE TABLE files ("
+>                     "path TEXT PRIMARY KEY, "
+>                     "sha256 TEXT NOT NULL, "
+>                     "size INTEGER NOT NULL)"
+>                 )
+>                 conn.executemany(
+>                     "INSERT INTO files VALUES (?, ?, ?)",
+>                     [(nfc_path, sha, sz) for (_, nfc_path, sha, sz) in rows]
+>                 )
+>                 conn.commit()
+>                 conn.close()
+>
+>                 os.replace(tmp_path, db_abs)
+>             except Exception:
+>                 try:
+>                     os.unlink(tmp_path)
+>                 except OSError:
+>                     pass
+>                 raise
+>         finally:
+>             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+> PYTHON_EOF
+root@b483ba2e11ac:/app# mkdir -p /tmp/testdir/sub && echo 'hello' > /tmp/testdir/a.txt && echo 'world' > /tmp/testdir/sub/b.txt
+root@b483ba2e11ac:/app# python3 -c "
+> from app.indexer import build_index
+> import sqlite3
+> build_index('/tmp/testdir', '/tmp/test.db')
+> conn = sqlite3.connect('/tmp/test.db')
+> for row in conn.execute('SELECT * FROM files ORDER BY path'):
+>     print(row)
+> conn.close()
+> "
+('a.txt', '5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03', 6)
+('sub/b.txt', 'e258d248fda94c63753607f7c4494ee0fcbe92f1a76bfdac795c9d84101eb317', 6)
+root@b483ba2e11ac:/app#

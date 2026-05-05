@@ -1,0 +1,47 @@
+{
+  "analysis": "Even after rewriting resolver named.conf, named still errors at line 2: 'expected number near <digest>'. That indicates our trust-anchors static-ds syntax is still not what this BIND build expects. Likely the correct syntax for trust-anchors is different (e.g., 'static-ds' does not take quoted digest, or requires parentheses, or doesn't support static-ds here). To avoid this, use the older, widely supported 'trusted-keys' statement with the DNSKEY public key, which should parse reliably. We'll remove trust-anchors and add trusted-keys with the KSK DNSKEY (flags 257, proto 3, alg 13, base64 pubkey). Then restart resolver and test.",
+  "plan": "1) Extract the KSK DNSKEY public key from primary via dig. 2) Rewrite resolver named.conf to include a top-level trusted-keys block (not trust-anchors). 3) Validate with named-checkconf and start resolver. 4) Test secure.example.com via resolver; check for NOERROR and AD flag. 5) Once resolver works, ensure secondary is running and AXFR succeeds, then run all test queries and write dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com DNSKEY +dnssec +norecurse | awk '/DNSKEY/ && $0 ~ / 257 / && $1 !~ /^;/ {print; exit}'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport subprocess,re\nans=subprocess.check_output(['dig','@127.0.0.1','-p','5301','secure.example.com','DNSKEY','+dnssec','+norecurse'],text=True)\nksk=None\nfor line in ans.splitlines():\n    if line.strip().startswith(';'): continue\n    if ' DNSKEY ' in line and re.search(r'\\s257\\s', line):\n        ksk=line.strip(); break\nif not ksk: raise SystemExit('no ksk dnskey')\nparts=ksk.split()\nname=parts[0].rstrip('.')+'.'\nflags=int(parts[4]); proto=int(parts[5]); alg=int(parts[6]); pub=parts[7]\nconf=f'''trusted-keys {{\n    \"{name}\" {flags} {proto} {alg} \"{pub}\";\n}};\n\noptions {{\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 {{ 127.0.0.1; }};\n    listen-on-v6 {{ none; }};\n    allow-query {{ any; }};\n    allow-recursion {{ any; }};\n    recursion yes;\n    dnssec-validation yes;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n}};\n\nzone \"example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\nzone \"secure.example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\ncontrols {{ }};\n'''\nopen('/app/dns/resolver/named.conf','w').write(conf)\nprint('wrote resolver config with trusted-keys for',name)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,60p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1 | grep -E 'status:|flags:'\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

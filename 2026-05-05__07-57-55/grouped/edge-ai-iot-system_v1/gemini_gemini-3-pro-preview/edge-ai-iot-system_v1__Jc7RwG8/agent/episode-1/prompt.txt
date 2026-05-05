@@ -1,0 +1,166 @@
+Current terminal state:
+New Terminal Output:
+
+root@559a5ed3d9fa:/app# cat << 'EOF' > solve.py
+> import json
+> import glob
+> import math
+>
+> def clamp(val, min_val=0.0, max_val=1.0):
+>     return max(min_val, min(val, max_val))
+>
+> def main():
+>     files = sorted(glob.glob('/app/device_*.json'))
+>     devices = []
+>     for f in files:
+>         with open(f, 'r') as fp:
+>             d = json.load(fp)
+>             devices.append(d)
+>
+>     results = []
+>     for d in devices:
+>         caps = d['capabilities']
+>         net = d['network']
+>         req = d['model_requirements']
+>
+>         storage_mb = caps['storage_mb']
+>         memory_mb = caps['memory_mb']
+>         compute_tflops = caps['compute_tflops']
+>
+>         bandwidth_mbps = net['bandwidth_mbps']
+>         latency_ms = net['latency_ms']
+>
+>         model_size_mb = req['model_size_mb']
+>         accuracy_threshold = req['accuracy_threshold']
+>
+>         # 1. Compression
+>         comp_ratio = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+>         comp_needed = comp_ratio > 0.3
+>         target_comp_size = storage_mb * 0.25
+>
+>         # 2. Quantization
+>         if accuracy_threshold >= 0.95:
+>             q_level = "FP32"
+>             bits = 32
+>         elif accuracy_threshold >= 0.90:
+>             q_level = "FP16"
+>             bits = 16
+>         elif accuracy_threshold >= 0.80:
+>             q_level = "INT8"
+>             bits = 8
+>         else:
+>             q_level = "INT4"
+>             bits = 4
+>
+>         q_eff = (32 / bits) * accuracy_threshold
+>
+>         # 3. FL Score
+>         net_quality = (bandwidth_mbps / 100.0) * (1.0 - latency_ms / 1000.0)
+>         comp_factor = min(compute_tflops / 5.0, 1.0)
+>         mem_factor = min(memory_mb / 4096.0, 1.0)
+>         fl_score = (net_quality * 0.4) + (comp_factor * 0.3) + (mem_factor * 0.3)
+>         fl_score = clamp(fl_score)
+>         fl_ready = fl_score >= 0.6
+>
+>         # 4. Inference Score
+>         storage_util = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+>         if model_size_mb == 0:
+>             mem_adeq = 0.0
+>             comp_adeq = 0.0
+>         else:
+>             mem_adeq = min(memory_mb / (model_size_mb * 2.0), 1.0)
+>             comp_adeq = min(compute_tflops / (model_size_mb * 0.001), 1.0)
+>
+>         inf_score = (1.0 - storage_util) * 0.3 + mem_adeq * 0.4 + comp_adeq * 0.3
+>         inf_score = clamp(inf_score)
+>
+>         results.append({
+>             'device_id': d['device_id'],
+>             'hardware_type': d['hardware_type'],
+>             'comp_ratio': comp_ratio,
+>             'comp_needed': comp_needed,
+>             'target_comp_size': target_comp_size,
+>             'q_level': q_level,
+>             'q_eff': q_eff,
+>             'fl_score': fl_score,
+>             'fl_ready': fl_ready,
+>             'inf_score': inf_score
+>         })
+>
+>     # Sort by inf_score desc
+>     results.sort(key=lambda x: x['inf_score'], reverse=True)
+>
+>     # Stats
+>     total_devices = len(results)
+>     mean_comp_ratio = sum(r['comp_ratio'] for r in results) / total_devices if total_devices > 0 else 0.0
+>     mean_fl_score = sum(r['fl_score'] for r in results) / total_devices if total_devices > 0 else 0.0
+>     if total_devices > 0:
+>         var_fl = sum((r['fl_score'] - mean_fl_score)**2 for r in results) / total_devices
+>         std_fl = math.sqrt(var_fl)
+>     else:
+>         std_fl = 0.0
+>
+>     total_fl_ready = sum(1 for r in results if r['fl_ready'])
+>
+>     # Generate JSON
+>     out_json = {
+>         'summary': {
+>             'total_devices': total_devices,
+>             'mean_compression_ratio': round(mean_comp_ratio, 3),
+>             'std_dev_fl_score': round(std_fl, 4),
+>             'fl_ready_devices': total_fl_ready
+>         },
+>         'devices': []
+>     }
+>
+>     # Generate TXT
+>     txt_lines = []
+>     txt_lines.append("EDGE AI DEPLOYMENT ANALYSIS")
+>     txt_lines.append("============================")
+>     txt_lines.append("")
+>     txt_lines.append("Summary Statistics:")
+>     txt_lines.append(f"- Total Devices: {total_devices}")
+>     txt_lines.append(f"- Mean Compression Ratio: {mean_comp_ratio:.3f}")
+>     txt_lines.append(f"- Std Dev FL Score: {std_fl:.4f}")
+>     txt_lines.append(f"- FL-Ready Devices: {total_fl_ready}")
+>     txt_lines.append("")
+>     txt_lines.append("Device Rankings (by Inference Score):")
+>
+>     for i, r in enumerate(results):
+>         rank = i + 1
+>         out_json['devices'].append({
+>             'rank': rank,
+>             'device_id': r['device_id'],
+>             'hardware_type': r['hardware_type'],
+>             'compression_needed': r['comp_needed'],
+>             'target_compressed_size_mb': round(r['target_comp_size'], 2),
+>             'quantization_level': r['q_level'],
+>             'quantization_efficiency': round(r['q_eff'], 4),
+>             'fl_score': round(r['fl_score'], 4),
+>             'fl_ready': r['fl_ready'],
+>             'inference_score': round(r['inf_score'], 4)
+>         })
+>
+>         comp_str = "needed" if r['comp_needed'] else "not needed"
+>         status_str = "ready" if r['fl_ready'] else "not ready"
+>
+>         txt_lines.append(f"{rank}. {r['device_id']} ({r['hardware_type']})")
+>         txt_lines.append(f"   Compression: {comp_str}, Target Size: {r['target_comp_size']:.2f} MB")
+>         txt_lines.append(f"   Quantization: {r['q_level']}, Efficiency: {r['q_eff']:.4f}")
+>         txt_lines.append(f"   FL Score: {r['fl_score']:.4f}, Status: {status_str}")
+>         txt_lines.append(f"   Inference Score: {r['inf_score']:.4f}")
+>
+>     with open('/app/deployment_analysis.json', 'w') as fp:
+>         json.dump(out_json, fp, indent=2)
+>
+>     with open('/app/deployment_report.txt', 'w') as fp:
+>         fp.write("\n".join(txt_lines) + "\n")
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@559a5ed3d9fa:/app# python3 solve.py
+root@559a5ed3d9fa:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

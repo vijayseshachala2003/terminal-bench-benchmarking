@@ -1,0 +1,902 @@
+[?2004hroot@39837010ada4:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@39837010ada4:/app# clear
+[?2004l[H[J[3J[?2004hroot@39837010ada4:/app# ls -la /app
+[?2004ltotal 72
+drwxr-xr-x. 1 root root   173 Apr 30 09:49 .
+drwxr-xr-x. 1 root root    74 Apr 30 12:44 ..
+-rwxr-xr-x. 1 root root  6883 Apr 30 09:39 generate_data.sh
+-rw-r--r--. 1 root root 13703 Apr 30 09:49 mysql_slow_07g1w9.log
+-rw-r--r--. 1 root root 11025 Apr 30 09:49 mysql_slow_4mvpet.log
+-rw-r--r--. 1 root root 12613 Apr 30 09:49 mysql_slow_4x92y2.log
+-rw-r--r--. 1 root root 14787 Apr 30 09:49 mysql_slow_rymn3u.log
+-rw-r--r--. 1 root root  1172 Apr 30 09:49 query_metadata.json
+[?2004hroot@39837010ada4:/app# python3 --version
+[?2004lPython 3.13.1
+[?2004hroot@39837010ada4:/app# cat > /app/analyze.py << 'EOF'
+[?2004l[?2004h> import json
+[?2004l[?2004h> import re
+[?2004l[?2004h> import os
+[?2004l[?2004h> import glob
+[?2004l[?2004h> from datetime import datetime, timedelta
+[?2004l[?2004h> from collections import defaultdict, Counter
+[?2004l[?2004h> 
+[?2004l[?2004h> def normalize_query(query):
+[?2004l[?2004h>     query = query.upper()
+[?2004l[?2004h>     # Replace numbers
+[?2004l[?2004h>     query = re.sub(r'\b\d+\.?\d*\b', '?', query)
+[?2004l[?2004h>     # Replace strings
+[?2004l[?2004h>     query = re.sub(r"'[^']*'", '?', query)
+[?2004l[?2004h>     query = re.sub(r'\"[^\"]*\"', '?', query)
+[?2004l[?2004h>     # Replace IN lists
+[?2004l[?2004h>     query = re.sub(r'IN\s*\(\s*\?\s*(?:,\s*\?\s*)*\)', 'IN (?)', query)
+[?2004l[?2004h>     return query.strip()
+[?2004l[?2004h> 
+[?2004l[?2004h> def parse_slow_log(content):
+[?2004l[?2004h>     entries = []
+[?2004l[?2004h>     lines = content.split('\n')
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(lines):
+[?2004l[?2004h>         if lines[i].startswith('# Time: '):
+[?2004l[?2004h>             time_str = lines[i][8:]
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 timestamp = datetime.strptime(time_str.strip(), '%Y-%m-%d %H:%M:%S')
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             query_time = None
+[?2004l[?2004h>             query = ''
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             while i < len(lines) and not lines[i].startswith('# Time:'):
+[?2004l[?2004h>                 if lines[i].startswith('# Query_time: '):
+[?2004l[?2004h>                     parts = lines[i].split()
+[?2004l[?2004h>                     query_time = float(parts[2])
+[?2004l[?2004h>                 elif not lines[i].startswith('#') and lines[i].strip():
+[?2004l[?2004h>                     query += lines[i] + ' '
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>             if query_time and query_time > 1.0:
+[?2004l[?2004h>                 entries.append((timestamp, query_time, query.strip()))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>     return entries
+[?2004l[?2004h> 
+[?2004l[?2004h> def extract_columns_from_query(query):
+[?2004l[?2004h>     tables = set()
+[?2004l[?2004h>     columns = set()
+[?2004l[?2004h>     # Simple regex to find FROM tables
+[?2004l[?2004h>     from_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+[?2004lt,
+            'selectivity': avg[?2004h>     if from_match:
+[?2004l[?2004h>         tables.add(from_match.group(1))
+[?2004l[?2004h>     join_matches = re.findall(r'JOIN\s+(\w+)', query, re.IGNORECASE)
+[?2004l[?2004h>     tables.update(join_matches)
+[?2004l[?2004h>     # WHERE columns
+[?2004l[?2004h>     where_cols = re.findall(r'\b(\w+)\s*[=<>!]+\s*\?', query)
+[?2004l[?2004h>     columns.update(where_cols)
+[?2004l[?2004h>     # IN
+[?2004l[?2004h>     in_cols = re.findall(r'\b(\w+)\s+IN\s+\(\?', query)
+[?2004l[?2004h>     columns.update(in_cols)
+[?2004l[?2004h>     # ORDER BY
+[?2004l[?2004h>     order_cols = re.findall(r'ORDER BY\s+(\w+)', query, re.IGNORECASE)
+[?2004l[?2004h>     columns.update(order_cols)
+[?2004l[?2004h>     # JOIN ON
+[?2004l[?2004h>     on_cols = re.findall(r'ON\s+\w+\.(\w+)\s*=\s*\w+\.(\w+)', query)
+[?2004l[?2004h>     for c1, c2 in on_cols:
+[?2004l[?2004h>         columns.update([c1, c2])
+[?2004l[?2004h>     return tables, columns
+[?2004l[?2004h> 
+[?2004l[?2004h> # Load metadata
+[?2004l[?2004h> with open('/app/query_metadata.json') as f:
+[?2004l[?2004h>     metadata = json.load(f)
+[?2004l[?2004h> budget = metadata['budget']
+[?2004l[?2004h> tables_meta = metadata['tables']
+[?2004l[?2004h> 
+[?2004l[?2004h> # Read logs
+[?2004l[?2004h> all_entries = []
+[?2004l[?2004h> for log_file in glob.glob('/app/mysql_slow_*.log'):
+[?2004l[?2004h>     with open(log_file) as f:
+[?2004l[?2004h>         content = f.read()
+[?2004l[?2004h>     all_entries.extend(parse_slow_log(content))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Group by normalized pattern
+[?2004l[?2004h> patterns = defaultdict(list)
+[?2004l[?2004h> for ts, qt, q in all_entries:
+[?2004l[?2004h>     norm = normalize_query(q)
+[?2004l[?2004h>     patterns[norm].append((ts, qt))
+[?2004l[?2004h> 
+[?2004l[?2004h> normalized_patterns = []
+[?2004l[?2004h> for pat, entries in patterns.items():
+[?2004l[?2004h>     freq = len(entries)
+[?2004l[?2004h>     total_time = sum(qt for _, qt in entries)
+[?2004l[?2004h>     avg_time = total_time / freq
+[?2004l[?2004h>     normalized_patterns.append({
+[?2004l[?2004h>         'pattern': pat,
+[?2004l[?2004h>         'frequency': freq,
+[?2004l[?2004h>         'avg_execution_time': round(avg_time, 1),
+[?2004l[?2004h>         'total_time': round(total_time, 1)
+[?2004l[?2004h>     })
+[?2004l[?2004h> normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+[?2004l[?2004h> 
+[?2004l[?2004h> total_slow_queries = sum(p['frequency'] for p in normalized_patterns)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Index candidates
+[?2004l[?2004h> index_candidates = []
+[?2004l[?2004h> table_patterns = defaultdict(list)
+[?2004l[?2004h> for pat in normalized_patterns:
+[?2004l[?2004h>     tables, cols = extract_columns_from_query(pat['pattern'])
+[?2004l[?2004h>     for table in tables:
+[?2004l[?2004h>         if table in tables_meta:
+[?2004l[?2004h>             table_patterns[table].append((pat, cols))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Single column candidates
+[?2004l[?2004h> candidate_map = {}
+[?2004l[?2004h> for table, pats_cols in table_patterns.items():
+[?2004l[?2004h>     table_cols_meta = tables_meta[table]['columns']
+[?2004l[?2004h>     for pat, cols in pats_cols:
+[?2004l[?2004h>         for col in cols:
+[?2004l[?2004h>             if col in table_cols_meta:
+[?2004l[?2004h>                 sel = table_cols_meta[col]['distinct_values'] / tables_meta[table]['total_rows']
+[?2004l[?2004h>                 sel = round(sel, 2)
+[?2004l[?2004h>                 impact = pat['frequency'] * pat['avg_execution_time'] * max(sel, 0.1)
+[?2004l[?2004h>                 impact = round(impact, 1)
+[?2004l[?2004h>                 key = (table, tuple([col]))
+[?2004l[?2004h>                 if key not in candidate_map or candidate_map[key]['impact_score'] < impact:
+[?2004l[?2004h>                     candidate_map[key] = {
+[?2004l[?2004h>                         'table': table,
+[?2004l[?2004h>                         'columns': [col],
+[?2004l[?2004h>                         'impact_score': impact,
+[?2004l[?2004h>                         'selectivity': sel,
+[?2004l[?2004h>                         'cost': round(100 * (1 + (table_cols_meta[col]['distinct_values'] + 1) ** 0.1 / 10), 1)  # ln approx
+[?2004l[?2004h>                     }
+[?2004l[?2004h> 
+[?2004l[?2004h> # Composite candidates
+[?2004l[?2004h> for table, pats_cols in table_patterns.items():
+[?2004l[?2004h>     all_cols = set()
+[?2004l[?2004h>     for _, cols in pats_cols:
+[?2004l[?2004h>         all_cols.update(cols)
+[?2004l[?2004h>     all_cols = [c for c in all_cols if c in tables_meta[table]['columns']]
+[?2004l[?2004h>     if len(all_cols) >= 2:
+[?2004l[?2004h>         sorted_cols = sorted(all_cols)
+[?2004l[?2004h>         # Find pattern with largest total_time for this table
+[?2004l[?2004h>         max_pat = max((pat for pat, _ in pats_cols), key=lambda p: p['total_time'])
+[?2004l[?2004h>         sels = [tables_meta[table]['columns'][c]['distinct_values'] / tables_meta[table]['total_rows'] for c in sorted_cols]
+[?2004l[?2004h>         avg_sel = sum(sels) / len(sels)
+[?2004l[?2004h>         avg_sel = round(avg_sel, 2)
+[?2004l[?2004h>         impact = max_pat['frequency'] * max_pat['avg_execution_time'] * max(avg_sel, 0.1)
+[?2004l[?2004h>         impact = round(impact, 1)
+[?2004l[?2004h>         avg_dist = sum(tables_meta[table]['columns'][c]['distinct_values'] for c in sorted_cols) / len(sorted_cols)
+[?2004l[?2004h>         cost = round(100 * len(sorted_cols) * (1 + (avg_dist + 1) ** 0.1 / 10), 1)
+[?2004l[?2004h>         key = (table, tuple(sorted_cols))
+[?2004l[?2004h>         candidate_map[key] = {
+[?2004l[?2004h>             'table': table,
+[?2004l[?2004h>             'columns': sorted_cols,
+[?2004l[?2004h>             'impact_score': impact,
+[?2004l[?2004h>             'selectivity': avg_sel,
+[?2004l[?2004h>             'cost': cost
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> index_candidates = list(candidate_map.values())
+[?2004l[?2004h> index_candidates.sort(key=lambda x: (-x['impact_score'], x['table'] + ''.join(x['columns'])))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Temporal correlations
+[?2004l[?2004h> all_times = [(ts, pat) for pat in patterns for ts, _ in patterns[pat]]
+[?2004l[?2004h> all_times.sort()
+[?2004l[?2004h> window_size = timedelta(seconds=60)
+[?2004l[?2004h> correlations = defaultdict(lambda: {'count': 0, 'deltas': []})
+[?2004l[?2004h> for i in range(len(all_times)):
+[?2004l[?2004h>     ts1, p1 = all_times[i]
+[?2004l[?2004h>     window_end = ts1 + window_size
+[?2004l[?2004h>     j = i + 1
+[?2004l[?2004h>     while j < len(all_times) and all_times[j][0] <= window_end:
+[?2004l[?2004h>         ts2, p2 = all_times[j]
+[?2004l[?2004h>         if p1 != p2:
+[?2004l[?2004h>             pair = tuple(sorted([p1, p2]))
+[?2004l[?2004h>             correlations[pair]['count'] += 1
+[?2004l[?2004h>             correlations[pair]['deltas'].append(abs((ts2 - ts1).total_seconds()))
+[?2004l[?2004h>         j += 1
+[?2004l[?2004h> 
+[?2004l[?2004h> temporal_correlations = []
+[?2004l[?2004h> for (p1, p2), data in correlations.items():
+[?2004l[?2004h>     if data['count'] >= 3:
+[?2004l[?2004h>         avg_delta = sum(data['deltas']) / len(data['deltas'])
+[?2004l[?2004h>         temporal_correlations.append({
+[?2004l[?2004h>             'pattern1': p1,
+[?2004l[?2004h>             'pattern2': p2,
+[?2004l[?2004h>             'correlation_strength': data['count'],
+[?2004l[?2004h>             'avg_time_delta': round(avg_delta, 1)
+[?2004l[?2004h>         })
+[?2004l[?2004h> temporal_correlations.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+[?2004l[?2004h> temporal_correlations = temporal_correlations[:3]
+[?2004l[?2004h> 
+[?2004l[?2004h> # Recommendations
+[?2004l[?2004h> recommended = []
+[?2004l[?2004h> table_count = defaultdict(int)
+[?2004l[?2004h> total_cost = 0
+[?2004l[?2004h> for cand in index_candidates:
+[?2004l[?2004h>     if len(recommended) >= 5:
+[?2004l[?2004h>         break
+[?2004l[?2004h>     if table_count[cand['table']] >= 2:
+[?2004l[?2004h>         continue
+[?2004l[?2004h>     if total_cost + cand['cost'] > budget:
+[?2004l[?2004h>         continue
+[?2004l[?2004h>     recommended.append(cand)
+[?2004l[?2004h>     table_count[cand['table']] += 1
+[?2004l[?2004h>     total_cost += cand['cost']
+[?2004l[?2004h> 
+[?2004l[?2004h> total_impact = sum(c['impact_score'] for c in recommended)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Output JSON
+[?2004l[?2004h> output = {
+[?2004l[?2004h>     'normalized_patterns': normalized_patterns,
+[?2004l[?2004h>     'index_candidates': index_candidates,
+[?2004l[?2004h>     'temporal_correlations': temporal_correlations,
+[?2004l[?2004h>     'recommended_indexes': recommended,
+[?2004l[?2004h>     'total_budget_used': round(total_cost, 1),
+[?2004l[?2004h>     'total_impact': round(total_impact, 1)
+[?2004l[?2004h> }
+[?2004l[?2004h> with open('/app/optimization.json', 'w') as f:
+[?2004l[?2004h>     json.dump(output, f, indent=2)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Text output
+[?2004l[?2004h> with open('/app/recommendations.txt', 'w') as f:
+[?2004l[?2004h>     f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+[?2004l[?2004h>     f.write('=====================================\n')
+[?2004l[?2004h>     f.write(f'Total Slow Queries: {total_slow_queries}\n')
+[?2004l[?2004h>     f.write(f'Unique Query Patterns: {len(normalized_patterns)}\n')
+[?2004l[?2004h>     f.write(f'Total Budget: {budget} points\n')
+[?2004l[?2004h>     f.write(f'Budget Used: {round(total_cost, 1)} points\n\n')
+[?2004l[?2004h>     f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+[?2004l[?2004h>     for i, pat in enumerate(normalized_patterns[:5], 1):
+[?2004l[?2004h>         # Compute S_max
+[?2004l[?2004h>         tables, cols = extract_columns_from_query(pat['pattern'])
+[?2004l[?2004h>         s_max = 0.1
+[?2004l[?2004h>         for table in tables:
+[?2004l[?2004h>             if table in tables_meta:
+[?2004l[?2004h>                 for col in cols:
+[?2004l[?2004h>                     if col in tables_meta[table]['columns']:
+[?2004l[?2004h>                         sel = tables_meta[table]['columns'][col]['distinct_values'] / tables_meta[table]['total_rows']
+[?2004l[?2004h>                         s_max = max(s_max, sel)
+[?2004l[?2004h>         impact = round(pat['frequency'] * pat['avg_execution_time'] * s_max, 1)
+[?2004l[?2004h>         pat_str = pat['pattern'][:60] + ('...' if len(pat['pattern']) > 60 else '')
+[?2004l[?2004h>         f.write(f'{i}. {pat_str} (Impact: {impact}, Freq: {pat["frequency"]}, Avg: {pat["avg_execution_time"]}s, Total: {pat["total_time"]}s)\n')
+[?2004l[?2004h>     f.write('\nTEMPORAL CORRELATIONS:\n')
+[?2004l[?2004h>     for i, corr in enumerate(temporal_correlations, 1):
+[?2004l[?2004h>         f.write(f'{i}. Pattern Pair (Strength: {corr["correlation_strength"]}):\n')
+[?2004l[?2004h>         f.write(f'   - {corr["pattern1"]}\n')
+[?2004l[?2004h>         f.write(f'   - {corr["pattern2"]}\n')
+[?2004l[?2004h>     f.write('\nRECOMMENDED INDEXES (5 max):\n')
+[?2004l[?2004h>     for i, idx in enumerate(recommended, 1):
+[?2004l[?2004h>         cols_str = ','.join(idx['columns'])
+[?2004l[?2004h>         f.write(f'{i}. {idx["table"]}({cols_str}) - Impact: {idx["impact_score"]}, Cost: {idx["cost"]} [high_impact]\n')
+[?2004l[?2004h>     f.write('\nOPTIMIZATION SUMMARY:\n')
+[?2004l[?2004h>     f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+[?2004l[?2004h>     f.write(f'- Remaining budget: {round(budget - total_cost, 1)} points\n')
+[?2004l[?2004h>     f.write(f'- Tables optimized: {len(table_count)}\n')
+[?2004l[?2004h> 
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@39837010ada4:/app# python3 /app/analyze.py
+[?2004l[?2004hroot@39837010ada4:/app# ls -la /app
+[?2004ltotal 92
+drwxr-xr-x. 1 root root    76 Apr 30 12:45 .
+drwxr-xr-x. 1 root root    85 Apr 30 12:44 ..
+-rw-r--r--. 1 root root  9940 Apr 30 12:45 analyze.py
+-rwxr-xr-x. 1 root root  6883 Apr 30 09:39 generate_data.sh
+-rw-r--r--. 1 root root 13703 Apr 30 09:49 mysql_slow_07g1w9.log
+-rw-r--r--. 1 root root 11025 Apr 30 09:49 mysql_slow_4mvpet.log
+-rw-r--r--. 1 root root 12613 Apr 30 09:49 mysql_slow_4x92y2.log
+-rw-r--r--. 1 root root 14787 Apr 30 09:49 mysql_slow_rymn3u.log
+-rw-r--r--. 1 root root   164 Apr 30 12:45 optimization.json
+-rw-r--r--. 1 root root  1172 Apr 30 09:49 query_metadata.json
+-rw-r--r--. 1 root root   388 Apr 30 12:45 recommendations.txt
+[?2004hroot@39837010ada4:/app# head -20 /app/optimization.json
+[?2004l{
+  "normalized_patterns": [],
+  "index_candidates": [],
+  "temporal_correlations": [],
+  "recommended_indexes": [],
+  "total_budget_used": 0,
+  "total_impact": 0
+}[?2004hroot@39837010ada4:/app# cat /app/recommendations.txt
+[?2004lADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 0
+Unique Query Patterns: 0
+Total Budget: 1000 points
+Budget Used: 0 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+
+TEMPORAL CORRELATIONS:
+
+RECOMMENDED INDEXES (5 max):
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 0
+- Remaining budget: 1000 points
+- Tables optimized: 0
+[?2004hroot@39837010ada4:/app# cat > /app/analyze.py << 'EOF'
+[?2004lh('# Time:'):
+                if lines[i].startswith('# Query_time: '):
+                    parts = lines[i].split()
+                    query_time = float(parts[2])
+                elif not lines[i].startswith('#') and lines[i].strip():
+                    query += lines[i] + ' '
+                i += 1
+            if query_time and query_time > 1.0:
+                entries.append((timestamp, query_time, query.strip()))
+        else:
+            i += 1
+    return entries
+
+def extract_columns_from_query(query):
+    tables = set()
+    columns = set()
+    # Simple regex to find FROM tables
+    from_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+    if from_match:
+        tables.add(from_match.group(1))
+    join_matches = re.findall(r'JOIN\s+(\w+)', query, re.IGNORECASE)
+    tables.update(join_matches)
+    # WHERE columns
+    where_cols = re.findall(r'\b(\w+)\s*[=<>!]+\s*\?', query)
+    columns.update(where_cols)
+    # IN
+    in_cols = re.findall(r'\b(\w+)\s+IN\s+\(\?', query)
+    columns.update(in_cols)
+    # ORDER BY
+    order_cols = re.findall(r'ORDER BY\s+(\w+)', query, re.IGNORECASE)
+    columns.update(order_cols)
+    # JOIN ON
+    on_cols = re.findall(r'ON\s+\w+\.(\w+)\s*=\s*\w+\.(\w+)', query)
+    for c1, c2 in on_cols:
+        columns.update([c1, c2])
+    return tables, columns
+
+# Load metadata
+with open('/app/query_metadata.json') as f:
+    metadata = json.load(f)
+budget = metadata['budget']
+tables_meta = metadata['tables']
+
+# Read logs
+all_entries = []
+for log_file in glob.glob('/app/mysql_slow_*.log'):
+    with open(log_file) as f:
+        content = f.read()
+    all_entries.extend(parse_slow_log(content))
+
+# Group by normalized pattern
+patterns = defaultdict(list)
+for ts, qt, q in all_entries:
+    norm = normalize_query(q)
+    patterns[norm].append((ts, qt))
+
+normalized_patterns = []
+for pat, entries in patterns.items():
+    freq = len(entries)
+    total_time = sum(qt for _, qt in entries)
+    avg_time = total_time / freq
+    normalized_patterns.append({
+        'pattern': pat,
+        'frequency': freq,
+        'avg_execution_time': round(avg_time, 1),
+        'total_time': round(total_time, 1)
+    })
+normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+
+total_slow_queries = sum(p['frequency'] for p in normalized_patterns)
+
+# Index candidates
+index_candidates = []
+table_patterns = defaultdict(list)
+for pat in normalized_patterns:
+    tables, cols = extract_columns_from_query(pat['pattern'])
+    for table in tables:
+        if table in tables_meta:
+            table_patterns[table].append((pat, cols))
+
+# Single column candidates
+candidate_map = {}
+for table, pats_cols in table_patterns.items():
+    table_cols_meta = tables_meta[table]['columns']
+    for pat, cols in pats_cols:
+        for col in cols:
+            if col in table_cols_meta:
+                sel = table_cols_meta[col]['distinct_values'] / tables_meta[table]['total_rows']
+                sel = round(sel, 2)
+                impact = pat['frequency'] * pat['avg_execution_time'] * max(sel, 0.1)
+                impact = round(impact, 1)
+              [?2004h> import json
+[?2004l[?2004h> import re
+[?2004l[?2004h> import os
+[?2004l[?2004h> import glob
+[?2004l[?2004h> from datetime import datetime, timedelta
+[?2004l[?2004h> from collections import defaultdict, Counter
+[?2004l[?2004h> import math
+[?2004l[?2004h> 
+[?2004l[?2004h> def normalize_query(query):
+[?2004l[?2004h>     query = query.upper()
+[?2004l[?2004h>     # Replace numbers
+[?2004l[?2004h>     query = re.sub(r'\b\d+\.?\d*\b', '?', query)
+[?2004l[?2004h>     # Replace strings
+[?2004l[?2004h>     query = re.sub(r"'[^']*'", '?', query)
+[?2004l[?2004h>     query = re.sub(r'\"[^\"]*\"', '?', query)
+[?2004l[?2004h>     # Replace IN lists
+[?2004l[?2004h>     query = re.sub(r'IN\s*\(\s*\?\s*(?:,\s*\?\s*)*\)', 'IN (?)', query)
+[?2004l[?2004h>     return query.strip()
+[?2004l[?2004h> 
+[?2004l[?2004h> def parse_slow_log(content):
+[?2004l[?2004h>     entries = []
+[?2004l[?2004h>     lines = content.split('\n')
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(lines):
+[?2004l[?2004h>         if lines[i].startswith('# Time: '):
+[?2004l[?2004h>             time_str = lines[i][8:]
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 timestamp = datetime.strptime(time_str.strip(), '%y%m%d %H:%M:%S')
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             query_time = None
+[?2004l[?2004h>             query = ''
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             while i < len(lines) and not lines[i].startswith('# Time:'):
+[?2004l[?2004h>                 if lines[i].startswith('# Query_time: '):
+[?2004l[?2004h>                     parts = lines[i].split()
+[?2004l[?2004h>                     query_time = float(parts[2])
+[?2004l[?2004h>                 elif not lines[i].startswith('#') and lines[i].strip():
+[?2004l[?2004h>                     query += lines[i] + ' '
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>             if query_time and query_time > 1.0:
+[?2004l[?2004h>                 entries.append((timestamp, query_time, query.strip()))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>     return entries
+[?2004l[?2004h> 
+[?2004l[?2004h> def extract_columns_from_query(query):
+[?2004l[?2004h>     tables = set()
+[?2004l[?2004h>     columns = set()
+[?2004l[?2004h>     # Simple regex to find FROM tables
+[?2004l[?2004h>     from_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+[?2004l[?2004h>     if from_match:
+[?2004l[?2004h>         tables.add(from_match.group(1))
+[?2004l[?2004h>     join_matches = re.findall(r'JOIN\s+(\w+)', query, re.IGNORECASE)
+[?2004l[?2004h>     tables.update(join_matches)
+[?2004l[?2004h>     # WHERE columns
+[?2004l[?2004h>     where_cols = re.findall(r'\b(\w+)\s*[=<>!]+\s*\?', query)
+[?2004l[?2004h>     columns.update(where_cols)
+[?2004l[?2004h>     # IN
+[?2004l[?2004h>     in_cols = re.findall(r'\b(\w+)\s+IN\s+\(\?', query)
+[?2004l[?2004h>     columns.update(in_cols)
+[?2004l[?2004h>     # ORDER BY
+[?2004l[?2004h>     order_cols = re.findall(r'ORDER BY\s+(\w+)', query, re.IGNORECASE)
+[?2004l[?2004h>     columns.update(order_cols)
+[?2004l[?2004h>     # JOIN ON
+[?2004l[?2004h>     on_cols = re.findall(r'ON\s+\w+\.(\w+)\s*=\s*\w+\.(\w+)', query)
+[?2004l[?2004h>     for c1, c2 in on_cols:
+[?2004l[?2004h>         columns.update([c1, c2])
+[?2004l[?2004h>     return tables, columns
+[?2004l[?2004h> 
+[?2004l[?2004h> # Load metadata
+[?2004l[?2004h> with open('/app/query_metadata.json') as f:
+[?2004l[?2004h>     metadata = json.load(f)
+[?2004l[?2004h> budget = metadata['budget']
+[?2004l[?2004h> tables_meta = metadata['tables']
+[?2004l[?2004h> 
+[?2004l[?2004h> # Read logs
+[?2004l[?2004h> all_entries = []
+[?2004l[?2004h> for log_file in glob.glob('/app/mysql_slow_*.log'):
+[?2004l[?2004h>     with open(log_file) as f:
+[?2004l[?2004h>         content = f.read()
+[?2004l[?2004h>     all_entries.extend(parse_slow_log(content))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Group by normalized pattern
+[?2004l[?2004h> patterns = defaultdict(list)
+[?2004l[?2004h> for ts, qt, q in all_entries:
+[?2004l[?2004h>     norm = normalize_query(q)
+[?2004l[?2004h>     patterns[norm].append((ts, qt))
+[?2004lg_[?2004h> 
+[?2004l[?2004h> normalized_patterns = []
+[?2004l[?2004h> for pat, entries in patterns.items():
+[?2004l[?2004h>     freq = len(entries)
+[?2004l[?2004h>     total_time = sum(qt for _, qt in entries)
+[?2004l[?2004h>     avg_time = total_time / freq
+[?2004l[?2004h>     normalized_patterns.append({
+[?2004l[?2004h>         'pattern': pat,
+[?2004l[?2004h>         'frequency': freq,
+[?2004l[?2004h>         'avg_execution_time': round(avg_time, 1),
+[?2004l[?2004h>         'total_time': round(total_time, 1)
+[?2004l[?2004h>     })
+[?2004l[?2004h> normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+[?2004l[?2004h> 
+[?2004l[?2004h> total_slow_queries = sum(p['frequency'] for p in normalized_patterns)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Index candidates
+[?2004l[?2004h> index_candidates = []
+[?2004l[?2004h> table_patterns = defaultdict(list)
+[?2004l[?2004h> for pat in normalized_patterns:
+[?2004l[?2004h>     tables, cols = extract_columns_from_query(pat['pattern'])
+[?2004l[?2004h>     for table in tables:
+[?2004l[?2004h>         if table in tables_meta:
+[?2004l[?2004h>             table_patterns[table].append((pat, cols))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Single column candidates
+[?2004l[?2004h> candidate_map = {}
+[?2004l[?2004h> for table, pats_cols in table_patterns.items():
+[?2004l[?2004h>     table_cols_meta = tables_meta[table]['columns']
+[?2004l[?2004h>     for pat, cols in pats_cols:
+[?2004l[?2004h>         for col in cols:
+[?2004l[?2004h>             if col in table_cols_meta:
+[?2004l[?2004h>                 sel = table_cols_meta[col]['distinct_values'] / tables_meta[table]['total_rows']
+[?2004l[?2004h>                 sel = round(sel, 2)
+[?2004l[?2004h>                 impact = pat['frequency'] * pat['avg_execution_time'] * max(sel, 0.1)
+[?2004l[?2004h>                 impact = round(impact, 1)
+[?2004l[?2004h>                 cost = round(100 * (1 + math.log(table_cols_meta[col]['distinct_values'] + 1) / 10), 1)
+[?2004l[?2004h>                 key = (table, tuple([col]))
+[?2004l[?2004h>                 if key not in candidate_map or candidate_map[key]['impact_score'] < impact:
+[?2004l[?2004h>                     candidate_map[key] = {
+[?2004l[?2004h>                         'table': table,
+[?2004l[?2004h>                         'columns': [col],
+[?2004l[?2004h>                         'impact_score': impact,
+[?2004l[?2004h>                         'selectivity': sel,
+[?2004l[?2004h>                         'cost': cost
+[?2004l[?2004h>                     }
+[?2004l[?2004h> 
+[?2004l[?2004h> # Composite candidates
+[?2004l[?2004h> for table, pats_cols in table_patterns.items():
+[?2004l[?2004h>     all_cols = set()
+[?2004l[?2004h>     for _, cols in pats_cols:
+[?2004l[?2004h>         all_cols.update(cols)
+[?2004l[?2004h>     all_cols = [c for c in all_cols if c in tables_meta[table]['columns']]
+[?2004l[?2004h>     if len(all_cols) >= 2:
+[?2004l[?2004h>         sorted_cols = sorted(all_cols)
+[?2004l[?2004h>         # Find pattern with largest total_time for this table
+[?2004l[?2004h>         max_pat = max((pat for pat, _ in pats_cols), key=lambda p: p['total_time'])
+[?2004l[?2004h>         sels = [tables_meta[table]['columns'][c]['distinct_values'] / tables_meta[table]['total_rows'] for c in sorted_cols]
+[?2004l[?2004h>         avg_sel = sum(sels) / len(sels)
+[?2004l[?2004h>         avg_sel = round(avg_sel, 2)
+[?2004l[?2004h>         impact = max_pat['frequency'] * max_pat['avg_execution_time'] * max(avg_sel, 0.1)
+[?2004l[?2004h>         impact = round(impact, 1)
+[?2004l[?2004h>         avg_dist = sum(tables_meta[table]['columns'][c]['distinct_values'] for c in sorted_cols) / len(sorted_cols)
+[?2004l[?2004h>         cost = round(100 * len(sorted_cols) * (1 + math.log(avg_dist + 1) / 10), 1)
+[?2004l[?2004h>         key = (table, tuple(sorted_cols))
+[?2004l[?2004h>         candidate_map[key] = {
+[?2004l[?2004h>             'table': table,
+[?2004l[?2004h>             'columns': sorted_cols,
+[?2004l[?2004h>             'impact_score': impact,
+[?2004l[?2004h>             'selectivity': avg_sel,
+[?2004l[?2004h>             'cost': cost
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> index_candidates = list(candidate_map.values())
+[?2004l[?2004h> index_candidates.sort(key=lambda x: (-x['impact_score'], x['table'] + ''.join(x['columns'])))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Temporal correlations
+[?2004l[?2004h> all_times = [(ts, pat) for pat in patterns for ts, _ in patterns[pat]]
+[?2004l[?2004h> all_times.sort()
+[?2004l[?2004h> window_size = timedelta(seconds=60)
+[?2004l[?2004h> correlations = defaultdict(lambda: {'count': 0, 'deltas': []})
+[?2004l[?2004h> for i in range(len(all_times)):
+[?2004l[?2004h>     ts1, p1 = all_times[i]
+[?2004l[?2004h>     window_end = ts1 + window_size
+[?2004l[?2004h>     j = i + 1
+[?2004l[?2004h>     while j < len(all_times) and all_times[j][0] <= window_end:
+[?2004l[?2004h>         ts2, p2 = all_times[j]
+[?2004l[?2004h>         if p1 != p2:
+[?2004l[?2004h>             pair = tuple(sorted([p1, p2]))
+[?2004l[?2004h>             correlations[pair]['count'] += 1
+[?2004l[?2004h>             correlations[pair]['deltas'].append(abs((ts2 - ts1).total_seconds()))
+[?2004l[?2004h>         j += 1
+[?2004l[?2004h> 
+[?2004l[?2004h> temporal_correlations = []
+[?2004l[?2004h> for (p1, p2), data in correlations.items():
+[?2004l[?2004h>     if data['count'] >= 3:
+[?2004l[?2004h>         avg_delta = sum(data['deltas']) / len(data['deltas'])
+[?2004l[?2004h>         temporal_correlations.append({
+[?2004l[?2004h>             'pattern1': p1,
+[?2004l[?2004h>             'pattern2': p2,
+[?2004l[?2004h>             'correlation_strength': data['count'],
+[?2004l[?2004h>             'avg_time_delta': round(avg_delta, 1)
+[?2004l[?2004h>         })
+[?2004l[?2004h> temporal_correlations.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+[?2004l[?2004h> temporal_correlations = temporal_correlations[:3]
+[?2004l[?2004h> 
+[?2004l[?2004h> # Recommendations
+[?2004l[?2004h> recommended = []
+[?2004l[?2004h> table_count = defaultdict(int)
+[?2004l[?2004h> total_cost = 0
+[?2004l[?2004h> for cand in index_candidates:
+[?2004l[?2004h>     if len(recommended) >= 5:
+[?2004l[?2004h>         break
+[?2004l[?2004h>     if table_count[cand['table']] >= 2:
+[?2004l[?2004h>         continue
+[?2004l[?2004h>     if total_cost + cand['cost'] > budget:
+[?2004l[?2004h>         continue
+[?2004l[?2004h>     recommended.append(cand)
+[?2004l[?2004h>     table_count[cand['table']] += 1
+[?2004l[?2004h>     total_cost += cand['cost']
+[?2004l[?2004h> 
+[?2004l[?2004h> total_impact = sum(c['impact_score'] for c in recommended)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Output JSON
+[?2004l[?2004h> output = {
+[?2004l[?2004h>     'normalized_patterns': normalized_patterns,
+[?2004l[?2004h>     'index_candidates': index_candidates,
+[?2004l[?2004h>     'temporal_correlations': temporal_correlations,
+[?2004l[?2004h>     'recommended_indexes': recommended,
+[?2004l[?2004h>     'total_budget_used': round(total_cost, 1),
+[?2004l[?2004h>     'total_impact': round(total_impact, 1)
+[?2004l[?2004h> }
+[?2004l[?2004h> with open('/app/optimization.json', 'w') as f:
+[?2004l[?2004h>     json.dump(output, f, indent=2)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Text output
+[?2004l[?2004h> with open('/app/recommendations.txt', 'w') as f:
+[?2004l[?2004h>     f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+[?2004l[?2004h>     f.write('=====================================\n')
+[?2004l[?2004h>     f.write(f'Total Slow Queries: {total_slow_queries}\n')
+[?2004l[?2004h>     f.write(f'Unique Query Patterns: {len(normalized_patterns)}\n')
+[?2004l[?2004h>     f.write(f'Total Budget: {budget} points\n')
+[?2004l[?2004h>     f.write(f'Budget Used: {round(total_cost, 1)} points\n\n')
+[?2004l[?2004h>     f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+[?2004l[?2004h>     for i, pat in enumerate(normalized_patterns[:5], 1):
+[?2004l[?2004h>         # Compute S_max
+[?2004l[?2004h>         tables, cols = extract_columns_from_query(pat['pattern'])
+[?2004l[?2004h>         s_max = 0.1
+[?2004l[?2004h>         for table in tables:
+[?2004l[?2004h>             if table in tables_meta:
+[?2004l[?2004h>                 for col in cols:
+[?2004l[?2004h>                     if col in tables_meta[table]['columns']:
+[?2004l[?2004h>                         sel = tables_meta[table]['columns'][col]['distinct_values'] / tables_meta[table]['total_rows']
+[?2004l[?2004h>                         s_max = max(s_max, sel)
+[?2004l[?2004h>         impact = round(pat['frequency'] * pat['avg_execution_time'] * s_max, 1)
+[?2004l[?2004h>         pat_str = pat['pattern'][:60] + ('...' if len(pat['pattern']) > 60 else '')
+[?2004l[?2004h>         f.write(f'{i}. {pat_str} (Impact: {impact}, Freq: {pat["frequency"]}, Avg: {pat["avg_execution_time"]}s, Total: {pat["total_time"]}s)\n')
+[?2004l[?2004h>     f.write('\nTEMPORAL CORRELATIONS:\n')
+[?2004l[?2004h>     for i, corr in enumerate(temporal_correlations, 1):
+[?2004l[?2004h>         f.write(f'{i}. Pattern Pair (Strength: {corr["correlation_strength"]}):\n')
+[?2004l[?2004h>         f.write(f'   - {corr["pattern1"]}\n')
+[?2004l[?2004h>         f.write(f'   - {corr["pattern2"]}\n')
+[?2004l[?2004h>     f.write('\nRECOMMENDED INDEXES (5 max):\n')
+[?2004l[?2004h>     for i, idx in enumerate(recommended, 1):
+[?2004l[?2004h>         cols_str = ','.join(idx['columns'])
+[?2004l[?2004h>         f.write(f'{i}. {idx["table"]}({cols_str}) - Impact: {idx["impact_score"]}, Cost: {idx["cost"]} [high_impact]\n')
+[?2004l[?2004h>     f.write('\nOPTIMIZATION SUMMARY:\n')
+[?2004l[?2004h>     f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+[?2004l[?2004h>     f.write(f'- Remaining budget: {round(budget - total_cost, 1)} points\n')
+[?2004l[?2004h>     f.write(f'- Tables optimized: {len(table_count)}\n')
+[?2004l[?2004h> 
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@39837010ada4:/app# python3 /app/analyze.py
+[?2004l[?2004hroot@39837010ada4:/app# head -30 /app/optimization.json
+[?2004l{
+  "normalized_patterns": [],
+  "index_candidates": [],
+  "temporal_correlations": [],
+  "recommended_indexes": [],
+  "total_budget_used": 0,
+  "total_impact": 0
+}[?2004hroot@39837010ada4:/app# cat /app/recommendations.txt
+[?2004lADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 0
+Unique Query Patterns: 0
+Total Budget: 1000 points
+Budget Used: 0 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+
+TEMPORAL CORRELATIONS:
+
+RECOMMENDED INDEXES (5 max):
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 0
+- Remaining budget: 1000 points
+- Tables optimized: 0
+[?2004hroot@39837010ada4:/app# head -50 /app/mysql_slow_07g1w9.log
+[?2004l# Time: 2026-04-30 09:49:51.021094+0000
+# User@Host: app_user[app_user] @ [192.168.1.254]
+# Thread_id: 530  Schema: users_db  QC_hit: No
+# Query_time: 2.4  Lock_time: 0.00067  Rows_sent: 7708  Rows_examined: 12675
+# Rows_affected: 534  Bytes_sent: 31454
+use users_db;
+SET timestamp=1777542591;
+SELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.email = 'admin@test.com';
+
+# Time: 2026-04-30 09:49:52.025894+0000
+# User@Host: app_user[app_user] @ [192.168.1.123]
+# Thread_id: 449  Schema: users_db  QC_hit: No
+# Query_time: 2.4  Lock_time: 0.000748  Rows_sent: 7315  Rows_examined: 27453
+# Rows_affected: 469  Bytes_sent: 1655
+use users_db;
+SET timestamp=1777542592;
+SELECT u.*, o.* FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 21104;
+
+# Time: 2026-04-30 09:50:45.024127+0000
+# User@Host: app_user[app_user] @ [192.168.1.17]
+# Thread_id: 436  Schema: orders_db  QC_hit: No
+# Query_time: 2.4  Lock_time: 0.000894  Rows_sent: 3905  Rows_examined: 18654
+# Rows_affected: 95  Bytes_sent: 15595
+use orders_db;
+SET timestamp=1777542645;
+SELECT * FROM orders WHERE created_at > '2024-05-18' ORDER BY id;
+
+# Time: 2026-04-30 09:50:57.002647+0000
+# User@Host: app_user[app_user] @ [192.168.1.86]
+# Thread_id: 687  Schema: orders_db  QC_hit: No
+# Query_time: 8.7  Lock_time: 0.000579  Rows_sent: 1707  Rows_examined: 19613
+# Rows_affected: 940  Bytes_sent: 8955
+use orders_db;
+SET timestamp=1777542657;
+SELECT oi.* FROM order_items oi JOIN orders o ON oi.order_id = o.id WHERE o.user_id = 25553;
+
+# Time: 2026-04-30 09:52:44.002976+0000
+# User@Host: app_user[app_user] @ [192.168.1.128]
+# Thread_id: 479  Schema: orders_db  QC_hit: No
+# Query_time: 2.4  Lock_time: 0.000427  Rows_sent: 4820  Rows_examined: 13974
+# Rows_affected: 398  Bytes_sent: 5938
+use orders_db;
+SET timestamp=1777542764;
+SELECT * FROM orders WHERE status IN ('inactive', 'deleted');
+
+# Time: 2026-04-30 09:52:46.001119+0000
+# User@Host: app_user[app_user] @ [192.168.1.102]
+# Thread_id: 788  Schema: products_db  QC_hit: No
+# Query_time: 2.4  Lock_time: 0.000590  Rows_sent: 3130  Rows_examined: 27008
+# Rows_affected: 224  Bytes_sent: 1700
+[?2004hroot@39837010ada4:/app# python3 -c "with open('/app/mysql_slow_07g1w9.log') as f: print(repr(f.read()[:500]))"
+[?2004l"# Time: 2026-04-30 09:49:51.021094+0000\n# User@Host: app_user[app_user] @ [192.168.1.254]\n# Thread_id: 530  Schema: users_db  QC_hit: No\n# Query_time: 2.4  Lock_time: 0.00067  Rows_sent: 7708  Rows_examined: 12675\n# Rows_affected: 534  Bytes_sent: 31454\nuse users_db;\nSET timestamp=1777542591;\nSELECT o.* FROM orders o JOIN users u ON o.user_id = u.id WHERE u.email = 'admin@test.com';\n\n# Time: 2026-04-30 09:49:52.025894+0000\n# User@Host: app_user[app_user] @ [192.168.1.123]\n# Thread_id: 449  Schem"
+[?2004hroot@39837010ada4:/app# sed -i "s/timestamp = datetime.strptime(time_str.strip(), '%y%m%d %H:%M:%S')/timestamp = datetime.strptime(time_str.strip(), '%Y-%m-%d %H:%M:%S.%f%z')/" /app/analyze.py
+[?2004l[?2004hroot@39837010ada4:/app# python3 /app/analyze.py
+[?2004l[?2004hroot@39837010ada4:/app# head -50 /app/optimization.json
+[?2004l{
+  "normalized_patterns": [
+    {
+      "pattern": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?;",
+      "frequency": 14,
+      "avg_execution_time": 5.0,
+      "total_time": 69.5
+    },
+    {
+      "pattern": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE EMAIL = ?;",
+      "frequency": 10,
+      "avg_execution_time": 6.1,
+      "total_time": 60.9
+    },
+    {
+      "pattern": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID;",
+      "frequency": 10,
+      "avg_execution_time": 5.8,
+      "total_time": 57.5
+    },
+    {
+      "pattern": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID = O.ID WHERE O.USER_ID = ?;",
+      "frequency": 8,
+      "avg_execution_time": 7.0,
+      "total_time": 56.0
+    },
+    {
+      "pattern": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS IN (?);",
+      "frequency": 13,
+      "avg_execution_time": 4.2,
+      "total_time": 54.1
+    },
+    {
+      "pattern": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE ID IN (?);",
+      "frequency": 8,
+      "avg_execution_time": 6.6,
+      "total_time": 52.5
+    },
+    {
+      "pattern": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS = ?;",
+      "frequency": 9,
+      "avg_execution_time": 5.2,
+      "total_time": 46.7
+    },
+    {
+      "pattern": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE COUNTRY = ?;",
+      "frequency": 8,
+      "avg_execution_time": 5.5,
+      "total_time": 44.1
+    },
+[?2004hroot@39837010ada4:/app# cat /app/recommendations.txt
+[?2004lADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 0 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE STA... (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE EMA... (Impact: 6.1, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE C... (Impact: 5.8, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. USE ORDERS_DB; SET TIMESTAMP=?; SELECT OI.* FROM ORDER_ITEMS... (Impact: 5.6, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE S... (Impact: 5.5, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 12):
+   - USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID;
+   - USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS = ?;
+2. Pattern Pair (Strength: 12):
+   - USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS IN (?);
+   - USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE COUNTRY = ?;
+3. Pattern Pair (Strength: 11):
+   - USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS IN (?);
+   - USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?;
+
+RECOMMENDED INDEXES (5 max):
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 0
+- Remaining budget: 1000 points
+- Tables optimized: 0
+[?2004hroot@39837010ada4:/app# cat /app/query_metadata.json
+[?2004l{
+  "budget": 1000,
+  "tables": {
+    "users": {
+      "total_rows": 100000,
+      "columns": {
+        "id": {"distinct_values": 95000},
+        "email": {"distinct_values": 98000},
+        "status": {"distinct_values": 5},
+        "created_at": {"distinct_values": 50000},
+        "country": {"distinct_values": 150}
+      }
+    },
+    "orders": {
+      "total_rows": 500000,
+      "columns": {
+        "id": {"distinct_values": 480000},
+        "user_id": {"distinct_values": 80000},
+        "status": {"distinct_values": 8},
+        "created_at": {"distinct_values": 200000},
+        "total_amount": {"distinct_values": 100000}
+      }
+    },
+    "products": {
+      "total_rows": 10000,
+      "columns": {
+        "id": {"distinct_values": 9500},
+        "name": {"distinct_values": 9500},
+        "category": {"distinct_values": 50},
+        "price": {"distinct_values": 5000}
+      }
+    },
+    "order_items": {
+      "total_rows": 1000000,
+      "columns": {
+        "id": {"distinct_values": 950000},
+        "order_id": {"distinct_values": 450000},
+        "product_id": {"distinct_values": 9000},
+        "quantity": {"distinct_values": 20}
+      }
+    }
+  }
+}
+[?2004hroot@39837010ada4:/app# grep -A 20 '"index_candidates":' /app/optimization.json
+[?2004l  "index_candidates": [],
+  "temporal_correlations": [
+    {
+      "pattern1": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID;",
+      "pattern2": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS = ?;",
+      "correlation_strength": 12,
+      "avg_time_delta": 28.9
+    },
+    {
+      "pattern1": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS IN (?);",
+      "pattern2": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE COUNTRY = ?;",
+      "correlation_strength": 12,
+      "avg_time_delta": 30.8
+    },
+    {
+      "pattern1": "USE ORDERS_DB; SET TIMESTAMP=?; SELECT * FROM ORDERS WHERE STATUS IN (?);",
+      "pattern2": "USE USERS_DB; SET TIMESTAMP=?; SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?;",
+      "correlation_strength": 11,
+      "avg_time_delta": 23.1
+    }
+  ],
+[?2004hroot@39837010ada4:/app# 

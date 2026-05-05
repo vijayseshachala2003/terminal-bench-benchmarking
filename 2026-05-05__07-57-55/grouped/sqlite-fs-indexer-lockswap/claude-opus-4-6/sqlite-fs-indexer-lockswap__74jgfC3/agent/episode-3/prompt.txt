@@ -1,0 +1,272 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@ece4444ae416:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+> import fnmatch
+> import fcntl
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read and parse ignore patterns from the ignore file."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 # Normalize pattern to NFC
+>                 pattern = unicodedata.normalize("NFC", line.strip())
+>                 if pattern:
+>                     patterns.append(pattern)
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _pattern_match(pattern, text):
+>     """
+>     Match pattern against text where * matches zero or more characters
+>     but NOT '/'. ** is treated as two literal * characters (matching
+>     a literal '*' then zero-or-more non-slash chars... but per spec,
+>     ** means two literal * chars in the path).
+>
+>     We implement custom matching since fnmatch treats * as matching
+>     everything except nothing special about /.
+>
+>     Actually, re-reading the spec: * matches zero or more characters
+>     and must not match /. ** is not special recursive glob; it means
+>     two literal * characters in the path.
+>
+>     So we need custom matching where:
+>     - * matches any sequence of chars except /
+>     - All other chars are literal
+>     - ** in pattern = literal ** which would need ** in text
+>
+>     Wait, re-reading: "** in a pattern is not a special recursive glob;
+>     it means two literal * characters in the path at that point."
+>
+>     So ** should match literal '**' in the path? That seems odd.
+>     Let me re-read: it says ** means two literal * characters.
+>     So pattern '**' matches the string '**' literally.
+>     But a single * matches zero or more non-slash characters.
+>
+>     So we need to parse the pattern carefully:
+>     - '**' -> match literal '*' then literal '*' ... no wait.
+>     - Actually I think the intent is: when you see '**' treat each
+>       '*' as a literal '*' character. So '**' matches exactly '**'.
+>
+>     Hmm, but that's contradictory with single * being a wildcard.
+>     Let me re-read once more: "*` matches zero or more characters and
+>     must not match `/`. The two-character sequence `**` in a pattern
+>     is not a special recursive glob; it means two literal `*` characters
+>     in the path at that point."
+>
+>     I think this means: if you encounter '**' as a sequence, don't
+>     treat it as a recursive glob (like .gitignore does). Instead,
+>     each * independently matches zero or more non-slash chars.
+>     So '**' = two consecutive wildcards = same as '*' effectively
+>     (zero or more non-slash chars followed by zero or more non-slash chars
+>     = zero or more non-slash chars).
+>
+>     Actually wait - "it means two literal `*` characters in the path".
+>     This says ** in the PATTERN matches two literal * characters in the PATH.
+>     So ** is an escape: it matches the string "**".
+>
+>     But then how do you match a single literal *? You can't?
+>     I think the simplest interpretation consistent with the wording is:
+>     - Single * is a wildcard matching zero or more non-/ chars
+>     - The sequence ** is NOT a recursive glob; instead it matches
+>       exactly the two-character string "**" in the path
+>
+>     Let me implement it that way.
+>     """
+>     return _do_match(pattern, 0, text, 0)
+>
+>
+> def _do_match(pattern, pi, text, ti):
+>     """Recursive matching with memoization-friendly structure."""
+>     while pi < len(pattern) and ti <= len(text):
+>         if pi + 1 < len(pattern) and pattern[pi] == '*' and pattern[pi + 1] == '*':
+>             # '**' matches literal '**' in text
+>             if ti + 1 < len(text) and text[ti] == '*' and text[ti + 1] == '*':
+>                 pi += 2
+>                 ti += 2
+>                 continue
+>             else:
+>                 return False
+>         elif pattern[pi] == '*':
+>             # * matches zero or more non-/ characters
+>             # Try matching zero chars, then one, then two, etc.
+>             for k in range(ti, len(text) + 1):
+>                 if k > ti and text[k - 1] == '/':
+>                     break
+>                 if _do_match(pattern, pi + 1, text, k):
+>                     return True
+>             return False
+>         else:
+>             if ti < len(text) and pattern[pi] == text[ti]:
+>                 pi += 1
+>                 ti += 1
+>             else:
+>                 return False
+>     return pi == len(pattern) and ti == len(text)
+>
+>
+> def _should_ignore(rel_path_nfc, patterns):
+>     """
+>     Check if a file should be ignored based on patterns.
+>  
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+      else:
+>             # No / in pattern: match against each path component
+>             components = rel_path_nfc.split('/')
+>             for comp in components:
+>                 if _pattern_match(pattern, comp):
+>                     return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of a file, return (hex_digest, size)."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, 'rb') as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     ignore_patterns = _read_ignore_patterns()
+>
+>     # Collect all files: walk without following symlinks
+>     # We need to handle Unicode collisions: if two filesystem entries
+>     # produce the same NFC path, keep only the one whose original
+>     # relative path is lexicographically largest.
+>
+>     # Dict: nfc_path -> (original_rel_path, full_path)
+>     file_map = {}
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories from dirnames to prevent traversal
+>         dirnames[:] = [
+>             d for d in sorted(dirnames)
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>
+>         for filename in filenames:
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Compute relative path
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             # Use forward slashes
+>             rel_path = rel_path.replace(os.sep, '/')
+>
+>             # NFC normalize
+>             rel_path_nfc = unicodedata.normalize('NFC', rel_path)
+>
+>             # Check ignore patterns
+>             if _should_ignore(rel_path_nfc, ignore_patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original
+>             if rel_path_nfc in file_map:
+>                 existing_orig = file_map[rel_path_nfc][0]
+>                 if rel_path > existing_orig:
+>                     file_map[rel_path_nfc] = (rel_path, full_path)
+>             else:
+>                 file_map[rel_path_nfc] = (rel_path, full_path)
+>
+>     # Build rows sorted by NFC path for determinism
+>     rows = []
+>     for nfc_path in sorted(file_map.keys()):
+>         orig_rel, full_path = file_map[nfc_path]
+>         try:
+>             hex_digest, size = _hash_file(full_path)
+>             rows.append((nfc_path, hex_digest, size))
+>         except (OSError, IOError):
+>             # Skip files we can't read
+>             continue
+>
+>     # Write to database with concurrency safety
+>     # Strategy: write to a temp file first, then atomically replace
+>     # Use a lock file to serialize concurrent writers
+>
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     lock_path = os.path.abspath(db_path) + ".lock"
+>
+>     # Acquire an exclusive file lock
+>     lock_fd = open(lock_path, 'w')
+>     try:
+>         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+>
+>         # Write to a temp file, then rename atomically
+>         fd, tmp_path = tempfile.mkstemp(
+>             dir=db_dir,
+>             suffix='.db',
+>             prefix='.indexer_tmp_'
+>         )
+>         os.close(fd)
+>
+>         try:
+>             conn = sqlite3.connect(tmp_path)
+>             try:
+>                 conn.execute('PRAGMA journal_mode=WAL')
+>                 conn.execute('PRAGMA synchronous=FULL')
+>                 conn.execute(
+>                     'CREATE TABLE files ('
+>                     '  path TEXT PRIMARY KEY,'
+>                     '  sha256 TEXT NOT NULL,'
+>                     '  size INTEGER NOT NULL'
+>                     ')'
+>                 )
+>                 conn.executemany(
+>                     'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+>                     rows
+>                 )
+>                 conn.commit()
+>             finally:
+>                 conn.close()
+>
+>             # Atomic replace
+>             os.replace(tmp_path, os.path.abspath(db_path))
+>         except Exception:
+>             # Clean up temp file on error
+>             try:
+>                 os.unlink(tmp_path)
+>             except OSError:
+>                 pass
+>             raise
+>     finally:
+>         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+>         lock_fd.close()
+>         try:
+>             os.unlink(lock_path)
+>         except OSError:
+>             pass
+> PYTHON_EOF
+root@ece4444ae416:/app# python3 -c "from app.indexer import build_index; print('Import OK')"
+Import OK
+root@ece4444ae416:/app#

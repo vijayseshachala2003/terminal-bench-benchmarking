@@ -1,0 +1,212 @@
+New Terminal Output:
+
+root@3b73c94fca5e:/app# python3 -c "
+> import textwrap
+> code = textwrap.dedent('''
+> import re
+>
+> def solve(lines: list[str]) -> str:
+>     # Parse valid prefix
+>     events = []
+>     for line in lines:
+>         stripped = line.strip()
+>         if not stripped or stripped.startswith('#'):
+>             continue
+>         parts = stripped.split(' ')
+>         if len(parts) < 3:
+>             break
+>         idx_str, tx, op = parts[0], parts[1], parts[2]
+>         arg = parts[3] if len(parts) >= 4 else None
+>         extra = len(parts) > 4
+>
+>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+>             break
+>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+>             break
+>
+>         valid = False
+>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+>             if arg is not None:
+>                 break
+>             valid = True
+>         elif op == 'VOTE':
+>             if arg is None or arg not in ('YES', 'NO') or extra:
+>                 break
+>             valid = True
+>         elif op == 'FENCE':
+>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+>                 break
+>             valid = True
+>         elif op == 'EPOCH':
+>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+>                 break
+>             valid = True
+>         else:
+>             break
+>
+>         if not valid:
+>             break
+>         events.append((tx, op, arg))
+>
+>     shard_last_epoch = {}
+>     shard_bad = set()
+>     tx_order = []
+>     tx_seen = set()
+>     tx_events = {}
+>
+>     for (tx, op, arg) in events:
+>         if tx not in tx_seen:
+>             tx_seen.add(tx)
+>             tx_order.append(tx)
+>             tx_events[tx] = []
+>         shard = tx[0]
+>         if op == 'EPOCH':
+>             nonce_val = int(arg, 16)
+>             if shard in shard_last_epoch:
+>                 if nonce_val <= shard_last_epoch[shard]:
+>                     shard_bad.add(shard)
+>             shard_last_epoch[shard] = nonce_val
+>         tx_events[tx].append((op, arg))
+>
+>     bad_lines = {}
+>     ins_lines = {}
+>
+>     for tx in tx_order:
+>         shard = tx[0]
+>         if shard in shard_bad:
+>             bad_lines[tx] = 'BAD_EPOCH'
+>             continue
+>
+>         evts = tx_events[tx]
+>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+>
+>         fence_bad = False
+>         last_fence = None
+>         for (op, arg) in state_evts:
+>             if op == 'FENCE':
+>                 val = int(arg, 16)
+>                 if last_fence is not None and val <= last_fence:
+>                     fence_bad = True
+>                     break
+>                 last_fence = val
+>         if fence_bad:
+>             bad_lines[tx] = 'BAD_FENCE'
+>             continue
+>
+>         has_yes = False
+>         has_no = False
+>         for (op, arg) in state_evts:
+>             if op == 'VOTE':
+>                 if arg == 'YES':
+>                     has_yes = True
+>                 else:
+>                     has_no = True
+>         if has_yes and has_no:
+>             bad_lines[tx] = 'BAD_VOTE'
+>             continue
+>
+>         state = 'NEW'
+>         irreparable = False
+>         has_begin = False
+>         has_prepare = False
+>         has_commit = False
+>         has_abort = False
+>         has_end = False
+>
+>         for (op, arg) in state_evts:
+>             if op == 'FENCE':
+>                 continue
+>             if op == 'BEGIN':
+>                 if state != 'NEW':
+>                     irreparable = True
+>                     break
+>                 state = 'BEGUN'
+>                 has_begin = True
+>             elif op == 'PREPARE':
+>                 if state != 'BEGUN':
+>                     irreparable = True
+>                     break
+>                 state = 'PREPARED'
+>                 has_prepare = True
+>             elif op == 'VOTE':
+>                 if state != 'PREPARED':
+>                     irreparable = True
+>                     break
+>             elif op == 'COMMIT':
+>                 if state != 'PREPARED':
+>                     irreparable = True
+>                     break
+>                 if has_no:
+>                     irreparable = True
+>                     break
+>                 state = 'DECIDED_COMMIT'
+>                 has_commit = True
+>             elif op == 'ABORT':
+>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'):
+>                     irreparable = True
+>                     break
+>                 state = 'DECIDED_ABORT'
+>                 has_abort = True
+>             elif op == 'END':
+>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+>                     irreparable = True
+>                     break
+>                 state = 'ENDED'
+>                 has_end = True
+>
+>         if irreparable:
+>             bad_lines[tx] = 'BAD_ORDER'
+>             continue
+>
+>         if has_end and not has_commit and not has_abort:
+>             bad_lines[tx] = 'BAD_ORDER'
+>             continue
+>         if has_commit and has_no:
+>             bad_lines[tx] = 'BAD_ORDER'
+>             continue
+>         if (has_commit or has_abort) and not has_prepare:
+>             bad_lines[tx] = 'BAD_ORDER'
+>             continue
+>
+>         insertions = []
+>         if state == 'ENDED':
+>             pass
+>         else:
+>             if not has_begin:
+>                 insertions.append(('BEGIN', None))
+>             if not has_prepare:
+>                 insertions.append(('PREPARE', None))
+>             if not has_commit and not has_abort:
+>                 if has_no:
+>                     insertions.append(('ABORT', None))
+>                 else:
+>                     insertions.append(('COMMIT', None))
+>             if not has_end:
+>                 insertions.append(('END', None))
+>         if insertions:
+>             ins_lines[tx] = insertions
+>
+>     output = []
+>     for tx in sorted(bad_lines.keys()):
+>         output.append(f'BAD {tx} {bad_lines[tx]}')
+>
+>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+>     for tx in sorted(ins_lines.keys()):
+>         items = ins_lines[tx]
+>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+>         for (op, arg) in items:
+>             if arg:
+>                 output.append(f'INS {tx} {op} {arg}')
+>             else:
+>                 output.append(f'INS {tx} {op}')
+>
+>     if not output:
+>         return 'OK'
+>     return '\\n'.join(output)
+> ''')
+> with open('/app/solution.py', 'w') as f:
+>     f.write(code.lstrip())
+> print('File created')
+> "
+File created
+root@3b73c94fca5e:/app#

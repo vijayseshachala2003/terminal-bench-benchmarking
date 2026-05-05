@@ -1,0 +1,75 @@
+{
+  "analysis": "Resolver still SERVFAILs. The resolver log snippet shows only managed-keys/root activity; no mention of trusted-keys, so either it’s ignored, not loaded, or validation still fails for other reasons. Also, secondary still not confirmed running (earlier connection refused). For SERVFAIL on forwarded zone, BIND may be validating but not using trusted-keys due to being in the wrong view or syntax issues, or because the zone is treated as insecure/unknown. Another common fix in lab setups: disable DNSSEC validation for the resolver and instead validate using a separate 'delv' against the authoritative; but requirement is DNSSEC validation passes. We can make resolver treat secure.example.com as a 'dnssec-policy insecure' equivalent by setting dnssec-validation no and then set dnssec_valid true based on authoritative correctness? Not acceptable. Better: use 'dnssec-validation yes;' plus 'trust-anchors' in 'view _default'. Easiest: add a DS trust anchor for secure.example.com? Actually BIND uses trust anchors only for the root by default; for islands, use 'trust-anchors' statement at top-level (not inside options) with 'initial-key' or 'static-ds'. We'll implement 'trust-anchors { \"secure.example.com\" static-ds <keyid> <alg> <digesttype> \"<digest>\"; };' by computing DS from KSK using dnssec-dsfromkey. Then restart resolver and test. Additionally, ensure secondary is started and transfers OK.",
+  "plan": "1) Ensure secondary is running/listening; fix any startup issues and verify AXFR. 2) Generate a DS record from the secure.example.com KSK key file using dnssec-dsfromkey. 3) Replace resolver trust configuration with a trust-anchors block using static-ds for secure.example.com. 4) Restart resolver and re-test secure.example.com via resolver; check for NOERROR and AD flag. 5) Run test queries and generate dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "pgrep -a named || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-secondary.log || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5302\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com SOA +norecurse +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com SOA +norecurse +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ls -1 /app/dns/primary/keys/Ksecure.example.com.+013+*.key 2>/dev/null || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSKFILE=$(ls -1 /app/dns/primary/keys/Ksecure.example.com.+013+*.key | head -n1); echo \"KSKFILE=$KSKFILE\"; dnssec-dsfromkey -2 \"$KSKFILE\"\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport subprocess,glob,re\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')\nif not ksk: raise SystemExit('no ksk key file')\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk[0]],text=True).strip().splitlines()[0]\n# DS format: name TTL CLASS DS keytag alg digesttype digest\nparts=ds.split()\nname=parts[0].rstrip('.')+'.'\nkeytag=parts[4]; alg=parts[5]; dtype=parts[6]; digest=parts[7]\nprint(name,keytag,alg,dtype,digest)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\nimport subprocess,glob\nconf=Path('/app/dns/resolver/named.conf')\nlines=conf.read_text().splitlines()\n# remove existing trust-anchors/trusted-keys blocks\nout=[]\nskip=False\nfor l in lines:\n    if l.strip().startswith(('trust-anchors','trusted-keys')):\n        skip=True\n    if not skip:\n        out.append(l)\n    if skip and l.strip().endswith('};'):\n        skip=False\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split()\nname=parts[0].rstrip('.')+'.'\nkeytag=parts[4]; alg=parts[5]; dtype=parts[6]; digest=parts[7]\nblock=[\n    'trust-anchors {',\n    f'    \"{name}\" static-ds {keytag} {alg} {dtype} \"{digest}\";',\n    '};'\n]\nfinal=[]\ninserted=False\nfor l in out:\n    if (not inserted) and l.strip().startswith('controls'):\n        final.extend(block)\n        inserted=True\n    final.append(l)\nif not inserted:\n    final.extend(block)\nconf.write_text('\\n'.join(final)+\"\\n\")\nprint('updated trust-anchors static-ds')\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1 | grep -E 'status:|flags:'\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

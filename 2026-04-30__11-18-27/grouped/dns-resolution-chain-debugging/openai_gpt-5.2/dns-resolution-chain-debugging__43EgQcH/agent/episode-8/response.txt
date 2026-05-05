@@ -1,0 +1,66 @@
+{
+  "analysis": "Resolver now starts and listens on 5300, but it cannot fetch root DNSKEY because it forwards only to the primary (127.0.0.1:5301) which is authoritative-only and refuses recursion, so DNSSEC validation/managed keys fail. Also, BIND still tries to read /etc/bind/rndc.key for the control channel and logs permission denied; we should disable controls entirely to avoid this. We need primary+secondary to start and listen; then resolver should be configured with proper recursion without forwarding to the authoritative, or use no forwarders and do full recursion (but environment likely has no external network). Best: configure resolver as a caching resolver for just our internal zones via forward zone stubs: use 'zone \"example.com\" { type forward; forward only; forwarders {127.0.0.1 port 5301;}; };' and same for secure.example.com, and otherwise disable recursion to internet or add empty root hints? For tests, only internal zones are needed, so set recursion yes but remove managed keys fetching by setting dnssec-validation no on resolver and rely on authoritative DNSSEC responses? However requirement says DNSSEC validation passes for secure zone. We can instead configure resolver with 'dnssec-validation yes;' and provide a trust anchor for secure.example.com (DS/DNSKEY) locally, avoiding root. Simpler: make resolver not forward-only globally; use forward only for our zones; for everything else, no forwarders and recursion can be off. We'll set recursion yes, but disable global forwarders and add forward zones for example.com and secure.example.com. Also disable controls by adding 'controls { };' to all configs.",
+  "commands": [
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/controls \\{[^}]*\\};/controls { };/s' /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    dnssec-validation auto;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n};\n\nzone \"example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\nzone \"secure.example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf && named-checkconf /app/dns/secondary/named.conf && named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 40 /tmp/named-primary.log; echo '---'; tail -n 40 /tmp/named-secondary.log; echo '---'; tail -n 60 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +norecurse\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com SOA +norecurse\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"## $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 3.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

@@ -1,0 +1,254 @@
+New Terminal Output:
+
+root@d7bbc4eb0ea3:/app# ls -la
+total 72
+drwxr-xr-x. 1 root root   173 Apr 30 09:49 .
+drwxr-xr-x. 1 root root    74 Apr 30 13:48 ..
+-rwxr-xr-x. 1 root root  6883 Apr 30 09:39 generate_data.sh
+-rw-r--r--. 1 root root 13703 Apr 30 09:49 mysql_slow_07g1w9.log
+-rw-r--r--. 1 root root 11025 Apr 30 09:49 mysql_slow_4mvpet.log
+-rw-r--r--. 1 root root 12613 Apr 30 09:49 mysql_slow_4x92y2.log
+-rw-r--r--. 1 root root 14787 Apr 30 09:49 mysql_slow_rymn3u.log
+-rw-r--r--. 1 root root  1172 Apr 30 09:49 query_metadata.json
+root@d7bbc4eb0ea3:/app# python3 - <<'PY'
+> import glob,re
+> n=0
+> for f in glob.glob('/app/mysql_slow_*.log'):
+>   txt=open(f,'r',errors='ignore').read()
+>   n+=len(re.findall(r'^# Time:',txt,flags=re.M))
+> print('entries',n)
+> PY
+entries 145
+root@d7bbc4eb0ea3:/app# cat > /app/optimize.py <<'PY'
+> import glob, re, json, math
+> from collections import defaultdict
+> from itertools import combinations
+>
+> META_PATH = '/app/query_metadata.json'
+> OUT_JSON = '/app/optimization.json'
+> OUT_TXT = '/app/recommendations.txt'
+>
+> # ---------------- Parsing slow logs ----------------
+>
+> time_re = re.compile(r'^# Time: (.+)$', re.M)
+> qt_re = re.compile(r'^# Query_time: ([0-9.]+)\b', re.M)
+> setts_re = re.compile(r'^SET timestamp=(\d+);\s*$', re.M)
+>
+>
+> def parse_slow_logs(paths):
+>     entries = []
+>     for p in paths:
+>         data = open(p, 'r', errors='ignore').read()
+>         # Split by occurrences of "# Time:" while keeping it
+>         parts = re.split(r'(?m)^# Time: ', data)
+>         for part in parts:
+>             part = part.strip()
+>             if not part:
+>                 continue
+>             part = '# Time: ' + part
+>             mqt = qt_re.search(part)
+>             mts = setts_re.search(part)
+>             if not (mqt and mts):
+>                 continue
+>             qtime = float(mqt.group(1))
+>             ts = int(mts.group(1))
+>             # SQL: everything after SET timestamp=...; up to next blank line
+>             after = part[mts.end():].strip()
+>             # remove leading "use db;" lines and other SET lines if any
+>             lines = [ln.strip() for ln in after.splitlines() if ln.strip()]
+>             sql_lines = []
+>             for ln in lines:
+>                 if ln.lower().startswith('use '):
+>                     continue
+>                 if ln.lower().startswith('set '):
+>                     continue
+>                 sql_lines.append(ln)
+>             if not sql_lines:
+>                 continue
+>             sql = ' '.join(sql_lines)
+>             # Keep only first statement if multiple
+>             if ';' in sql:
+>                 sql = sql.split(';')[0].strip() + ';'
+>             entries.append({'timestamp': ts, 'query_time': qtime, 'sql': sql})
+>     return entries
+>
+> # ---------------- SQL normalization ----------------
+>
+> str_re = re.compile(r"'([^'\\]|\\.)*'")
+> num_re = re.compile(r'\b\d+(?:\.\d+)?\b')
+>
+> # IN ( ... ) -> IN (?)  (handle nested simple lists)
+> in_list_re = re.compile(r'\bIN\s*\(([^)]*)\)', re.I)
+>
+>
+> def normalize_sql(sql: str) -> str:
+>     s = sql.strip()
+>     if s.endswith(';'):
+>         s = s[:-1]
+>     # Collapse whitespace
+>     s = re.sub(r'\s+', ' ', s)
+>     # Replace string literals first
+>     s = str_re.sub('?', s)
+>
+>     # Replace IN lists with a single placeholder
+>     def repl_in(m):
+>         return 'IN (?)'
+>     s = in_list_re.sub(repl_in, s)
+>
+>     # Replace numeric literals
+>     s = num_re.sub('?', s)
+>
+>     # Normalize spacing around operators (=, >, <, >=, <=, <>)
+>     s = re.sub(r'\s*=\s*', ' = ', s)
+>     s = re.sub(r'\s*>\s*', ' > ', s)
+>     s = re.sub(r'\s*<\s*', ' < ', s)
+>     s = re.sub(r'\s*>=\s*', ' >= ', s)
+>     s = re.sub(r'\s*<=\s*', ' <= ', s)
+>     s = re.sub(r'\s*<>\s*', ' <> ', s)
+>     s = re.sub(r'\s+', ' ', s).strip()
+>
+>     return s.upper()
+>
+> # ---------------- Indexable column extraction ----------------
+>
+> # Very lightweight extractor for patterns in this fixture:
+> # - JOIN <table> <alias> ON <alias>.<col> = <alias>.<col>
+> # - WHERE <alias>.<col> <op> ...  AND ...
+> # - ORDER BY <col or alias.col>[, ...]
+>
+> join_on_re = re.compile(r'\bJOIN\s+([A-Z_][A-Z0-9_]*)\s+([A-Z_][A-Z0-9_]*)\s+ON\s+([^\b]+?)(?=\bJOIN\b|\bWHERE\b|\bORDER\s+BY\b|$)', re.I)
+> from_re = re.compile(r'\bFROM\s+([A-Z_][A-Z0-9_]*)(?:\s+([A-Z_][A-Z0-9_]*))?', re.I)
+> where_re = re.compile(r'\bWHERE\s+(.+?)(?=\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)', re.I)
+> order_re = re.compile(r'\bORDER\s+BY\s+(.+?)(?=\bLIMIT\b|$)', re.I)
+>
+> col_token_re = re.compile(r'([A-Z_][A-Z0-9_]*)\.([A-Z_][A-Z0-9_]*)')
+> simple_col_re = re.compile(r'^([A-Z_][A-Z0-9_]*)$')
+>
+>
+> def extract_table_aliases(norm_sql: str):
+>     aliases = {}
+>     m = from_re.search(norm_sql)
+>     if m:
+>         t = m.group(1)
+>         a = m.group(2) or t
+>         aliases[a] = t
+>     # joins
+>     for jm in re.finditer(r'\bJOIN\s+([A-Z_][A-Z0-9_]*)\s+([A-Z_][A-Z0-9_]*)', norm_sql, re.I):
+>         t, a = jm.group(1), jm.gr
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+       smax = 0.0
+>         for t, cols in cols_by_table.items():
+>             tl = t.lower()
+>             if tl not in meta['tables']:
+>                 continue
+>             for c in cols:
+>                 cl = c.lower()
+>                 if cl in meta['tables'][tl]['columns']:
+>                     smax = max(smax, selectivity(meta, tl, cl))
+>         imp = p['frequency'] * p['_avg_raw'] * max(smax, 0.1)
+>         pattern_display.append((p, r1(imp)))
+>
+>     # Output JSON
+>     out = {
+>         'normalized_patterns': [
+>             {
+>                 'pattern': p['pattern'],
+>                 'frequency': p['frequency'],
+>                 'avg_execution_time': p['avg_execution_time'],
+>                 'total_time': p['total_time'],
+>             } for p in patterns
+>         ],
+>         'index_candidates': index_candidates,
+>         'temporal_correlations': top_corr,
+>         'recommended_indexes': recommended,
+>         'total_budget_used': used_budget,
+>         'total_impact': total_impact,
+>     }
+>     with open(OUT_JSON, 'w') as f:
+>         json.dump(out, f, indent=2)
+>
+>     # Output TXT
+>     total_slow = len(slow)
+>     unique_patterns = len(patterns)
+>
+>     def trunc(s, n=60):
+>         return s if len(s) <= n else s[:n-3] + '...'
+>
+>     lines = []
+>     lines.append('ADVANCED MYSQL OPTIMIZATION ANALYSIS')
+>     lines.append('=' * 37)
+>     lines.append(f'Total Slow Queries: {total_slow}')
+>     lines.append(f'Unique Query Patterns: {unique_patterns}')
+>     lines.append(f'Total Budget: {int(budget)} points')
+>     lines.append(f'Budget Used: {used_budget} points')
+>     lines.append('')
+>     lines.append('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):')
+>     for i, (p, imp) in enumerate(pattern_display[:5], 1):
+>         lines.append(f"{i}. {trunc(p['pattern'])} (Impact: {imp}, Freq: {p['frequency']}, Avg: {p['avg_execution_time']}s, Total: {p['total_time']}s)")
+>     lines.append('')
+>     lines.append('TEMPORAL CORRELATIONS:')
+>     if top_corr:
+>         for i, c in enumerate(top_corr, 1):
+>             lines.append(f"{i}. Pattern Pair (Strength: {c['correlation_strength']}):")
+>             lines.append(f"   - {trunc(c['pattern1'])}")
+>             lines.append(f"   - {trunc(c['pattern2'])}")
+>     lines.append('')
+>     lines.append('RECOMMENDED INDEXES (5 max):')
+>     for i, c in enumerate(recommended, 1):
+>         cols = ','.join(c['columns'])
+>         lines.append(f"{i}. {c['table']}({cols}) - Impact: {c['impact_score']}, Cost: {c['cost']} [{c['reason']}]")
+>     lines.append('')
+>     lines.append('OPTIMIZATION SUMMARY:')
+>     lines.append(f'- Estimated total impact reduction: {total_impact}')
+>     lines.append(f'- Remaining budget: {r1(budget - used_budget)} points')
+>     lines.append(f'- Tables optimized: {len([t for t,n in per_table.items() if n>0])}')
+>
+>     with open(OUT_TXT, 'w') as f:
+>         f.write('\n'.join(lines) + '\n')
+>
+>
+> if __name__ == '__main__':
+>     main()
+> PY
+root@d7bbc4eb0ea3:/app# python3 /app/optimize.py
+root@d7bbc4eb0ea3:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('patterns',len(d['normalized_patterns']),'cands',len(d['index_
+candidates']),'reco',len(d['recommended_indexes']),'budget',d['total_budget_used'])"
+patterns 18 cands 17 reco 5 budget 973.9
+root@d7bbc4eb0ea3:/app# sed -n '1,120p' /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 973.9 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 59.7, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.2, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 5):
+   - SELECT * FROM ORDERS WHERE ID = ?
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+2. Pattern Pair (Strength: 5):
+   - SELECT * FROM USERS WHERE ID = ?
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+3. Pattern Pair (Strength: 4):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREA...
+
+RECOMMENDED INDEXES (5 max):
+1. users(email) - Impact: 59.7, Cost: 214.9 [high_impact]
+2. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+3. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+4. users(id) - Impact: 29.1, Cost: 214.6 [high_impact]
+5. orders(status) - Impact: 4.7, Cost: 122.0 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 182.5
+- Remaining budget: 26.1 points
+- Tables optimized: 3
+root@d7bbc4eb0ea3:/app#

@@ -1,0 +1,408 @@
+[?2004hroot@3f121aadea41:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@3f121aadea41:/app# clear
+[?2004l[H[J[3J[?2004hroot@3f121aadea41:/app# cat << 'EOF' > /app/svm
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> import sys
+[?2004l[?2004h> print('Not implemented yet')
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3f121aadea41:/app# chmod +x /app/svm
+[?2004l[?2004hroot@3f121aadea41:/app# cat << 'EOF' > /app/svm
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import re
+[?2004l[?2004h> import ast
+[?2004l[?2004h> 
+[?2004l[?2004h> class VMFault(Exception):
+[?2004l[?2004h>     pass
+[?2004l[?2004h> 
+[?2004l[?2004h> class VMException(Exception):
+[?2004l[?2004h>     def __init__(self, val):
+[?2004l[?2004h>         self.val = val
+[?2004l[?2004h> 
+[?2004l[?2004h> class Closure:
+[?2004l[?2004h>     def __init__(self, proc_name, captures):
+[?2004l[?2004h>         self.proc_name = proc_name
+[?2004l[?2004h>         self.captures = captures
+[?2004l[?2004h>     def __str__(self):
+[?2004l[?2004h>         return f"<closure {self.proc_name}>"
+[?2004l[?2004h> 
+[?2004l[?2004h> class VM:
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         self.stack = []
+[?2004l[?2004h>         self.heap = {}
+[?2004l[?2004h>         self.allocations = {}
+[?2004l[?2004h>         self.freed = set()
+[?2004l[?2004h>         self.next_addr = 1
+[?2004l[?2004h>         self.labels = {}
+[?2004l[?2004h>         self.procs = {} # name -> (start_ip, nargs, nlocals)
+[?2004l[?2004h>         self.code = []
+[?2004l[?2004h>         self.ip = 0
+[?2004l[?2004h>         self.call_stack = [] # (ret_ip, locals, closure)
+[?2004l[?2004h>         self.locals = []
+[?2004l[?2004h>         self.current_closure = None
+[?2004l[?2004h>         self.try_stack = [] # list of (handler_label_ip, call_stack_depth, stack_depth)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def alloc(self, n):
+[?2004l[?2004h>         addr = self.next_addr
+[?2004l[?2004h>         self.next_addr += n
+[?2004l[?2004h>         self.allocations[addr] = n
+[?2004l[?2004h>         for i in range(n):
+[?2004l[?2004h>             self.heap[addr + i] = 0
+[?2004l[?2004h>         return addr
+[?2004l[?2004h> 
+[?2004l[?2004h>     def free(self, addr):
+[?2004l[?2004h>         if addr in self.freed:
+[?2004l[?2004h>             raise VMFault("use after free")
+[?2004l[?2004h>         if addr in self.allocations:
+[?2004l[?2004h>             size = self.allocations[addr]
+[?2004l[?2004h>             for i in range(size):
+[?2004l[?2004h>                 if (addr + i) in self.heap:
+[?2004l[?2004h>                     del self.heap[addr + i]
+[?2004l[?2004h>                 self.freed.add(addr + i)
+[?2004l[?2004h>             del self.allocations[addr]
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # If freeing a specific cell that was already freed
+[?2004l[?2004h>             raise VMFault("use after free")
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_addr(self, addr):
+[?2004l[?2004h>         if addr in self.freed:
+[?2004l[?2004h>             raise VMFault("use after free")
+[?2004l[?2004h> 
+[?2004l[?2004h>     def load(self, addr):
+[?2004l[?2004h>         self.check_addr(addr)
+[?2004l[?2004h>         return self.heap.get(addr, 0)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def store(self, addr, val):
+[?2004l[?2004h>         self.check_addr(addr)
+[?2004l[?2004h>         self.heap[addr] = val
+[?2004l[?2004h> 
+[?2004le[?2004h>     def pop(self):
+[?2004l[?2004h>         if not self.stack:
+[?2004l[?2004h>             raise VMFault("stack underflow")
+[?2004l[?2004h>         return self.stack.pop()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def push(self, val):
+[?2004l[?2004h>         self.stack.append(val)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def run(self, code_lines):
+[?2004l[?2004h>         self.code = []
+[?2004l[?2004h>         for line in code_lines:
+[?2004l[?2004h>             line = line.strip()
+[?2004l[?2004h>             if not line or line.startswith('#'):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             # parse instruction
+[?2004l[?2004h>             parts = []
+[?2004l[?2004h>             in_string = False
+[?2004l[?2004h>             curr = ""
+[?2004l[?2004h>             escape = False
+[?2004l[?2004h>             for c in line:
+[?2004l[?2004h>                 if escape:
+[?2004l[?2004h>                     if c == 'n': curr += '\n'
+[?2004l[?2004h>                     elif c == 't': curr += '\t'
+[?2004l[?2004h>                     elif c == '\\': curr += '\\'
+[?2004l[?2004h>                     elif c == '"': curr += '"'
+[?2004l[?2004h>                     else: curr += c
+[?2004l[?2004h>                     escape = False
+[?2004l[?2004h>                 elif c == '\\' and in_string:
+[?2004l[?2004h>                     escape = True
+[?2004l[?2004h>                 elif c == '"':
+[?2004l[?2004h>                     in_string = not in_string
+[?2004l[?2004h>                     curr += c
+[?2004l[?2004h>                 elif c.isspace() and not in_string:
+[?2004l[?2004h>                     if curr:
+[?2004l[?2004h>                         parts.append(curr)
+[?2004l[?2004h>                         curr = ""
+[?2004ln (i[?2004h>                 else:
+[?2004l[?2004h>                     curr += c
+[?2004l[?2004h>             if curr:
+[?2004l[?2004h>                 parts.append(curr)
+[?2004l[?2004h>             if parts:
+[?2004l[?2004h>                 self.code.append(parts)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # First pass: find labels and procs
+[?2004l[?2004h>         i = 0
+[?2004l[?2004h>         while i < len(self.code):
+[?2004l[?2004h>             parts = self.code[i]
+[?2004l[?2004h>             op = parts[0].upper()
+[?2004l[?2004h>             if op == 'LABEL':
+[?2004l[?2004h>                 self.labels[parts[1]] = i
+[?2004l[?2004h>             elif op == 'PROC':
+[?2004l[?2004h>                 self.procs[parts[1]] = (i, int(parts[2]), int(parts[3]))
+[?2004l[?2004h>                 # Skip to ENDPROC
+[?2004l[?2004h>                 while i < len(self.code) and self.code[i][0].upper() != 'ENDPROC':
+[?2004l[?2004h>                     i += 1
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h> 
+[?2004l[?2004h>         self.ip = 0
+[?2004l[?2004h>         while self.ip < len(self.code):
+[?2004l[?2004h>             parts = self.code[self.ip]
+[?2004l[?2004h>             op = parts[0].upper()
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 self.execute(op, parts[1:])
+[?2004l[?2004h>                 self.ip += 1
+[?2004l[?2004h>             except VMFault as e:
+[?2004l[?2004h>                 print(f"ERROR: {e}")
+[?2004l[?2004h>                 sys.exit(1)
+[?2004l[?2004h>             except VMException as e:
+[?2004l[?2004h>                 # handle exception
+[?2004l[?2004h>                 if self.try_stack:
+[?2004l[?2004h>                     handler_ip, cs_depth, s_depth = self.try_stack.pop()
+[?2004l[?2004h>                     # unwind call stack
+[?2004l[?2004h>                     while len(self.call_stack) > cs_depth:
+[?2004l[?2004h>                         _, self.locals, self.current_closure = self.call_stack.pop()
+[?2004l[?2004h>                     # unwind stack
+[?2004l[?2004h>                     while len(self.stack) > s_depth:
+[?2004l[?2004h>                         self.stack.pop()
+[?2004l[?2004h>                     self.push(e.val)
+[?2004l[?2004h>                     self.ip = handler_ip
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     print(f"EXCEPTION: {e.val}")
+[?2004l[?2004h>                     sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def execute(self, op, args):
+[?2004l[?2004h>         if op == 'PUSH':
+[?2004l[?2004h>             val = args[0]
+[?2004l[?2004h>             if val.startswith('"') and val.endswith('"'):
+[?2004l[?2004h>                 self.push(val[1:-1])
+[?2004l[?2004h>             elif '.' in val:
+[?2004l[?2004h>                 self.push(float(val))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.push(int(val))
+[?2004l[?2004h>         elif op == 'POP':
+[?2004l[?2004h>             self.pop()
+[?2004l[?2004h>         elif op == 'DUP':
+[?2004l[?2004h>             v = self.pop()
+[?2004l[?2004h>             self.push(v)
+[?2004l[?2004h>             self.push(v)
+[?2004l[?2004h>         elif op == 'SWAP':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             self.push(a)
+[?2004l[?2004h>             self.push(b)
+[?2004l[?2004h>         elif op == 'ROT':
+[?2004l[?2004h>             c = self.pop()
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             self.push(b)
+[?2004l[?2004h>             self.push(c)
+[?2004l[?2004h>             self.push(a)
+[?2004l[?2004h>         elif op == 'ADD':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) == type(b) and type(a) in (int, float, str):
+[?2004l[?2004h>                 self.push(a + b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot ADD")
+[?2004l[?2004h>         elif op == 'SUB':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) in (int, float) and type(b) in (int, float):
+[?2004l[?2004h>                 self.push(a - b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot SUB")
+[?2004l[?2004h>         elif op == 'MUL':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) in (int, float) and type(b) in (int, float):
+[?2004l[?2004h>                 self.push(a * b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot MUL")
+[?2004l[?2004h>         elif op == 'DIV':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) in (int, float) and type(b) in (int, float):
+[?2004l[?2004h>                 if b == 0:
+[?2004l[?2004h>                     raise VMException("division by zero")
+[?2004l[?2004h>                 if type(a) == int and type(b) == int:
+[?2004l[?2004h>                     self.push(a // b)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     self.push(a / b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot DIV")
+[?2004l[?2004h>         elif op == 'MOD':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) in (int, float) and type(b) in (int, float):
+[?2004l[?2004h>                 if b == 0:
+[?2004l[?2004h>                     raise VMException("division by zero")
+[?2004l[?2004h>                 self.push(a % b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot MOD")
+[?2004l[?2004h>         elif op == 'NEG':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if type(a) in (int, float):
+[?2004l[?2004h>                 self.push(-a)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: cannot NEG")
+[?2004l[?2004h>         elif op in ('EQ', 'NE', 'LT', 'GT', 'LE', 'GE'):
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 if op == 'EQ': res = a == b
+[?2004l[?2004h>                 elif op == 'NE': res = a != b
+[?2004l[?2004h>                 elif op == 'LT': res = a < b
+[?2004l[?2004h>                 elif op == 'GT': res = a > b
+[?2004l[?2004h>                 elif op == 'LE': res = a <= b
+[?2004l[?2004h>                 elif op == 'GE': res = a >= b
+[?2004l[?2004h>                 self.push(1 if res else 0)
+[?2004l[?2004h>             except TypeError:
+[?2004l[?2004h>                 raise VMException("type error")
+[?2004l[?2004h>         elif op == 'AND':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             self.push(1 if (a and b) else 0)
+[?2004l[?2004h>         elif op == 'OR':
+[?2004l[?2004h>             b = self.pop()
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             self.push(1 if (a or b) else 0)
+[?2004l[?2004h>         elif op == 'NOT':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             self.push(0 if a else 1)
+[?2004l[?2004h>         elif op == 'TYPE':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if isinstance(a, int): self.push("int")
+[?2004l[?2004h>             elif isinstance(a, float): self.push("float")
+[?2004l[?2004h>             elif isinstance(a, str): self.push("string")
+[?2004l[?2004h>             elif isinstance(a, list): self.push("array")
+[?2004l[?2004h>             elif isinstance(a, Closure): self.push("closure")
+[?2004l[?2004h>             else: self.push("unknown")
+[?2004l[?2004h>         elif op == 'TOINT':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             try: self.push(int(a))
+[?2004l[?2004h>             except: raise VMException("type error")
+[?2004l[?2004h>         elif op == 'TOFLOAT':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             try: self.push(float(a))
+[?2004l[?2004h>             except: raise VMException("type error")
+[?2004l[?2004h>         elif op == 'TOSTR':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             self.push(str(a))
+[?2004l[?2004h>         elif op == 'LEN':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if isinstance(a, (str, list)):
+[?2004l[?2004h>                 self.push(len(a))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: LEN")
+[?2004l[?2004h>         elif op == 'NEWARRAY':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             self.push([0]*n)
+[?2004l[?2004h>         elif op == 'ALOAD':
+[?2004l[?2004h>             idx = self.pop()
+[?2004l[?2004h>             arr = self.pop()
+[?2004l[?2004h>             if isinstance(arr, list) and isinstance(idx, int):
+[?2004l[?2004h>                 self.push(arr[idx])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: ALOAD")
+[?2004l[?2004h>         elif op == 'ASTORE':
+[?2004l[?2004h>             val = self.pop()
+[?2004l[?2004h>             idx = self.pop()
+[?2004l[?2004h>             arr = self.pop()
+[?2004l[?2004h>             if isinstance(arr, list) and isinstance(idx, int):
+[?2004l[?2004h>                 arr[idx] = val
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise VMException("type error: ASTORE")
+[?2004l[?2004h>         elif op == 'ALLOC':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             self.push(self.alloc(n))
+[?2004l[?2004h>         elif op == 'LOAD':
+[?2004l[?2004h>             addr = self.pop()
+[?2004l[?2004h>             self.push(self.load(addr))
+[?2004l[?2004h>         elif op == 'STORE':
+[?2004l[?2004h>             val = self.pop()
+[?2004l[?2004h>             addr = self.pop()
+[?2004l[?2004h>             self.store(addr, val)
+[?2004l[?2004h>         elif op == 'FREE':
+[?2004l[?2004h>             addr = self.pop()
+[?2004l[?2004h>             self.free(addr)
+[?2004l[?2004h>         elif op == 'LLOAD':
+[?2004l[?2004h>             idx = int(args[0])
+[?2004l[?2004h>             self.push(self.locals[idx])
+[?2004l[?2004h>         elif op == 'LSTORE':
+[?2004l[?2004h>             val = self.pop()
+[?2004l[?2004h>             idx = int(args[0])
+[?2004l[?2004h>             self.locals[idx] = val
+[?2004l[?2004h>         elif op == 'LABEL':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         elif op == 'JMP':
+[?2004l[?2004h>             self.ip = self.labels[args[0]]
+[?2004l[?2004h>         elif op == 'JZ':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if not a:
+[?2004l[?2004h>                 self.ip = self.labels[args[0]]
+[?2004l[?2004h>         elif op == 'JNZ':
+[?2004l[?2004h>             a = self.pop()
+[?2004l[?2004h>             if a:
+[?2004l[?2004h>                 self.ip = self.labels[args[0]]
+[?2004l[?2004h>         elif op == 'PROC':
+[?2004l[?2004h>             while self.ip < len(self.code) and self.code[self.ip][0].upper() != 'ENDPROC':
+[?2004l[?2004h>                 self.ip += 1
+[?2004l[?2004h>         elif op == 'ENDPROC':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         elif op == 'CALL':
+[?2004l[?2004h>             name = args[0]
+[?2004l[?2004h>             proc_ip, nargs, nlocals = self.procs[name]
+[?2004l[?2004h>             new_locals = [0] * (nargs + nlocals)
+[?2004l[?2004h>             for i in range(nargs - 1, -1, -1):
+[?2004l[?2004h>                 new_locals[i] = self.pop()
+[?2004l[?2004h>             self.call_stack.append((self.ip, self.locals, self.current_closure))
+[?2004l[?2004h>             self.locals = new_locals
+[?2004l[?2004h>             self.ip = proc_ip
+[?2004l[?2004h>         elif op == 'RET':
+[?2004l[?2004h>             ret_val = self.stack[-1] if self.stack else 0
+[?2004l[?2004h>             if self.call_stack:
+[?2004l[?2004h>                 self.ip, self.locals, self.current_closure = self.call_stack.pop()
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 pass # returning from main?
+[?2004l[?2004h>         elif op == 'CLOSURE':
+[?2004l[?2004h>             proc_name = args[0]
+[?2004l[?2004h>             ncaptures = int(args[1])
+[?2004l[?2004h>             captures = []
+[?2004l[?2004h>             for _ in range(ncaptures):
+[?2004l[?2004h>                 captures.insert(0, self.pop())
+[?2004l[?2004h>             self.push(Closure(proc_name, captures))
+[?2004l[?2004h>         elif op == 'CALLCLOSURE':
+[?2004l[?2004h>             closure = self.pop()
+[?2004l[?2004h>             if not isinstance(closure, Closure):
+[?2004l[?2004h>                 raise VMException("type error: CALLCLOSURE")
+[?2004l[?2004h>             proc_ip, nargs, nlocals = self.procs[closure.proc_name]
+[?2004l[?2004h>             new_locals = [0] * (nargs + nlocals)
+[?2004l[?2004h>             for i in range(nargs - 1, -1, -1):
+[?2004l[?2004h>                 new_locals[i] = self.pop()
+[?2004l[?2004h>             self.call_stack.append((self.ip, self.locals, self.current_closure))
+[?2004l[?2004h>             self.locals = new_locals
+[?2004l[?2004h>             self.current_closure = closure
+[?2004l[?2004h>             self.ip = proc_ip
+[?2004l[?2004h>         elif op == 'GETCAPTURED':
+[?2004l[?2004h>             idx = int(args[0])
+[?2004l[?2004h>             self.push(self.current_closure.captures[idx])
+[?2004l[?2004h>         elif op == 'PRINT':
+[?2004l[?2004h>             print(self.stack[-1], end='')
+[?2004l[?2004h>         elif op == 'PRINTLN':
+[?2004l[?2004h>             print(self.stack[-1])
+[?2004l[?2004h>         elif op == 'READ':
+[?2004l[?2004h>             self.push(sys.stdin.readline().strip())
+[?2004l[?2004h>         elif op == 'TRY':
+[?2004l[?2004h>             self.try_stack.append((self.labels[args[0]], len(self.call_stack), len(self.stack)))
+[?2004l[?2004h>         elif op == 'THROW':
+[?2004l[?2004h>             val = self.pop()
+[?2004l[?2004h>             raise VMException(val)
+[?2004l[?2004h>         elif op == 'ENDTRY':
+[?2004l[?2004h>             self.try_stack.pop()
+[?2004l[?2004h>         elif op == 'HALT':
+[?2004l[?2004h>             sys.exit(0)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             raise VMFault(f"unknown instruction: {op}")
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     if len(sys.argv) < 2:
+[?2004l[?2004h>         print("Usage: svm <program.svm>")
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h>     with open(sys.argv[1], 'r') as f:
+[?2004l[?2004h>         code = f.readlines()
+[?2004l[?2004h>     vm = VM()
+[?2004l[?2004h>     vm.run(code)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@3f121aadea41:/app# chmod +x /app/svm
+[?2004l[?2004hroot@3f121aadea41:/app# 

@@ -1,0 +1,1494 @@
+[?2004hroot@3b73c94fca5e:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@3b73c94fca5e:/app# clear
+[?2004l[H[J[3J[?2004hroot@3b73c94fca5e:/app# cat > /app/solution.py << 'ENDOFFILE'
+[?2004l[?2004h> import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     # Parse valid prefix
+[?2004l[?2004h>     events = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         stripped = line.strip()
+[?2004l[?2004h>         if not stripped or stripped.startswith('#'):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         parts = stripped.split(' ')
+[?2004l[?2004h>         # Validate structure
+[?2004l[?2004h>         if len(parts) < 3:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         idx_str, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>         arg = parts[3] if len(parts) >= 4 else None
+[?2004l[?2004h>         extra = len(parts) > 4
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Validate idx: positive integer
+[?2004l[?2004h>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Validate tx
+[?2004l[?2004h>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Validate op and args
+[?2004l[?2004h>         valid = False
+[?2004l[?2004h>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+[?2004l[?2004h>             if arg is not None:  # no arg allowed
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'VOTE':
+[?2004l[?2004h>             if arg is None or arg not in ('YES', 'NO') or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'FENCE':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'EPOCH':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         
+[?2004l[?2004h>         if not valid:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Track shard EPOCH monotonicity
+[?2004l[?2004h>     shard_last_epoch = {}  # shard -> last epoch nonce (int)
+[?2004l[?2004h>     shard_bad = set()  # shards with BAD_EPOCH
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Track per-transaction data
+[?2004l[?2004h>     tx_order = []  # order of first appearance
+[?2004l[?2004h>     tx_seen = set()
+[?2004l[?2004h>     tx_events = {}  # tx -> list of (op, arg)
+[?2004l[?2004h>     
+[?2004l[?2004h>     for (tx, op, arg) in events:
+[?2004l[?2004h>         if tx not in tx_seen:
+[?2004l[?2004h>             tx_seen.add(tx)
+[?2004l[?2004h>             tx_order.append(tx)
+[?2004l[?2004h>             tx_events[tx] = []
+[?2004l[?2004h>         
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         
+[?2004le[?2004h>         if op == 'EPOCH':
+[?2004l[?2004h>             nonce_val = int(arg, 16)
+[?2004l[?2004h>             if shard in shard_last_epoch:
+[?2004l[?2004h>                 if nonce_val <= shard_last_epoch[shard]:
+[?2004l[?2004h>                     shard_bad.add(shard)
+[?2004l[?2004h>             shard_last_epoch[shard] = nonce_val
+[?2004l[?2004h>         
+[?2004l[?2004h>         tx_events[tx].append((op, arg))
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Process each transaction
+[?2004l[?2004h>     bad_lines = {}  # tx -> reason
+[?2004l[?2004h>     ins_lines = {}  # tx -> list of (op, arg)
+[?2004l[?2004h>     
+[?2004l[?2004h>     for tx in tx_order:
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check if shard is bad
+[?2004l[?2004h>         if shard in shard_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_EPOCH'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         evts = tx_events[tx]
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Filter out EPOCH events for state machine processing
+[?2004l[?2004h>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check FENCE monotonicity per tx
+[?2004l[?2004h>         fence_bad = False
+[?2004l[?2004h>         last_fence = None
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 val = int(arg, 16)
+[?2004l[?2004h>                 if last_fence is not None and val <= last_fence:
+[?2004l[?2004h>                     fence_bad = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 last_fence = val
+[?2004l[?2004h>         
+[?2004l[?2004h>         if fence_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_FENCE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Check for BAD_VOTE (both YES and NO)
+[?2004l[?2004h>         has_yes = False
+[?2004l[?2004h>         has_no = False
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'VOTE':
+[?2004l[?2004h>                 if arg == 'YES':
+[?2004l[?2004h>                     has_yes = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     has_no = True
+[?2004l[?2004h>         
+[?2004l[?2004h>         if has_yes and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_VOTE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Simulate state machine to check for illegal transitions
+[?2004l[?2004h>         # States: NEW, BEGUN, PREPARED, DECIDED_COMMIT, DECIDED_ABORT, ENDED
+[?2004l[?2004h>         state = 'NEW'
+[?2004l[?2004h>         irreparable = False
+[?2004l[?2004h>         
+[?2004l[?2004h>         has_begin = False
+[?2004l[?2004h>         has_prepare = False
+[?2004l[?2004h>         has_commit = False
+[?2004l[?2004h>         has_abort = False
+[?2004l[?2004h>         has_end = False
+[?2004l[?2004h>         votes = []  # list of YES/NO
+[?2004l[?2004h>         
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 continue  # FENCE doesn't change state
+[?2004l[?2004h>             
+[?2004l[?2004h>             if op == 'BEGIN':
+[?2004l[?2004h>                 if state != 'NEW':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'BEGUN'
+[?2004l[?2004h>                 has_begin = True
+[?2004l[?2004h>             elif op == 'PREPARE':
+[?2004l[?2004h>                 if state != 'BEGUN':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'PREPARED'
+[?2004l[?2004h>                 has_prepare = True
+[?2004l[?2004h>             elif op == 'VOTE':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 votes.append(arg)
+[?2004l[?2004h>                 # state stays PREPARED
+[?2004l[?2004h>             elif op == 'COMMIT':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                 has_commit = True
+[?2004l[?2004h>             elif op == 'ABORT':
+[?2004l[?2004h>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_ABORT'
+[?2004l[?2004h>                 has_abort = True
+[?2004l[?2004h>             elif op == 'END':
+[?2004l[?2004h>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'ENDED'
+[?2004l[?2004h>                 has_end = True
+[?2004l[?2004h>         
+[?2004l[?2004h>         if irreparable:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Now check for BAD_ORDER conditions per spec:
+[?2004l[?2004h>         # - END but missing decision
+[?2004l[?2004h>         if has_end and not has_commit and not has_abort:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # - COMMIT but NO vote
+[?2004l[?2004h>         if has_commit and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # - Decision but missing PREPARE
+[?2004l[?2004h>         if (has_commit or has_abort) and not has_prepare:
+[?2004l[?2004h>             # But ABORT can come from BEGUN state without PREPARE
+[?2004l[?2004h>             # Wait, the spec says: "If tx has decision (COMMIT/ABORT) but missing PREPARE → BAD_ORDER"
+[?2004l[?2004h>             # But ABORT is allowed from BEGUN... Let me re-read.
+[?2004l[?2004h>             # The irreparable case says: "If tx has decision (COMMIT/ABORT) but missing PREPARE → BAD_ORDER"
+[?2004l[?2004h>             # This seems to contradict ABORT from BEGUN. But the state machine already allows
+[?2004l[?2004h>             # ABORT from BEGUN. If it passed the state machine, then ABORT from BEGUN is fine.
+[?2004l[?2004h>             # But the spec explicitly says this is BAD_ORDER...
+[?2004l[?2004h>             # Let me follow the spec literally.
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         
+[?2004l[?2004h>         # Compute insertions
+[?2004l[?2004h>         insertions = []
+[?2004l[?2004h>         
+[?2004l[?2004h>         if state == 'ENDED':
+[?2004l[?2004h>             # Already complete, no insertions needed
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # Need to reach ENDED
+[?2004l[?2004h>             if not has_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_commit and not has_abort:
+[?2004l[?2004h>                 # No decision yet
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     insertions.append(('ABORT', None))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     insertions.append(('COMMIT', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_end:
+[?2004l[?2004h>                 insertions.append(('END', None))
+[?2004l[?2004h>         
+[?2004l[?2004h>         if insertions:
+[?2004l[?2004h>             ins_lines[tx] = insertions
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Build output
+[?2004l[?2004h>     output = []
+[?2004l[?2004h>     
+[?2004l[?2004h>     # BAD lines sorted by tx
+[?2004l[?2004h>     for tx in sorted(bad_lines.keys()):
+[?2004l[?2004h>         output.append(f'BAD {tx} {bad_lines[tx]}')
+[?2004l[?2004h>     
+[?2004l[?2004h>     # INS lines sorted by tx, then op order, then arg
+[?2004l[?2004h>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+[?2004l[?2004h>     
+[?2004l[?2004h>     for tx in sorted(ins_lines.keys()):
+[?2004l[?2004h>         items = ins_lines[tx]
+[?2004l[?2004h>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+[?2004l[?2004h>         for (op, arg) in items:
+[?2004l[?2004h>             if arg:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op} {arg}')
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op}')
+[?2004l[?2004h>     
+[?2004l[?2004h>     if not output:
+[?2004l[?2004h>         return 'OK'
+[?2004l[?2004h>     
+[?2004l[?2004h>     return '\n'.join(output)
+[?2004l[?2004h> ENDOFILE
+[?2004l[?2004h> cd /app && python3 -c "
+[?2004l[?2004h> from solution import solve
+[?2004l[?2004h> 
+[?2004l[?2004h> # Example 1: EPOCH Violation
+[?2004l[?2004h> lines1 = [
+[?2004l[?2004h>     '1 a1 BEGIN',
+[?2004l[?2004h>     '2 a1 EPOCH 0000000A',
+[?2004l[?2004h>     '3 a2 BEGIN',
+[?2004l[?2004h>     '4 a2 EPOCH 00000009',
+[?2004l[?2004h>     '5 b1 BEGIN',
+[?2004l[?2004h>     '6 b1 EPOCH 00000001',
+[?2004l[?2004h> ]
+[?2004l[?2004h> print('Test 1:')
+[?2004l[?2004h> print(repr(solve(lines1)))
+[?2004l[?2004h> print()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Example 2: Contradictory Votes
+[?2004l[?2004h> lines2 = [
+[?2004l[?2004h>     '1 c1 BEGIN',
+[?2004l[?2004h>     '2 c1 PREPARE',
+[?2004l[?2004h>     '3 c1 VOTE YES',
+[?2004l[?2004h>     '4 c1 VOTE NO',
+[?2004l[?2004h> ]
+[?2004l[?2004h> print('Test 2:')
+[?2004l[?2004h> print(repr(solve(lines2)))
+[?2004l[?2004h> print()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Example 3: END Without Decision
+[?2004l[?2004h> lines3 = [
+[?2004l[?2004h>     '1 d1 BEGIN',
+[?2004l[?2004h>     '2 d1 END',
+[?2004l[?2004h> ]
+[?2004l[?2004h> print('Test 3:')
+[?2004l[?2004h> print(repr(solve(lines3)))
+[?2004l[?2004h> print()
+[?2004l[?2004h> 
+[?2004l[?2004h> # Example 4: Bespoke Default COMMIT
+[?2004l[?2004h> lines4 = [
+[?2004l[?2004h>     '1 a1 BEGIN',
+[?2004l[?2004h>     '2 a1 PREPARE',
+[?2004l[?2004h> ]
+[?2004l[?2004h> print('Test 4:')
+[?2004l[?2004h> print(repr(solve(lines4)))
+[?2004l[?2004h> print()
+[?2004l[?2004h> "
+[?2004l[?2004h> cd /app && python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001']))"
+[?2004l[?2004h> python3 << 'EOF'
+[?2004l[?2004h> from solution import solve
+[?2004l[?2004h> 
+[?2004l[?2004h> # Test 1: EPOCH violation
+[?2004l[?2004h> result = solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001'])
+[?2004l[?2004h> print('Test1:', repr(result))
+[?2004l[?2004h> EOF
+[?2004l[?2004h> ls -la /app/solution.py
+[?2004l[?2004h> python3 -c "print('hello')"
+[?2004l[?2004h> python3 -c "import solution; print('imported ok')"
+[?2004l[?2004h> python3 -c "print('hello world')" > /tmp/test.txt 2>&1; cat /tmp/test.txt
+[?2004l[?2004h> 
+[?2004l[?2004h> echo test123
+[?2004l[?2004h> ^C[?2004l[?2004h[?2004l
+[?2004hroot@3b73c94fca5e:/app# ^C[?2004l[?2004h[?2004l
+[?2004hroot@3b73c94fca5e:/app# echo HELLO_WORLD
+[?2004lHELLO_WORLD
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001']))"
+[?2004lTraceback (most recent call last):
+  File [35m"<string>"[0m, line [35m1[0m, in [35m<module>[0m
+    [1;31mfrom solution import solve[0m; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001']))
+    [1;31m^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+[1;35mModuleNotFoundError[0m: [35mNo module named 'solution'[0m
+[?2004hroot@3b73c94fca5e:/app# ls -la /app/solution.py
+[?2004lls: cannot access '/app/solution.py': No such file or directory
+[?2004hroot@3b73c94fca5e:/app# python3 -c "
+[?2004l[?2004h> import textwrap
+[?2004l[?2004h> code = textwrap.dedent('''
+[?2004l[?2004h> import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     # Parse valid prefix
+[?2004l[?2004h>     events = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         stripped = line.strip()
+[?2004l[?2004h>         if not stripped or stripped.startswith('#'):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         parts = stripped.split(' ')
+[?2004l[?2004h>         if len(parts) < 3:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         idx_str, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>         arg = parts[3] if len(parts) >= 4 else None
+[?2004l[?2004h>         extra = len(parts) > 4
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         valid = False
+[?2004l[?2004h>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+[?2004l[?2004h>             if arg is not None:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'VOTE':
+[?2004l[?2004h>             if arg is None or arg not in ('YES', 'NO') or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'FENCE':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'EPOCH':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not valid:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     shard_last_epoch = {}
+[?2004l[?2004h>     shard_bad = set()
+[?2004l[?2004h>     tx_order = []
+[?2004l[?2004h>     tx_seen = set()
+[?2004l[?2004h>     tx_events = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (tx, op, arg) in events:
+[?2004l[?2004h>         if tx not in tx_seen:
+[?2004l[?2004h>             tx_seen.add(tx)
+[?2004l[?2004h>             tx_order.append(tx)
+[?2004l[?2004h>             tx_events[tx] = []
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if op == 'EPOCH':
+[?2004l[?2004h>             nonce_val = int(arg, 16)
+[?2004l[?2004h>             if shard in shard_last_epoch:
+[?2004l[?2004h>                 if nonce_val <= shard_last_epoch[shard]:
+[?2004l[?2004h>                     shard_bad.add(shard)
+[?2004l[?2004h>             shard_last_epoch[shard] = nonce_val
+[?2004l[?2004h>         tx_events[tx].append((op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     bad_lines = {}
+[?2004l[?2004h>     ins_lines = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in tx_order:
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in shard_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_EPOCH'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         evts = tx_events[tx]
+[?2004l[?2004h>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+[?2004l[?2004h> 
+[?2004l[?2004h>         fence_bad = False
+[?2004l[?2004h>         last_fence = None
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 val = int(arg, 16)
+[?2004l[?2004h>                 if last_fence is not None and val <= last_fence:
+[?2004l[?2004h>                     fence_bad = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 last_fence = val
+[?2004l[?2004h>         if fence_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_FENCE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         has_yes = False
+[?2004l[?2004h>         has_no = False
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'VOTE':
+[?2004l[?2004h>                 if arg == 'YES':
+[?2004l[?2004h>                     has_yes = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     has_no = True
+[?2004l[?2004h>         if has_yes and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_VOTE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         state = 'NEW'
+[?2004l[?2004h>         irreparable = False
+[?2004l[?2004h>         has_begin = False
+[?2004l[?2004h>         has_prepare = False
+[?2004l[?2004h>         has_commit = False
+[?2004l[?2004h>         has_abort = False
+[?2004l[?2004h>         has_end = False
+[?2004l[?2004h> 
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             if op == 'BEGIN':
+[?2004l[?2004h>                 if state != 'NEW':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'BEGUN'
+[?2004l[?2004h>                 has_begin = True
+[?2004l[?2004h>             elif op == 'PREPARE':
+[?2004l[?2004h>                 if state != 'BEGUN':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'PREPARED'
+[?2004l[?2004h>                 has_prepare = True
+[?2004l[?2004h>             elif op == 'VOTE':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'COMMIT':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                 has_commit = True
+[?2004l[?2004h>             elif op == 'ABORT':
+[?2004l[?2004h>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_ABORT'
+[?2004l[?2004h>                 has_abort = True
+[?2004l[?2004h>             elif op == 'END':
+[?2004l[?2004h>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'ENDED'
+[?2004l[?2004h>                 has_end = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         if irreparable:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if has_end and not has_commit and not has_abort:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if has_commit and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if (has_commit or has_abort) and not has_prepare:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         insertions = []
+[?2004l[?2004h>         if state == 'ENDED':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if not has_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             if not has_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>             if not has_commit and not has_abort:
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     insertions.append(('ABORT', None))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     insertions.append(('COMMIT', None))
+[?2004l[?2004h>             if not has_end:
+[?2004l[?2004h>                 insertions.append(('END', None))
+[?2004l[?2004h>         if insertions:
+[?2004l[?2004h>             ins_lines[tx] = insertions
+[?2004l[?2004h> 
+[?2004l[?2004h>     output = []
+[?2004l[?2004h>     for tx in sorted(bad_lines.keys()):
+[?2004l[?2004h>         output.append(f'BAD {tx} {bad_lines[tx]}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+[?2004l[?2004h>     for tx in sorted(ins_lines.keys()):
+[?2004l[?2004h>         items = ins_lines[tx]
+[?2004l[?2004h>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+[?2004l[?2004h>         for (op, arg) in items:
+[?2004l[?2004h>             if arg:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op} {arg}')
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not output:
+[?2004l[?2004h>         return 'OK'
+[?2004l[?2004h>     return '\\n'.join(output)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> with open('/app/solution.py', 'w') as f:
+[?2004l[?2004h>     f.write(code.lstrip())
+[?2004l[?2004h> print('File created')
+[?2004l[?2004h> "
+[?2004lFile created
+[?2004hroot@3b73c94fca5e:/app# head -5 /app/solution.py
+[?2004limport re
+
+def solve(lines: list[str]) -> str:
+    # Parse valid prefix
+    events = []
+[?2004hroot@3b73c94fca5e:/app# tail -5 /app/solution.py
+[?2004l
+    if not output:
+        return 'OK'
+    return '
+'.join(output)
+[?2004hroot@3b73c94fca5e:/app# python3 << 'PYEOF'
+[?2004l[?2004h> with open('/app/solution.py', 'w') as f:
+[?2004l[?2004h>     f.write('''import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     events = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         stripped = line.strip()
+[?2004l[?2004h>         if not stripped or stripped.startswith('#'):
+[?2004l[?2004h>             continue
+[?2004lhas_abort = False
+        has_end = False
+
+        for (op, arg) in state_evts:
+            if op == 'FENCE':
+                continue
+            if op == 'BEGIN':
+                if state != 'NEW':
+                    irreparable = True
+                    break
+                state = 'BEGUN'
+                has_begin = True
+            elif op == 'PREPARE':
+                if state != 'BEGUN':
+                    irreparable = True
+                    break
+                state = 'PREPARED'
+                has_prepare = True
+            elif op == 'VOTE':
+                if state != 'PREPARED':
+                    irreparable = True
+                    break
+            elif op == 'COMMIT':
+                if state != 'PREPARED':
+                    irreparable = True
+                    break
+                if has_no:
+                    irreparable = True
+                    break
+                state = 'DECIDED_COMMIT'
+                has_commit = True
+            elif op == 'ABORT':
+               [?2004h>         parts = stripped.split(' ')
+[?2004l[?2004h>         if len(parts) < 3:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         idx_str, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>         arg = parts[3] if len(parts) >= 4 else None
+[?2004l[?2004h>         extra = len(parts) > 4
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         valid = False
+[?2004l[?2004h>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+[?2004l[?2004h>             if arg is not None:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'VOTE':
+[?2004l[?2004h>             if arg is None or arg not in ('YES', 'NO') or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'FENCE':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'EPOCH':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not valid:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     shard_last_epoch = {}
+[?2004l[?2004h>     shard_bad = set()
+[?2004l[?2004h>     tx_order = []
+[?2004l[?2004h>     tx_seen = set()
+[?2004l[?2004h>     tx_events = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (tx, op, arg) in events:
+[?2004l[?2004h>         if tx not in tx_seen:
+[?2004l[?2004h>             tx_seen.add(tx)
+[?2004l[?2004h>             tx_order.append(tx)
+[?2004l[?2004h>             tx_events[tx] = []
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if op == 'EPOCH':
+[?2004l[?2004h>             nonce_val = int(arg, 16)
+[?2004l[?2004h>             if shard in shard_last_epoch:
+[?2004l[?2004h>                 if nonce_val <= shard_last_epoch[shard]:
+[?2004l[?2004h>                     shard_bad.add(shard)
+[?2004l[?2004h>             shard_last_epoch[shard] = nonce_val
+[?2004l[?2004h>         tx_events[tx].append((op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     bad_lines = {}
+[?2004l[?2004h>     ins_lines = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in tx_order:
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in shard_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_EPOCH'
+[?2004l[?2004h>             continue
+[?2004lput)
+''')
+print('done')
+PYEOF
+[?2004h> 
+[?2004l[?2004h>         evts = tx_events[tx]
+[?2004l[?2004h>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+[?2004l[?2004h> 
+[?2004l[?2004h>         fence_bad = False
+[?2004l[?2004h>         last_fence = None
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 val = int(arg, 16)
+[?2004l[?2004h>                 if last_fence is not None and val <= last_fence:
+[?2004l[?2004h>                     fence_bad = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 last_fence = val
+[?2004l[?2004h>         if fence_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_FENCE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         has_yes = False
+[?2004l[?2004h>         has_no = False
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'VOTE':
+[?2004l[?2004h>                 if arg == 'YES':
+[?2004l[?2004h>                     has_yes = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     has_no = True
+[?2004l[?2004h>         if has_yes and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_VOTE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         state = 'NEW'
+[?2004l[?2004h>         irreparable = False
+[?2004l[?2004h>         has_begin = False
+[?2004l[?2004h>         has_prepare = False
+[?2004l[?2004h>         has_commit = False
+[?2004l[?2004h>         has_abort = False
+[?2004l[?2004h>         has_end = False
+[?2004l[?2004h> 
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             if op == 'BEGIN':
+[?2004l[?2004h>                 if state != 'NEW':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'BEGUN'
+[?2004l[?2004h>                 has_begin = True
+[?2004l[?2004h>             elif op == 'PREPARE':
+[?2004l[?2004h>                 if state != 'BEGUN':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'PREPARED'
+[?2004l[?2004h>                 has_prepare = True
+[?2004l[?2004h>             elif op == 'VOTE':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'COMMIT':
+[?2004l[?2004h>                 if state != 'PREPARED':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                 has_commit = True
+[?2004l[?2004h>             elif op == 'ABORT':
+[?2004l[?2004h>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'DECIDED_ABORT'
+[?2004l[?2004h>                 has_abort = True
+[?2004l[?2004h>             elif op == 'END':
+[?2004l[?2004h>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'ENDED'
+[?2004l[?2004h>                 has_end = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         if irreparable:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if has_end and not has_commit and not has_abort:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if has_commit and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if (has_commit or has_abort) and not has_prepare:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         insertions = []
+[?2004l[?2004h>         if state == 'ENDED':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if not has_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             if not has_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>             if not has_commit and not has_abort:
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     insertions.append(('ABORT', None))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     insertions.append(('COMMIT', None))
+[?2004l[?2004h>             if not has_end:
+[?2004l[?2004h>                 insertions.append(('END', None))
+[?2004l[?2004h>         if insertions:
+[?2004l[?2004h>             ins_lines[tx] = insertions
+[?2004l[?2004h> 
+[?2004l[?2004h>     output = []
+[?2004l[?2004h>     for tx in sorted(bad_lines.keys()):
+[?2004l[?2004h>         output.append(f'BAD {tx} {bad_lines[tx]}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+[?2004l[?2004h>     for tx in sorted(ins_lines.keys()):
+[?2004l[?2004h>         items = ins_lines[tx]
+[?2004l[?2004h>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+[?2004l[?2004h>         for (op, arg) in items:
+[?2004l[?2004h>             if arg:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op} {arg}')
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not output:
+[?2004l[?2004h>         return 'OK'
+[?2004l[?2004h>     return chr(10).join(output)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> print('done')
+[?2004l[?2004h> PYEOF
+[?2004ldone
+[?2004hroot@3b73c94fca5e:/app# tail -3 /app/solution.py
+[?2004l    if not output:
+        return 'OK'
+    return chr(10).join(output)
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001'])))"
+[?2004l'BAD a1 BAD_EPOCH\nBAD a2 BAD_EPOCH\nINS b1 PREPARE\nINS b1 COMMIT\nINS b1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO'])))"
+[?2004l'BAD c1 BAD_VOTE'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 d1 BEGIN','2 d1 END'])))"
+[?2004l'BAD d1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE'])))"
+[?2004l'INS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve([])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['# comment'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE YES','4 a1 COMMIT','5 a1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 ABORT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['0 a1 BEGIN','1 a1 PREPARE'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 PREPARE'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE YES'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 COMMIT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 << 'PYEOF'
+[?2004l[?2004h> with open('/app/solution.py', 'w') as f:
+[?2004l[?2004h>     f.write(r'''import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     events = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         stripped = line.strip()
+[?2004l[?2004h>         if not stripped or stripped.startswith('#'):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         parts = stripped.split(' ')
+[?2004l[?2004h>         if len(parts) < 3:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         idx_str, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>         arg = parts[3] if len(parts) >= 4 else None
+[?2004l[?2004h>         extra = len(parts) > 4
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         valid = False
+[?2004l[?2004h>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+[?2004l[?2004h>             if arg is not None:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'VOTE':
+[?2004l[?2004h>             if arg is None or arg not in ('YES', 'NO') or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'FENCE':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'EPOCH':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not valid:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l [?2004h>     # Track shard EPOCH monotonicity
+[?2004l[?2004h>     shard_last_epoch = {}
+[?2004l[?2004h>     shard_bad = set()
+[?2004l[?2004h>     tx_order = []
+[?2004l[?2004h>     tx_seen = set()
+[?2004l[?2004h>     tx_events = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (tx, op, arg) in events:
+[?2004l[?2004h>         if tx not in tx_seen:
+[?2004l[?2004h>             tx_seen.add(tx)
+[?2004l[?2004h>             tx_order.append(tx)
+[?2004l[?2004h>             tx_events[tx] = []
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if op == 'EPOCH':
+[?2004l[?2004h>             nonce_val = int(arg, 16)
+[?2004l[?2004h>             if shard in shard_last_epoch:
+[?2004l[?2004h>                 if nonce_val <= shard_last_epoch[shard]:
+[?2004l[?2004h>                     shard_bad.add(shard)
+[?2004l[?2004h>             shard_last_epoch[shard] = nonce_val
+[?2004l[?2004h>         tx_events[tx].append((op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     bad_lines = {}
+[?2004l[?2004h>     ins_lines = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in tx_order:
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in shard_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_EPOCH'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         evts = tx_events[tx]
+[?2004l[?2004h>         # Filter out EPOCH for state processing
+[?2004l[?2004h>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Check FENCE monotonicity per tx
+[?2004l[?2004h>         fence_bad = False
+[?2004l[?2004h>         last_fence = None
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 val = int(arg, 16)
+[?2004l[?2004h>                 if last_fence is not None and val <= last_fence:
+[?2004l[?2004h>                     fence_bad = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 last_fence = val
+[?2004l[?2004h>         if fence_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_FENCE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Check for mixed votes
+[?2004l[?2004h>         has_yes = any(arg == 'YES' for op, arg in state_evts if op == 'VOTE')
+[?2004l[?2004h>         has_no = any(arg == 'NO' for op, arg in state_evts if op == 'VOTE')
+[?2004l[?2004h>         if has_yes and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_VOTE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Simulate state machine WITH insertions
+[?2004l[?2004h>         # We try to advance through the events, inserting prerequisites as needed
+[?2004l[?2004h>         # The key: we process events in order and track what state we can reach
+[?2004l[?2004h>         # considering allowed insertions
+[?2004l[?2004h>         #
+[?2004l[?2004h>         # Valid sequence (with optional parts):
+[?2004l[?2004h>         #   BEGIN -> PREPARE -> VOTE* -> (COMMIT|ABORT) -> END
+[?2004l[?2004h>         # ABORT can also come right after BEGIN (from BEGUN state)
+[?2004l[?2004h>         # FENCE can appear anywhere without changing state
+[?2004l[?2004h>         #
+[?2004l[?2004h>         # We simulate by tracking current state and seeing if each event
+[?2004l[?2004h>         # can be reached by inserting prerequisites
+[?2004l[?2004h>         
+[?2004l[?2004h>         # State ordering for "can we get there by insertion?"
+[?2004l[?2004h>         # NEW -> BEGUN -> PREPARED -> DECIDED_COMMIT/DECIDED_ABORT -> ENDED
+[?2004l[?2004h>         
+[?2004l[?2004h>         state = 'NEW'
+[?2004l[?2004h>         irreparable = False
+[?2004l[?2004h>         has_begin = False
+[?2004l[?2004h>         has_prepare = False
+[?2004l[?2004h>         has_commit = False
+[?2004l[?2004h>         has_abort = False
+[?2004l[?2004h>         has_end = False
+[?2004l[?2004h>         need_insert_begin = False
+[?2004l[?2004h>         need_insert_prepare = False
+[?2004l[?2004h>         
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             
+[?2004l[?2004h>             if op == 'BEGIN':
+[?2004l[?2004h>                 if state != 'NEW':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'BEGUN'
+[?2004l[?2004h>                 has_begin = True
+[?2004l[?2004h>             elif op == 'PREPARE':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     # Can insert BEGIN before
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'VOTE':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True  # logically
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'PREPARED':
+[?2004l[?2004h>                     pass  # stay in PREPARED
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'COMMIT':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                     has_commit = True
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                     has_commit = True
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'PREPARED':
+[?2004l[?2004h>                     if has_no:
+[?2004l[?2004h>                         irreparable = True
+[?2004l[?2004h>                         break
+[?2004l[?2004h>                     state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                     has_commit = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'ABORT':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'DECIDED_ABORT'
+[?2004l[?2004h>                     has_abort = True
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'DECIDED_ABORT'
+[?2004l[?2004h>                     has_abort = True
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'PREPARED':
+[?2004l[?2004h>                     state = 'DECIDED_ABORT'
+[?2004l[?2004h>                     has_abort = True
+[?2004l[?2004h>                 elif state == 'DECIDED_ABORT':
+[?2004l[?2004h>                     pass  # repeated ABORT is ok
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'END':
+[?2004l[?2004h>                 if state in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     state = 'ENDED'
+[?2004l[?2004h>                     has_end = True
+[?2004l[?2004h>                 elif state in ('NEW', 'BEGUN', 'PREPARED'):
+[?2004l[?2004h>                     # Need to insert a decision before END
+[?2004l[?2004h>                     # But we can only do that if it makes sense
+[?2004l[?2004h>                     # Actually, can we insert COMMIT/ABORT before END?
+[?2004l[?2004h>                     # We need BEGIN, PREPARE, decision before END
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>         
+[?2004l[?2004h>         if irreparable:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Compute insertions needed
+[?2004l[?2004h>         insertions = []
+[?2004l[?2004h>         if state == 'ENDED':
+[?2004l[?2004h>             # Already complete
+[?2004l[?2004h>             if need_insert_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             if need_insert_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if not has_begin and not need_insert_begin:
+[?2004l[?2004h>                 need_insert_begin = True
+[?2004l[?2004h>             if need_insert_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_prepare and not need_insert_prepare:
+[?2004l[?2004h>                 need_insert_prepare = True
+[?2004l[?2004h>             if need_insert_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_commit and not has_abort:
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     insertions.append(('ABORT', None))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     insertions.append(('COMMIT', None))
+[?2004l[?2004h>             
+[?2004l[?2004h>             if not has_end:
+[?2004l[?2004h>                 insertions.append(('END', None))
+[?2004l[?2004h> 
+[?2004l[?2004h>         if insertions:
+[?2004l[?2004h>             ins_lines[tx] = insertions
+[?2004l[?2004h> 
+[?2004l[?2004h>     output = []
+[?2004l[?2004h>     for tx in sorted(bad_lines.keys()):
+[?2004l[?2004h>         output.append(f'BAD {tx} {bad_lines[tx]}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+[?2004l[?2004h>     for tx in sorted(ins_lines.keys()):
+[?2004l[?2004h>         items = ins_lines[tx]
+[?2004l[?2004h>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+[?2004l[?2004h>         for (op, arg) in items:
+[?2004l[?2004h>             if arg:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op} {arg}')
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not output:
+[?2004l[?2004h>         return 'OK'
+[?2004l[?2004h>     return '\n'.join(output)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> print('done')
+[?2004l[?2004h> PYEOF
+[?2004ldone
+[?2004hroot@3b73c94fca5e:/app# tail -5 /app/solution.py
+[?2004l                output.append(f'INS {tx} {op}')
+
+    if not output:
+        return 'OK'
+    return '\n'.join(output)
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; r = solve(['1 a1 BEGIN','2 a1 PREPARE']); print(repr(r))"
+[?2004l'INS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 EPOCH 00000001']))"
+[?2004lBAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO']))"
+[?2004lBAD c1 BAD_VOTE
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 d1 BEGIN','2 d1 END']))"
+[?2004lBAD d1 BAD_ORDER
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE']))"
+[?2004lINS a1 COMMIT
+INS a1 END
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 PREPARE']))"
+[?2004lINS a1 BEGIN
+INS a1 COMMIT
+INS a1 END
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 COMMIT']))"
+[?2004lINS a1 BEGIN
+INS a1 PREPARE
+INS a1 END
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE NO']))"
+[?2004lINS a1 ABORT
+INS a1 END
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 ABORT','4 a1 END']))"
+[?2004lOK
+[?2004hroot@3b73c94fca5e:/app# python3 << 'PYEOF'
+[?2004l[?2004h> with open('/app/solution.py', 'w') as f:
+[?2004l[?2004h>     f.write(r'''import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     events = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         stripped = line.strip()
+[?2004l[?2004h>         if not stripped or stripped.startswith('#'):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         parts = stripped.split(' ')
+[?2004l[?2004h>         if len(parts) < 3:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         idx_str, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>         arg = parts[3] if len(parts) >= 4 else None
+[?2004l[?2004h>         extra = len(parts) > 4
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not re.fullmatch(r'[1-9][0-9]*', idx_str):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if not re.fullmatch(r'[a-z0-9]{1,8}', tx):
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l [?2004h>         valid = False
+[?2004l[?2004h>         if op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+[?2004l[?2004h>             if arg is not None:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'VOTE':
+[?2004l[?2004h>             if arg is None or arg not in ('YES', 'NO') or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'FENCE':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         elif op == 'EPOCH':
+[?2004l[?2004h>             if arg is None or not re.fullmatch(r'[A-F0-9]{8}', arg) or extra:
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             valid = True
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             break
+[?2004l[?2004h> 
+[?2004l[?2004h>         if not valid:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Track shard EPOCH monotonicity
+[?2004l[?2004h>     shard_last_epoch = {}
+[?2004l[?2004h>     shard_bad = set()
+[?2004l[?2004h>     tx_order = []
+[?2004l[?2004h>     tx_seen = set()
+[?2004l[?2004h>     tx_events = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for (tx, op, arg) in events:
+[?2004l[?2004h>         if tx not in tx_seen:
+[?2004l     [?2004h>             tx_seen.add(tx)
+[?2004l[?2004h>             tx_order.append(tx)
+[?2004l[?2004h>             tx_events[tx] = []
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if op == 'EPOCH':
+[?2004l[?2004h>             nonce_val = int(arg, 16)
+[?2004l[?2004h>             if shard in shard_last_epoch:
+[?2004l[?2004h>                 if nonce_val <= shard_last_epoch[shard]:
+[?2004l[?2004h>                     shard_bad.add(shard)
+[?2004l[?2004h>             shard_last_epoch[shard] = nonce_val
+[?2004l[?2004h>         tx_events[tx].append((op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     bad_lines = {}
+[?2004l[?2004h>     ins_lines = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in tx_order:
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in shard_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_EPOCH'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         evts = tx_events[tx]
+[?2004l[?2004h>         state_evts = [(op, arg) for (op, arg) in evts if op != 'EPOCH']
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Check FENCE monotonicity per tx
+[?2004l[?2004h>         fence_bad = False
+[?2004l[?2004h>         last_fence = None
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 val = int(arg, 16)
+[?2004l[?2004h>                 if last_fence is not None and val <= last_fence:
+[?2004l[?2004h>                     fence_bad = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 last_fence = val
+[?2004l[?2004h>         if fence_bad:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_FENCE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Check for mixed votes
+[?2004l[?2004h>         has_yes = any(arg == 'YES' for op, arg in state_evts if op == 'VOTE')
+[?2004l[?2004h>         has_no = any(arg == 'NO' for op, arg in state_evts if op == 'VOTE')
+[?2004l[?2004h>         if has_yes and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_VOTE'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Collect what ops actually exist in input
+[?2004l[?2004h>         actual_ops = set(op for op, arg in state_evts if op != 'FENCE')
+[?2004l[?2004h>         has_begin_actual = 'BEGIN' in actual_ops
+[?2004l[?2004h>         has_prepare_actual = 'PREPARE' in actual_ops
+[?2004l[?2004h>         has_commit_actual = 'COMMIT' in actual_ops
+[?2004l[?2004h>         has_abort_actual = 'ABORT' in actual_ops
+[?2004l[?2004h>         has_end_actual = 'END' in actual_ops
+[?2004l[?2004h>         has_decision_actual = has_commit_actual or has_abort_actual
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Check explicit irreparable cases from spec section 6:
+[?2004l[?2004h>         # 1. END exists but no decision in input
+[?2004l[?2004h>         if has_end_actual and not has_decision_actual:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         # 2. COMMIT exists but NO vote exists
+[?2004l[?2004h>         if has_commit_actual and has_no:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         # 3. Decision exists but no PREPARE in input
+[?2004l[?2004h>         if has_decision_actual and not has_prepare_actual:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Now simulate state machine with allowed insertions
+[?2004l[?2004h>         state = 'NEW'
+[?2004l[?2004h>         irreparable = False
+[?2004l[?2004h>         has_begin = False
+[?2004l[?2004h>         has_prepare = False
+[?2004l[?2004h>         has_commit = False
+[?2004l[?2004h>         has_abort = False
+[?2004l[?2004h>         has_end = False
+[?2004l[?2004h>         need_insert_begin = False
+[?2004l[?2004h>         need_insert_prepare = False
+[?2004l[?2004h> 
+[?2004l[?2004h>         for (op, arg) in state_evts:
+[?2004l[?2004h>             if op == 'FENCE':
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             if op == 'BEGIN':
+[?2004l[?2004h>                 if state != 'NEW':
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 state = 'BEGUN'
+[?2004l[?2004h>                 has_begin = True
+[?2004l[?2004h>             elif op == 'PREPARE':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                     has_prepare = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'VOTE':
+[?2004l[?2004h>                 if state == 'NEW':
+[?2004l[?2004h>                     need_insert_begin = True
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                 elif state == 'BEGUN':
+[?2004l[?2004h>                     need_insert_prepare = True
+[?2004l[?2004h>                     state = 'PREPARED'
+[?2004l[?2004h>                 elif state == 'PREPARED':
+[?2004l[?2004h>                     pass
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'COMMIT':
+[?2004l[?2004h>                 if state == 'PREPARED':
+[?2004l[?2004h>                     state = 'DECIDED_COMMIT'
+[?2004l[?2004h>                     has_commit = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'ABORT':
+[?2004l[?2004h>                 if state in ('PREPARED', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     state = 'DECIDED_ABORT'
+[?2004l[?2004h>                     has_abort = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             elif op == 'END':
+[?2004l[?2004h>                 if state in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+[?2004l[?2004h>                     state = 'ENDED'
+[?2004l[?2004h>                     has_end = True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     irreparable = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h> 
+[?2004l[?2004h>         if irreparable:
+[?2004l[?2004h>             bad_lines[tx] = 'BAD_ORDER'
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Compute insertions needed
+[?2004l[?2004h>         insertions = []
+[?2004l[?2004h>         if state == 'ENDED':
+[?2004l[?2004h>             if need_insert_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h>             if need_insert_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             if not has_begin and not need_insert_begin:
+[?2004l[?2004h>                 need_insert_begin = True
+[?2004l[?2004h>             if need_insert_begin:
+[?2004l[?2004h>                 insertions.append(('BEGIN', None))
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not has_prepare and not need_insert_prepare:
+[?2004l[?2004h>                 need_insert_prepare = True
+[?2004l[?2004h>             if need_insert_prepare:
+[?2004l[?2004h>                 insertions.append(('PREPARE', None))
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not has_commit and not has_abort:
+[?2004l[?2004h>                 if has_no:
+[?2004l[?2004h>                     insertions.append(('ABORT', None))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     insertions.append(('COMMIT', None))
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not has_end:
+[?2004l[?2004h>                 insertions.append(('END', None))
+[?2004l[?2004h> 
+[?2004l[?2004h>         if insertions:
+[?2004l[?2004h>             ins_lines[tx] = insertions
+[?2004l[?2004h> 
+[?2004l[?2004h>     output = []
+[?2004l[?2004h>     for tx in sorted(bad_lines.keys()):
+[?2004l[?2004h>         output.append(f'BAD {tx} {bad_lines[tx]}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+[?2004l[?2004h>     for tx in sorted(ins_lines.keys()):
+[?2004l[?2004h>         items = ins_lines[tx]
+[?2004l[?2004h>         items.sort(key=lambda x: (op_order.get(x[0], 99), x[1] or ''))
+[?2004l[?2004h>         for (op, arg) in items:
+[?2004l[?2004h>             if arg:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op} {arg}')
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 output.append(f'INS {tx} {op}')
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not output:
+[?2004l[?2004h>         return 'OK'
+[?2004l[?2004h>     return '\n'.join(output)
+[?2004l[?2004h> ''')
+[?2004l[?2004h> print('done')
+[?2004l[?2004h> PYEOF
+[?2004ldone
+[?2004hroot@3b73c94fca5e:/app# tail -3 /app/solution.py
+[?2004l    if not output:
+        return 'OK'
+    return '\n'.join(output)
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE'])))"
+[?2004l'INS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 d1 BEGIN','2 d1 END'])))"
+[?2004l'BAD d1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 ABORT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 PREPARE'])))"
+[?2004l'INS a1 BEGIN\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE YES'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 END'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN'])))"
+[?2004l'INS a1 PREPARE\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 FENCE 00000001'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 EPOCH 00000001'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 ABORT','4 a1 ABORT','5 a1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 COMMIT','4 a1 ABORT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE YES','4 a1 VOTE YES','5 a1 COMMIT','6 a1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 PREPARE','2 a1 COMMIT','3 a1 END'])))"
+[?2004l'INS a1 BEGIN'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 END'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 COMMIT'])))"
+[?2004l'INS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE YES','4 a1 END'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE NO','4 a1 ABORT','5 a1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE NO','4 a1 COMMIT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 EPOCH 00000005','2 a2 EPOCH 00000003'])))"
+[?2004l'BAD a1 BAD_EPOCH\nBAD a2 BAD_EPOCH'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 EPOCH 00000005','2 a2 EPOCH 00000006'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 COMMIT\nINS a1 END\nINS a2 BEGIN\nINS a2 PREPARE\nINS a2 COMMIT\nINS a2 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 EPOCH 00000005','2 a2 EPOCH 00000005'])))"
+[?2004l'BAD a1 BAD_EPOCH\nBAD a2 BAD_EPOCH'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN EXTRA'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 FENCE'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 UNKNOWN'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE MAYBE'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 ABORT','3 a1 PREPARE'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 ABORT'])))"
+[?2004l'INS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE YES','4 a1 ABORT'])))"
+[?2004l'INS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 FENCE 00000001','3 a1 PREPARE','4 a1 FENCE 00000002','5 a1 COMMIT','6 a1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 FENCE 00000002','3 a1 PREPARE','4 a1 FENCE 00000001'])))"
+[?2004l'BAD a1 BAD_FENCE'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 EPOCH 00000001','2 a1 EPOCH 00000002'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 b1 BEGIN','3 a1 PREPARE','4 b1 PREPARE','5 a1 COMMIT','6 b1 ABORT','7 a1 END','8 b1 END'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE YES','4 a1 COMMIT','5 a1 END','6 a1 BEGIN'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['bad line'])))"
+[?2004l'OK'
+[?2004hroot@3b73c94fca5e:/app# echo '1 a1 BEGIN
+[?2004l[?2004h> 2 a1 PREPARE' | python3 -c "from solution import solve; import sys; lines = sys.stdin.read().splitlines(); print(solve(lines))"
+[?2004lINS a1 COMMIT
+INS a1 END
+[?2004hroot@3b73c94fca5e:/app# echo '1 a1 BEGIN
+[?2004l[?2004h> 2 a1 EPOCH 0000000A
+[?2004l[?2004h> 3 a2 BEGIN
+[?2004l[?2004h> 4 a2 EPOCH 00000009
+[?2004l[?2004h> 5 b1 BEGIN
+[?2004l[?2004h> 6 b1 EPOCH 00000001' | python3 -c "from solution import solve; import sys; lines = sys.stdin.read().splitlines(); print(solve(lines))"
+[?2004lBAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+[?2004hroot@3b73c94fca5e:/app# wc -l /app/solution.py
+[?2004l239 /app/solution.py
+[?2004hroot@3b73c94fca5e:/app# python3 -c "import ast; ast.parse(open('/app/solution.py').read()); print('Syntax OK')"
+[?2004lSyntax OK
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 VOTE NO','4 a1 ABORT'])))"
+[?2004l'INS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE NO'])))"
+[?2004l'INS a1 BEGIN\nINS a1 PREPARE\nINS a1 ABORT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE YES','2 a1 COMMIT'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 VOTE YES','2 a1 COMMIT','3 a1 END'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 FENCE 00000001','2 a1 FENCE 00000001'])))"
+[?2004l'BAD a1 BAD_FENCE'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 BEGIN'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 BEGIN','2 a1 PREPARE','3 a1 PREPARE'])))"
+[?2004l'BAD a1 BAD_ORDER'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 PREPARE','2 a1 VOTE YES'])))"
+[?2004l'INS a1 BEGIN\nINS a1 COMMIT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# python3 -c "from solution import solve; print(repr(solve(['1 a1 PREPARE','2 a1 VOTE NO'])))"
+[?2004l'INS a1 BEGIN\nINS a1 ABORT\nINS a1 END'
+[?2004hroot@3b73c94fca5e:/app# 

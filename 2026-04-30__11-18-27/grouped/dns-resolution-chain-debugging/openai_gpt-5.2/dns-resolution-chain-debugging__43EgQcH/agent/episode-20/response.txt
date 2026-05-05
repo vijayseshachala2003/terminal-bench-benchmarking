@@ -1,0 +1,55 @@
+{
+  "analysis": "Still SERVFAIL from resolver. This likely means resolver is still trying to validate via the normal chain and not applying our island trust anchor, or it is forwarding and not getting DNSKEY/proofs needed, or the forward zone is not returning DNSKEY because the resolver isn't asking for it. We need to look at resolver log for 'validating' errors. Also, easiest way to make BIND treat secure.example.com as secure is to configure it as a 'static-stub' zone with a locally configured DS/DNSKEY? Another approach: disable validation for everything except secure.example.com is hard. Perhaps the resolver is not forwarding DNSKEY queries due to forward zone; but it should. Let's inspect resolver named.conf to ensure forward zones exist and trust-anchors block is present and syntactically correct. Then check logs for 'no valid signature' or 'unable to find key'. We'll also test querying resolver for DNSKEY of secure.example.com to see what it returns.",
+  "plan": "1) Print resolver named.conf to confirm forward zones and trust-anchors/trusted-keys blocks. 2) Tail resolver log with increased context and grep for 'validate', 'bogus', 'broken', 'trust', 'anchor'. 3) Query resolver for secure.example.com DNSKEY and DS to see behavior. 4) If trust anchor isn't applied, move trust-anchors/trusted-keys block to top-level before options (BIND sometimes requires it at top-level). We'll rewrite resolver named.conf cleanly with options, forward zones, and a top-level trust-anchors block. 5) Restart resolver and re-test.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,260p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -Ei 'bogus|validate|validation|trust|anchor|failed|SERVFAIL' /tmp/named-resolver.log | tail -n 80 || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 250 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com DNSKEY +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com DS +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split()\nname=parts[0].rstrip('.')+'.'\nkeytag=parts[4]; alg=parts[5]; dtype=parts[6]; digest=parts[7]\nprint(name,keytag,alg,dtype,digest)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "NAME=$(python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split();\nprint(parts[0].rstrip('.')+'.')\nPY\n); KEYTAG=$(python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split();\nprint(parts[4])\nPY\n); ALG=$(python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split();\nprint(parts[5])\nPY\n); DTYPE=$(python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split();\nprint(parts[6])\nPY\n); DIGEST=$(python3 - <<'PY'\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\nds=subprocess.check_output(['dnssec-dsfromkey','-2',ksk],text=True).strip().splitlines()[0]\nparts=ds.split();\nprint(parts[7])\nPY\n); cat > /app/dns/resolver/named.conf <<EOF\ntrust-anchors {\n    \"${NAME}\" static-ds ${KEYTAG} ${ALG} ${DTYPE} \"${DIGEST}\";\n};\n\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    dnssec-validation yes;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n};\n\nzone \"example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\nzone \"secure.example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

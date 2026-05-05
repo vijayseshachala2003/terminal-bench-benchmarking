@@ -1,0 +1,145 @@
+New Terminal Output:
+
+root@5c7f91368d01:/app# nl -ba stress_test.cpp | sed -n '70,160p'
+    70  int main() {
+    71      std::cout << "=== Lock-Free Queue Stress Test ===" << std::endl;
+    72      std::cout << "Producers: " << NUM_PRODUCERS << std::endl;
+    73      std::cout << "Consumers: " << NUM_CONSUMERS << std::endl;
+    74      std::cout << "Operations per producer: " << OPS_PER_THREAD << std::endl;
+    75      std::cout << "Total operations: " << (NUM_PRODUCERS * OPS_PER_THREAD) << std::endl;
+    76      std::cout << std::endl;
+    77
+    78      LockFreeQueue queue;
+    79
+    80      std::vector<std::thread> producer_threads;
+    81      std::vector<std::thread> consumer_threads;
+    82      std::vector<std::vector<uint64_t>> consumer_results(NUM_CONSUMERS);
+    83
+    84      // Start consumer threads
+    85      for (int i = 0; i < NUM_CONSUMERS; ++i) {
+    86          consumer_threads.emplace_back(consumer, std::ref(queue), std::ref(consumer_results[i]));
+    87      }
+    88
+    89      // Start producer threads
+    90      for (int i = 0; i < NUM_PRODUCERS; ++i) {
+    91          producer_threads.emplace_back(producer, std::ref(queue), i);
+    92      }
+    93
+    94      auto start_time = std::chrono::high_resolution_clock::now();
+    95
+    96      // Watchdog thread: abort if we exceed wall-clock timeout
+    97      std::thread watchdog([&start_time]() {
+    98          while (true) {
+    99              if (finished.load(std::memory_order_relaxed)) return;
+   100              std::this_thread::sleep_for(std::chrono::seconds(1));
+   101              auto now = std::chrono::high_resolution_clock::now();
+   102              auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+   103              if (elapsed >= WALL_CLOCK_TIMEOUT_SEC) {
+   104                  std::cerr << "TIMEOUT: stress test exceeded " << WALL_CLOCK_TIMEOUT_SEC
+   105                            << "s wall clock limit" << std::endl;
+   106                  timed_out.store(true, std::memory_order_relaxed);
+   107                  std::this_thread::sleep_for(std::chrono::seconds(2));
+   108                  std::cerr << "STRESS TEST FAILED" << std::endl;
+   109                  std::cerr << "  - Wall clock timeout after " << elapsed << "s" << std::endl;
+   110                  _exit(1);
+   111              }
+   112          }
+   113      });
+   114      watchdog.detach();
+   115
+   116      // Release all threads
+   117      start_flag.store(true, std::memory_order_release);
+   118
+   119      // Wait for producers
+   120      for (auto& t : producer_threads) {
+   121          t.join();
+   122      }
+   123
+   124      std::cout << "All producers finished" << std::endl;
+   125
+   126      // Wait for consumers
+   127      for (auto& t : consumer_threads) {
+   128          t.join();
+   129      }
+   130
+   131      finished.store(true, std::memory_order_relaxed);
+   132
+   133      auto end_time = std::chrono::high_resolution_clock::now();
+   134      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+   135
+   136      std::cout << "All consumers finished" << std::endl;
+   137      std::cout << "Duration: " << duration.count() << " ms" << std::endl;
+   138      std::cout << std::endl;
+   139
+   140      // Collect all dequeued values
+   141      for (const auto& results : consumer_results) {
+   142          all_dequeued.insert(all_dequeued.end(), results.begin(), results.end());
+   143      }
+   144
+   145      // Verify results
+   146      uint64_t expected_count = static_cast<uint64_t>(NUM_PRODUCERS) * OPS_PER_THREAD;
+   147
+   148      std::cout << "=== Results ===" << std::endl;
+   149      std::cout << "Expected: " << expected_count << std::endl;
+   150      std::cout << "Enqueued: " << total_enqueued.load() << std::endl;
+   151      std::cout << "Dequeued: " << all_dequeued.size() << std::endl;
+   152
+   153      // Check for duplicates and missing values
+   154      std::unordered_set<uint64_t> seen;
+   155      uint64_t duplicates = 0;
+   156      uint64_t invalid_values = 0;
+   157
+   158      for (uint64_t val : all_dequeued) {
+   159          if (val == 0 || val == SENTINEL) {
+   160              invalid_values++;
+root@5c7f91368d01:/app# perl -i -pe 'if($.==1){$seen=0} if(/std::atomic<bool> timed_out\(false\);/ && !$seen++){s/\n/\n    std::atomic<bool> finished(false);\n/
+} ' stress_test.cpp
+root@5c7f91368d01:/app# perl -i -pe 's/std::thread watchdog\(\[&start_time\]\)/std::thread watchdog([&start_time, &finished])/g' stress_test.cpp
+root@5c7f91368d01:/app# perl -0777 -i -pe 's/\n\s*finished\.store\(true, std::memory_order_relaxed\);\n(\s*std::cout << "All consumers finished")/\n\1/s' stress
+_test.cpp
+root@5c7f91368d01:/app# perl -0777 -i -pe 's/(for \(auto& t : consumer_threads\) \{\n\s*t\.join\(\);\n\s*\}\n)/$1\n    finished.store(true, std::memory_order_re
+laxed);\n/s' stress_test.cpp
+root@5c7f91368d01:/app# grep -n "timed_out\|finished\|watchdog" -n stress_test.cpp | head -n 30
+23:std::atomic<bool> timed_out{false};
+52:    while (!timed_out.load(std::memory_order_relaxed)) {
+97:    std::thread watchdog([&start_time]() {
+99:            if (finished.load(std::memory_order_relaxed)) return;
+106:                timed_out.store(true, std::memory_order_relaxed);
+114:    watchdog.detach();
+124:    std::cout << "All producers finished" << std::endl;
+131:    finished.store(true, std::memory_order_relaxed);
+133:    finished.store(true, std::memory_order_relaxed);
+138:    std::cout << "All consumers finished" << std::endl;
+root@5c7f91368d01:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+stress_test.cpp:99:17: error: use of undeclared identifier 'finished'
+            if (finished.load(std::memory_order_relaxed)) return;
+                ^
+stress_test.cpp:131:5: error: use of undeclared identifier 'finished'
+    finished.store(true, std::memory_order_relaxed);
+    ^
+stress_test.cpp:133:5: error: use of undeclared identifier 'finished'
+    finished.store(true, std::memory_order_relaxed);
+    ^
+3 errors generated.
+make: *** [Makefile:13: stress_test] Error 1
+root@5c7f91368d01:/app# /app/stress_test
+bash: /app/stress_test: No such file or directory
+root@5c7f91368d01:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+stress_test.cpp:99:17: error: use of undeclared identifier 'finished'
+            if (finished.load(std::memory_order_relaxed)) return;
+                ^
+stress_test.cpp:131:5: error: use of undeclared identifier 'finished'
+    finished.store(true, std::memory_order_relaxed);
+    ^
+stress_test.cpp:133:5: error: use of undeclared identifier 'finished'
+    finished.store(true, std::memory_order_relaxed);
+    ^
+3 errors generated.
+make: *** [Makefile:18: stress_test_tsan] Error 1
+root@5c7f91368d01:/app# /app/stress_test_tsan
+bash: /app/stress_test_tsan: No such file or directory
+root@5c7f91368d01:/app#

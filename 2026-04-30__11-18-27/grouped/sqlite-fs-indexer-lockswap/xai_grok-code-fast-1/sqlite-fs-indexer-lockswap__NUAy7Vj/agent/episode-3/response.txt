@@ -1,0 +1,19 @@
+{
+  "analysis": "The previous attempt to edit the file using sed caused JSON parsing errors due to escaping issues. The implementation needs to be corrected for concurrency: write directly to db_path with WAL and busy_timeout for retries, instead of using a temp file and rename. The code should import successfully and pass the tests.",
+  "plan": "Overwrite the indexer.py file with the corrected implementation using cat. The key changes are: remove temp file logic, add PRAGMA busy_timeout=30000 for lock retries, write directly to db_path. Then test the import and run pytest.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/app/indexer.py << 'EOF'\nimport os\nimport sqlite3\nimport hashlib\nimport unicodedata\n\ndef _normalize_path(path):\n    return unicodedata.normalize('NFC', path.replace(os.sep, '/'))\n\ndef _read_ignore_patterns():\n    ignore_path = '/data/ignore.txt'\n    patterns = []\n    if os.path.exists(ignore_path):\n        with open(ignore_path, 'r', encoding='utf-8') as f:\n            for line in f:\n                line = line.strip()\n                if not line or line.startswith('#'):\n                    continue\n                patterns.append(_normalize_path(line))\n    return patterns\n\ndef _matches_pattern(rel_path, pattern):\n    if pattern.startswith('/'):\n        pattern = pattern[1:]\n        return rel_path == pattern\n    if '/' not in pattern:\n        return any(comp == pattern for comp in rel_path.split('/'))\n    # Contains / but not leading\n    if rel_path == pattern or rel_path.endswith('/' + pattern):\n        return True\n    if pattern in rel_path:\n        idx = rel_path.find(pattern)\n        return idx > 0 and rel_path[idx-1] == '/'\n    return False\n\ndef _should_ignore(rel_path, patterns):\n    return any(_matches_pattern(rel_path, p) for p in patterns)\n\ndef build_index(root_dir: str, db_path: str) -> None:\n    patterns = _read_ignore_patterns()\n    files = {}\n    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):\n        for name in filenames:\n            fullpath = os.path.join(dirpath, name)\n            if os.path.islink(fullpath):\n                continue\n            try:\n                rel_path = os.path.relpath(fullpath, root_dir)\n                nfc_rel_path = _normalize_path(rel_path)\n                if _should_ignore(nfc_rel_path, patterns):\n                    continue\n                with open(fullpath, 'rb') as f:\n                    data = f.read()\n                sha256 = hashlib.sha256(data).hexdigest()\n                size = len(data)\n                original = rel_path\n                key = nfc_rel_path\n                if key not in files or original > files[key][0]:\n                    files[key] = (original, sha256, size)\n            except (OSError, IOError):\n                continue\n    # Sort for deterministic order\n    sorted_files = sorted(files.items())\n    conn = sqlite3.connect(db_path)\n    conn.execute('PRAGMA journal_mode=WAL')\n    conn.execute('PRAGMA synchronous=NORMAL')\n    conn.execute('PRAGMA busy_timeout=30000')\n    conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')\n    for path, (orig, sha, sz) in sorted_files:\n        conn.execute('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)', (path, sha, sz))\n    conn.commit()\n    conn.close()\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 -c \"import app.indexer; print('Import successful')\"\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app && python3 -m pytest /tests/test_outputs.py -v\n",
+      "duration": 10.0
+    }
+  ],
+  "task_complete": false
+}

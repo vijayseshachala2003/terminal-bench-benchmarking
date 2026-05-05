@@ -1,0 +1,168 @@
+[?2004hroot@fbfb22bbfa4e:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@fbfb22bbfa4e:/app# clear
+[?2004l[H[J[3J[?2004hroot@fbfb22bbfa4e:/app# cat /app/app/indexer.py
+[?2004l# Implement build_index here.
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    raise NotImplementedError
+[?2004hroot@fbfb22bbfa4e:/app# cat /tests/test_outputs.py
+[?2004lcat: /tests/test_outputs.py: No such file or directory
+[?2004hroot@fbfb22bbfa4e:/app# cat << 'EOF' > /app/app/indexer.py
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> import hashlib
+[?2004l[?2004h> import unicodedata
+[?2004l[?2004h> import re
+[?2004l[?2004h> import time
+[?2004l[?2004h> 
+[?2004l[?2004h> def compile_pattern(pattern):
+[?2004l[?2004h>     # 1. Handle literal '**'
+[?2004l[?2004h>     # We'll split by '**', process '*', then join with '\*\*'
+[?2004l[?2004h>     parts = pattern.split('**')
+[?2004l[?2004h>     regex_parts = []
+[?2004l[?2004h>     for part in parts:
+[?2004l[?2004h>         # Escape regex chars except '*'
+[?2004l[?2004h>         escaped = ''
+[?2004l[?2004h>         for char in part:
+[?2004l[?2004h>             if char == '*':
+[?2004l[?2004h>                 escaped += '[^/]*'
+[?2004l[?2004h>             elif char in '.^$+|()[]{}\\':
+[?2004l[?2004h>                 escaped += '\\' + char
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 escaped += char
+[?2004l[?2004h>         regex_parts.append(escaped)
+[?2004l[?2004h>     
+[?2004l[?2004h>     return '\*\*'.join(regex_parts)
+[?2004l[?2004h> 
+[?2004l[?2004h> def matches_ignore(rel_path, patterns):
+[?2004l[?2004h>     if not patterns:
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     
+[?2004l[?2004h>     components = rel_path.split('/')
+[?2004l[?2004h>     
+[?2004l[?2004h>     for p_type, regex in patterns:
+[?2004l[?2004h>         if p_type == 'leading_slash':
+[?2004l[?2004h>             if re.fullmatch(regex, rel_path):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         elif p_type == 'no_slash':
+[?2004l[?2004h>             for comp in components:
+[?2004l[?2004h>                 if re.fullmatch(regex, comp):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>         elif p_type == 'contains_slash':
+[?2004l[?2004h>             if re.fullmatch(regex, rel_path):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>             # Or any suffix that starts immediately after a '/' boundary
+[?2004l[?2004h>             # meaning regex matches rel_path[i:] where rel_path[i-1] == '/'
+[?2004l[?2004h>             # We can just check if rel_path ends with regex, but it must match exactly the suffix
+[?2004l[?2004h>             # Wait, re.search(r'(^|/)' + regex + r'$', rel_path)?
+[?2004l[?2004h>             # Yes, because it must match a suffix starting after a /
+[?2004l[?2004h>             if re.search(r'(?:^|/)' + regex + r'$', rel_path):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> def build_index(root_dir: str, db_path: str) -> None:
+[?2004l[?2004h>     ignore_file = '/data/ignore.txt'
+[?2004l[?2004h>     patterns = []
+[?2004l[?2004h>     if os.path.isfile(ignore_file):
+[?2004l[?2004h>         with open(ignore_file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>             for line in f:
+[?2004l[?2004h>                 line_stripped = line.lstrip()
+[?2004l[?2004h>                 if not line_stripped or line_stripped.startswith('#'):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 pattern = line.rstrip('\r\n')
+[?2004l[?2004h>                 pattern = unicodedata.normalize('NFC', pattern)
+[?2004l[?2004h>                 
+[?2004l[?2004h>                 if pattern.startswith('/'):
+[?2004l[?2004h>                     p_type = 'leading_slash'
+[?2004l[?2004h>                     regex = compile_pattern(pattern[1:])
+[?2004l[?2004h>                 elif '/' not in pattern:
+[?2004l[?2004h>                     p_type = 'no_slash'
+[?2004l[?2004h>                     regex = compile_pattern(pattern)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     p_type = 'contains_slash'
+[?2004l[?2004h>                     regex = compile_pattern(pattern)
+[?2004l[?2004h>                 
+[?2004l[?2004h>                 patterns.append((p_type, regex))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Walk directory
+[?2004l[?2004h>     files_to_index = {}
+[?2004l[?2004h>     
+[?2004l[?2004h>     for dirpath, dirnames, filenames in os.walk(root_dir):
+[?2004l[?2004h>         # Do not follow symlinks for directories
+[?2004l[?2004h>         # os.walk does not follow symlinks by default, but we should remove symlinks from dirnames
+[?2004l[?2004h>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+[?2004l[?2004h>         
+[?2004l[?2004h>         for filename in filenames:
+[?2004l[?2004h>             full_path = os.path.join(dirpath, filename)
+[?2004l[?2004h>             if os.path.islink(full_path):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             
+[?2004l[?2004h>             rel_path = os.path.relpath(full_path, root_dir)
+[?2004l[?2004h>             # Use forward slashes
+[?2004l[?2004h>             rel_path = rel_path.replace(os.sep, '/')
+[?2004l[?2004h>             if rel_path == '.':
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             
+[?2004l[?2004h>             if matches_ignore(unicodedata.normalize('NFC', rel_path), patterns):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>                 
+[?2004l[?2004h>             nfc_path = unicodedata.normalize('NFC', rel_path)
+[?2004l[?2004h>             
+[?2004l[?2004h>             if nfc_path not in files_to_index:
+[?2004l[?2004h>                 files_to_index[nfc_path] = rel_path
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 if rel_path > files_to_index[nfc_path]:
+[?2004l[?2004h>                     files_to_index[nfc_path] = rel_path
+[?2004l[?2004h> 
+[?2004l[?2004h>     results = []
+[?2004l[?2004h>     for nfc_path, orig_rel_path in files_to_index.items():
+[?2004l[?2004h>         full_path = os.path.join(root_dir, orig_rel_path.replace('/', os.sep))
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             size = os.path.getsize(full_path)
+[?2004l[?2004h>             hasher = hashlib.sha256()
+[?2004l[?2004h>             with open(full_path, 'rb') as f:
+[?2004l[?2004h>                 for chunk in iter(lambda: f.read(4096 * 1024), b''):
+[?2004l[?2004h>                     hasher.update(chunk)
+[?2004l[?2004h>             sha256_hex = hasher.hexdigest()
+[?2004l[?2004h>             results.append((nfc_path, sha256_hex, size))
+[?2004l[?2004h>         except OSError:
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Sort results by nfc_path for determinism (though DB order handles this, good for insertion)
+[?2004l[?2004h>     results.sort(key=lambda x: x[0])
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Write to DB
+[?2004l[?2004h>     for _ in range(100):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             conn = sqlite3.connect(db_path, timeout=60.0)
+[?2004l[?2004h>             conn.execute("PRAGMA journal_mode=WAL")
+[?2004l[?2004h>             conn.execute("PRAGMA synchronous=NORMAL")
+[?2004l[?2004h>             
+[?2004l[?2004h>             with conn:
+[?2004l[?2004h>                 conn.execute('''
+[?2004l[?2004h>                     CREATE TABLE IF NOT EXISTS files (
+[?2004l[?2004h>                         path TEXT PRIMARY KEY,
+[?2004l[?2004h>                         sha256 TEXT NOT NULL,
+[?2004l[?2004h>                         size INTEGER NOT NULL
+[?2004l[?2004h>                     )
+[?2004l[?2004h>                 ''')
+[?2004l[?2004h>                 
+[?2004l[?2004h>                 # We need to insert or replace. The test might run multiple times or concurrently.
+[?2004l[?2004h>                 # If multiple processes run, they might insert the same rows.
+[?2004l[?2004h>                 conn.executemany('''
+[?2004l[?2004h>                     INSERT OR REPLACE INTO files (path, sha256, size)
+[?2004l[?2004h>                     VALUES (?, ?, ?)
+[?2004l[?2004h>                 ''', results)
+[?2004l[?2004h>             conn.close()
+[?2004l[?2004h>             break
+[?2004l[?2004h>         except sqlite3.OperationalError as e:
+[?2004l[?2004h>             if 'locked' in str(e) or 'busy' in str(e):
+[?2004l[?2004h>                 time.sleep(0.1)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@fbfb22bbfa4e:/app# touch /app/app/__init__.py
+[?2004l[?2004hroot@fbfb22bbfa4e:/app# 

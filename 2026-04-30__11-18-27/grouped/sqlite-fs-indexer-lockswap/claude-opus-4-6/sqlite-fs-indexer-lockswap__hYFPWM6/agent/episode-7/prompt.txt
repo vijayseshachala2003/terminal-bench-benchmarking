@@ -1,0 +1,279 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@5404bc9b5bfa:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import re
+> import tempfile
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read ignore patterns from file. Return list of NFC-normalized patterns."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 # Skip empty lines and lines whose first non-whitespace char is #
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 # Normalize pattern to NFC
+>                 pattern = unicodedata.normalize("NFC", line)
+>                 patterns.append(pattern)
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _pattern_to_regex(pattern_str):
+>     """
+>     Convert a glob-like pattern to a regex string where:
+>     - ** (two consecutive asterisks) matches literal ** in the path
+>     - * (single asterisk) matches zero or more characters but NOT /
+>     - ? matches exactly one character but NOT /
+>     - [...] character classes work as usual
+>     """
+>     i = 0
+>     regex = "^"
+>     n = len(pattern_str)
+>     while i < n:
+>         c = pattern_str[i]
+>         if c == '*' and i + 1 < n and pattern_str[i + 1] == '*':
+>             # ** means literal two asterisks
+>             regex += re.escape('**')
+>             i += 2
+>         elif c == '*':
+>             # single * matches zero or more non-/ characters
+>             regex += "[^/]*"
+>             i += 1
+>         elif c == '?':
+>             regex += "[^/]"
+>             i += 1
+>         elif c == '[':
+>             # Find closing bracket
+>             j = i + 1
+>             if j < n and pattern_str[j] == '!':
+>                 j += 1
+>             if j < n and pattern_str[j] == ']':
+>                 j += 1
+>             while j < n and pattern_str[j] != ']':
+>                 j += 1
+>             if j >= n:
+>                 regex += re.escape(c)
+>                 i += 1
+>             else:
+>                 stuff = pattern_str[i + 1:j]
+>                 i = j + 1
+>                 if stuff and stuff[0] == '!':
+>                     stuff = '^' + stuff[1:]
+>                 regex += '[' + stuff + ']'
+>         else:
+>             regex += re.escape(c)
+>             i += 1
+>     regex += "$"
+>     return regex
+>
+>
+> def _match_pattern(pattern_str, text):
+>     """Match a pattern against text."""
+>     regex = _pattern_to_regex(pattern_str)
+>     try:
+>         return re.match(regex, text) is not None
+>     except re.error:
+>         return False
+>
+>
+> def _is_ignored(rel_path_nfc, patterns):
+>     """
+>     Check if a NFC-normalized relative path should be ignored based on patterns.
+>     rel_path_nfc uses / as separator.
+>     """
+>     for pattern in patterns:
+>         pat = pattern.strip()
+>         if not pat:
+>             continue
+>
+>         if pat.startswith("/"):
+>             # Rule 1: Leading / means match against full relative path only
+>             pat_stripped = pat[1:]
+>             if _match_pattern(pat_stripped, rel_path_nfc):
+>                 return True
+>         elif "/" in pat:
+>             # Rule 3: Contains / but doesn't start with /
+>             # Match against full relative path OR any suffix starting after a / boundary
+>             if _match_pattern(pat, rel_path_nfc):
+>                 return True
+>             parts = rel_path_nfc.split("/")
+>             for idx in range(1, len(parts)):
+>                 suffix = "/".join(parts[idx:])
+>                 if _match_pattern(pat, suffix):
+>                     return True
+>         else:
+>             # Rule 2: No / in pattern - match against each path component
+>             components = rel_path_nfc.split("/")
+>             for comp in components:
+>                 if _match_pattern(pat, comp):
+>                     return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of file contents. Returns lowercase hex string."""
+>     h = hashlib.sha256()
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>     return h.hexdigest()
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     # Read ignore patterns
+>     patterns = _read_ignore_patterns()
+>
+>     # Normalize root_dir to absolute path
+>     root_dir = os.path.abspath(root_dir)
+>
+>     # Dict: nfc_rel_path -> (original_rel_path, full_path)
+>     file_map = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories from dirnames (in-place)
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         # Sort dirnames for deterministic traversal
+>         dirnames.sort()
+>
+>         for filename in sorted(filenames):
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Compute relative path with forward slashes
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, "/")
+>
+>             # NFC normalize
+>             nfc_rel_path = unicodedata.normalize("NFC", rel_path)
+>
+>             # Check ignore rules (use NFC path for matching)
+>             if _is_ignored(nfc_rel_path, patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original
+>             if nfc_rel_path in file_map:
+>                 existing_orig = file_map[nfc_rel_path][0]
+>                 if rel_path > existing_orig:
+>                     file_map[nfc_rel_path] = (rel_path, full_path)
+>             else:
+>                 file_map[nfc_rel_path] = (rel_path, full_path)
+>
+>     # Build rows sorted by NFC path for determinism
+>     rows = []
+>     for nfc_path in sorted(file_map.keys()):
+>         orig_rel, full_path = file_map[nfc_path]
+>         try:
+>             size = os.path.getsize(full_path)
+>             sha = _hash_file(full_path)
+>             rows.append((nfc_path, sha, size))
+>         except (OSError, IOError):
+>             continue
+>
+>     # Write to SQLite database
+>     # For concurrency safety: build in a temp file, then atomically replace
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     if db_dir:
+>         os.makedirs(db_dir, exist_ok=True)
+>
+>     fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=FULL")
+>             conn.execute(
+>                 "CREATE TABLE files ("
+>                 "path TEXT PRIMARY KEY, "
+>                 "sha256 TEXT NOT NULL, "
+>                 "size INTEGER NOT NULL)"
+>             )
+>             conn.executemany(
+>                 "INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)",
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         # Atomic replace
+>         os.replace(tmp_path, os.path.abspath(db_path))
+>     except BaseException:
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> PYTHON_EOF
+root@5404bc9b5bfa:/app# python3 -c "from app.indexer import build_index; print('Import OK')"
+Import OK
+root@5404bc9b5bfa:/app# python3 -c "
+> from app.indexer import _match_pattern
+> # Test ** matches literal **
+> print('** vs **:', _match_pattern('**', '**'))  # Should be True
+> print('** vs ab:', _match_pattern('**', 'ab'))  # Should be False
+> print('* vs ab:', _match_pattern('*', 'ab'))    # Should be True
+> print('* vs a/b:', _match_pattern('*', 'a/b'))  # Should be False
+> print('*.log vs test.log:', _match_pattern('*.log', 'test.log'))  # True
+> print('a/b vs a/b:', _match_pattern('a/b', 'a/b'))  # True
+> "
+** vs **: True
+** vs ab: False
+* vs ab: True
+* vs a/b: False
+*.log vs test.log: True
+a/b vs a/b: True
+root@5404bc9b5bfa:/app# python3 -c "
+> import os, tempfile, multiprocessing, sqlite3
+> from app.indexer import build_index
+>
+> td = tempfile.mkdtemp()
+> for i in range(20):
+>     with open(os.path.join(td, f'file{i}.txt'), 'w') as f:
+>         f.write(f'content {i}')
+>
+> db = '/tmp/test_concurrent2.db'
+>
+> def worker(_):
+>     build_index(td, db)
+>
+> with multiprocessing.Pool(8) as pool:
+>     pool.map(worker, range(8))
+>
+> conn = sqlite3.connect(db)
+> result = conn.execute('PRAGMA integrity_check').fetchone()
+> print('Integrity:', result)
+> rows = conn.execute('SELECT COUNT(*) FROM files').fetchone()
+> print('Row count:', rows[0])
+> conn.close()
+> print('Concurrency test OK')
+> "
+Integrity: ('ok',)
+Row count: 20
+Concurrency test OK
+root@5404bc9b5bfa:/app#

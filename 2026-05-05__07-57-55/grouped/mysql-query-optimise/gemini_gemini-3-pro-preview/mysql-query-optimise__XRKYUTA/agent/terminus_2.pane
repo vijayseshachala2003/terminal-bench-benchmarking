@@ -1,0 +1,81 @@
+[?2004hroot@cce9dd0954cd:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@cce9dd0954cd:/app# clear
+[?2004l[H[J[3J[?2004hroot@cce9dd0954cd:/app# ls -la /app
+[?2004ltotal 72
+drwxr-xr-x. 1 root root   173 Apr 30 09:49 .
+drwxr-xr-x. 1 root root    74 May  5 09:21 ..
+-rwxr-xr-x. 1 root root  6883 Apr 30 09:39 generate_data.sh
+-rw-r--r--. 1 root root 13703 Apr 30 09:49 mysql_slow_07g1w9.log
+-rw-r--r--. 1 root root 11025 Apr 30 09:49 mysql_slow_4mvpet.log
+-rw-r--r--. 1 root root 12613 Apr 30 09:49 mysql_slow_4x92y2.log
+-rw-r--r--. 1 root root 14787 Apr 30 09:49 mysql_slow_rymn3u.log
+-rw-r--r--. 1 root root  1172 Apr 30 09:49 query_metadata.json
+[?2004hroot@cce9dd0954cd:/app# cat << 'EOF' > analyze.py
+[?2004l[?2004h> import json, re, glob, math
+[?2004l[?2004h> from collections import defaultdict
+[?2004l[?2004h> from datetime import datetime
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/query_metadata.json', 'r') as f:
+[?2004l[?2004h>     meta = json.load(f)
+[?2004l[?2004h> budget = meta['budget']
+[?2004l[?2004h> tables = meta['tables']
+[?2004l[?2004h> 
+[?2004l[?2004h> parsed = []
+[?2004l[?2004h> for lf in glob.glob('/app/mysql_slow_*.log'):
+[?2004l[?2004h>     with open(lf, 'r') as f:
+[?2004l[?2004h>         content = f.read()
+[?2004l[?2004h>         for block in content.split('# Time: ')[1:]:
+[?2004l[?2004h>             lines = block.strip().split('\n')
+[?2004l[?2004h>             ts_str = lines[0].strip()[:19]
+[?2004l[?2004h>             try: ts = datetime.strptime(ts_str, '%Y-%m-%dT%H:%M:%S').timestamp()
+[?2004l[?2004h>             except: ts = 0
+[?2004l[?2004h>             qt = 0.0
+[?2004l[?2004h>             ql = []
+[?2004l[?2004h>             for l in lines[1:]:
+[?2004l[?2004h>                 if l.startswith('# Query_time:'):
+[?2004l[?2004h>                     m = re.search(r'Query_time:\s*([\d\.]+)', l)
+[?2004l[?2004h>                     if m: qt = float(m.group(1))
+[?2004l[?2004h>                 elif not l.startswith('#') and not l.startswith('SET'):
+[?2004l[?2004h>                     ql.append(l)
+[?2004l[?2004h>             q = ' '.join(ql).strip()
+[?2004l[?2004h>             if q.endswith(';'): q = q[:-1]
+[?2004l[?2004h>             if qt > 1.0:
+[?2004l[?2004h>                 nq = re.sub(r'\s+', ' ', q)
+[?2004l[?2004h>                 nq = re.sub(r'IN\s*\([^)]+\)', 'IN (?)', nq, flags=re.IGNORECASE)
+[?2004l[?2004h>                 nq = re.sub(r"'[^']*'", "?", nq)
+[?2004l[?2004h>                 nq = re.sub(r'"[^"]*"', "?", nq)
+[?2004l[?2004h>                 nq = re.sub(r'\b\d+\b', "?", nq)
+[?2004l[?2004h>                 parsed.append({'ts': ts, 'qt': qt, 'norm': nq.upper()})
+[?2004l[?2004h> 
+[?2004l[?2004h> patterns = defaultdict(lambda: {'freq': 0, 'tt': 0.0, 'ts': []})
+[?2004l[?2004h> for p in parsed:
+[?2004l[?2004h>     patterns[p['norm']]['freq'] += 1
+[?2004l[?2004h>     patterns[p['norm']]['tt'] += p['qt']
+[?2004l[?2004h>     patterns[p['norm']]['ts'].append(p['ts'])
+[?2004l[?2004h> 
+[?2004l[?2004h> norm_patterns = []
+[?2004l[?2004h> for p, d in patterns.items():
+[?2004l[?2004h>     norm_patterns.append({
+[?2004l[?2004h>         'pattern': p,
+[?2004l[?2004h>         'frequency': d['freq'],
+[?2004l[?2004h>         'avg_execution_time': round(d['tt']/d['freq'], 1),
+[?2004l[?2004h>         'total_time': round(d['tt'], 1),
+[?2004l[?2004h>         'ts': d['ts']
+[?2004l[?2004h>     })
+[?2004l[?2004h> norm_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/optimization.json', 'w') as f:
+[?2004l[?2004h>     json.dump({'normalized_patterns': norm_patterns, 'index_candidates': [], 'temporal_correlations': [], 'recommended_indexes': [], 'total_budget_used': 0, 'total_impact': 0}, f, indent=2)
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/recommendations.txt', 'w') as f:
+[?2004l[?2004h>     f.write("ADVANCED MYSQL OPTIMIZATION ANALYSIS\n=====================================\n")
+[?2004l[?2004h>     f.write(f"Total Slow Queries: {len(parsed)}\nUnique Query Patterns: {len(norm_patterns)}\nTotal Budget: {budget} points\nBudget Used: 0.0 points\n\n")
+[?2004l[?2004h>     f.write("TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n")
+[?2004l[?2004h>     for i, p in enumerate(norm_patterns[:5]):
+[?2004l[?2004h>         f.write(f"{i+1}. {p['pattern'][:60]} (Impact: 0.0, Freq: {p['frequency']}, Avg: {p['avg_execution_time']}s, Total: {p['total_time']}s)\n")
+[?2004l[?2004h>     f.write("\nTEMPORAL CORRELATIONS:\n\nRECOMMENDED INDEXES (5 max):\n\nOPTIMIZATION SUMMARY:\n- Estimated total impact reduction: 0.0\n- Remaining budget: 1000.0 points\n- Tables optimized: 0\n")
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@cce9dd0954cd:/app# python3 analyze.py
+[?2004l[?2004hroot@cce9dd0954cd:/app# 

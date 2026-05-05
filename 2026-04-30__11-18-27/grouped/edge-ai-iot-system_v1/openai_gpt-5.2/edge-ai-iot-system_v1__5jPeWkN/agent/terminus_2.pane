@@ -1,0 +1,224 @@
+[?2004hroot@d39c3d055ae3:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@d39c3d055ae3:/app# clear
+[?2004l[H[J[3J[?2004hroot@d39c3d055ae3:/app# ls -1 /app/device_*.json 2>/dev/null | sort
+[?2004l/app/device_001.json
+/app/device_002.json
+/app/device_003.json
+[?2004hroot@d39c3d055ae3:/app# cat > /app/edge_ai_deploy.py <<'PY'
+[?2004l[?2004h> import json, glob, os, math
+[?2004l[?2004h> from decimal import Decimal, ROUND_HALF_UP
+[?2004l[?2004h> 
+[?2004l[?2004h> def qdiv(num, den):
+[?2004l[?2004h>     return 0.0 if den == 0 else (num / den)
+[?2004l[?2004h> 
+[?2004l[?2004h> def clamp01(x):
+[?2004l[?2004h>     if x < 0.0:
+[?2004l[?2004h>         return 0.0
+[?2004l[?2004h>     if x > 1.0:
+[?2004l[?2004h>         return 1.0
+[?2004l[?2004h>     return x
+[?2004l[?2004h> 
+[?2004l[?2004h> def fmt(x, places):
+[?2004l[?2004h>     # Use Decimal quantize for deterministic rounding (half-up)
+[?2004l[?2004h>     d = Decimal(str(x))
+[?2004l[?2004h>     q = Decimal('1.' + ('0' * places))
+[?2004l[?2004h>     return format(d.quantize(q, rounding=ROUND_HALF_UP), f'f')
+[?2004l[?2004h> 
+[?2004l[?2004h> def quant_level(acc):
+[?2004l[?2004h>     if acc >= 0.95:
+[?2004l[?2004h>         return 'FP32', 32
+[?2004l[?2004h>     if acc >= 0.90:
+[?2004l[?2004h>         return 'FP16', 16
+[?2004l[?2004h>     if acc >= 0.80:
+[?2004l[?2004h>         return 'INT8', 8
+[?2004l[?2004h>     return 'INT4', 4
+[?2004l[?2004h> 
+[?2004l[?2004h> files = sorted(glob.glob('/app/device_*.json'))
+[?2004l[?2004h> devices_raw = []
+[?2004l[?2004h> for fp in files:
+[?2004l[?2004h>     with open(fp, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>         devices_raw.append(json.load(f))
+[?2004l[?2004h> 
+[?2004l[?2004h> per_device = []
+[?2004l[?2004h> compression_ratios = []
+[?2004l[?2004h> fl_scores = []
+[?2004l[?2004h> 
+[?2004l[?2004h> for d in devices_raw:
+[?2004l[?2004h>     caps = d.get('capabilities', {})
+[?2004l[?2004h>     net = d.get('network', {})
+[?2004l[?2004h>     req = d.get('model_requirements', {})
+[?2004l[?2004h> 
+[?2004l[?2004h>     storage = float(caps.get('storage_mb', 0))
+[?2004l[?2004h>     memory = float(caps.get('memory_mb', 0))
+[?2004l[?2004h>     compute = float(caps.get('compute_tflops', 0))
+[?2004l[?2004h> 
+[?2004l[?2004h>     bandwidth = float(net.get('bandwidth_mbps', 0))
+[?2004l[?2004h>     latency = float(net.get('latency_ms', 0))
+[?2004l[?2004h> 
+[?2004l[?2004h>     model_size = float(req.get('model_size_mb', 0))
+[?2004l[?2004h>     acc_thr = float(req.get('accuracy_threshold', 0))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 1) Compression
+[?2004l[?2004h>     compression_ratio = qdiv(model_size, storage) if storage != 0 else 0.0
+[?2004l[?2004h>     compression_needed = compression_ratio > 0.3
+[?2004l[?2004h>     target_compressed_size = storage * 0.25
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2) Quantization
+[?2004l[?2004h>     q_level, bits = quant_level(acc_thr)
+[?2004l[?2004h>     quant_eff = (32.0 / float(bits)) * acc_thr
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3) Federated learning score
+[?2004l[?2004h>     network_quality = (bandwidth / 100.0) * (1.0 - latency / 1000.0)
+[?2004l[?2004h>     compute_factor = min(qdiv(compute, 5.0), 1.0)
+[?2004l[?2004h>     memory_factor = min(qdiv(memory, 4096.0), 1.0)
+[?2004l[?2004h>     fl_score = (network_quality * 0.4) + (compute_factor * 0.3) + (memory_factor * 0.3)
+[?2004l[?2004h>     fl_score = clamp01(fl_score)
+[?2004l[?2004h>     fl_ready = fl_score >= 0.6
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4) Inference capability score
+[?2004l[?2004h>     storage_util = qdiv(model_size, storage) if storage != 0 else 0.0
+[?2004l[?2004h>     if model_size == 0:
+[?2004l[?2004h>         mem_adequacy = 0.0
+[?2004l[?2004h>         comp_adequacy = 0.0
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         mem_adequacy = qdiv(memory, (model_size * 2.0))
+[?2004l[?2004h>         comp_adequacy = qdiv(compute, (model_size * 0.001))
+[?2004l[?2004h>     mem_adequacy = min(mem_adequacy, 1.0)
+[?2004l[?2004h>     comp_adequacy = min(comp_adequacy, 1.0)
+[?2004l[?2004h> 
+[?2004l[?2004h>     inference_score = ((1.0 - storage_util) * 0.3) + (mem_adequacy * 0.4) + (comp_adequacy * 0.3)
+[?2004l[?2004h>     inference_score = clamp01(inference_score)
+[?2004l[?2004h> 
+[?2004l[?2004h>     per_device.append({
+[?2004l[?2004h>         'device_id': d.get('device_id', ''),
+[?2004l[?2004h>         'hardware_type': d.get('hardware_type', ''),
+[?2004l[?2004h>         # store raw numeric for sorting and stats
+[?2004l[?2004h>         '_compression_ratio': compression_ratio,
+[?2004l[?2004h>         '_quant_eff': quant_eff,
+[?2004l[?2004h>         '_fl_score': fl_score,
+[?2004l[?2004h>         '_inference_score': inference_score,
+[?2004l[?2004h>         'compression_needed': compression_needed,
+[?2004l[?2004h>         'target_compressed_size_mb': target_compressed_size,
+[?2004l[?2004h>         'quantization_level': q_level,
+[?2004l[?2004h>         'quantization_efficiency': quant_eff,
+[?2004l[?2004h>         'fl_score': fl_score,
+[?2004l[?2004h>         'fl_ready': fl_ready,
+[?2004l[?2004h>         'inference_score': inference_score,
+[?2004l[?2004h>     })
+[?2004l[?2004h> 
+[?2004l[?2004h>     compression_ratios.append(compression_ratio)
+[?2004l[?2004h>     fl_scores.append(fl_score)
+[?2004l[?2004h> 
+[?2004l[?2004h> n = len(per_device)
+[?2004l[?2004h> mean_cr = sum(compression_ratios) / n if n else 0.0
+[?2004l[?2004h> var = sum((x - mean_cr) ** 2 for x in fl_scores) / n if n else 0.0  # note: spec says std dev of FL scores; use population std dev
+[?2004l[?2004h> std_fl = math.sqrt(var)
+[?2004l[?2004h> fl_ready_count = sum(1 for x in fl_scores if x >= 0.6)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Sort devices by inference_score desc; stable tie-breaker by device_id for determinism
+[?2004l[?2004h> per_device_sorted = sorted(per_device, key=lambda x: (-x['_inference_score'], x['device_id']))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Build output JSON with exact precision formatting
+[?2004l[?2004h> out_devices = []
+[?2004l[?2004h> for idx, d in enumerate(per_device_sorted, start=1):
+[?2004l[?2004h>     out_devices.append({
+[?2004l[?2004h>         'rank': idx,
+[?2004l[?2004h>         'device_id': d['device_id'],
+[?2004l[?2004h>         'hardware_type': d['hardware_type'],
+[?2004l[?2004h>         'compression_needed': bool(d['compression_needed']),
+[?2004l[?2004h>         'target_compressed_size_mb': float(fmt(d['target_compressed_size_mb'], 2)),
+[?2004l[?2004h>         'quantization_level': d['quantization_level'],
+[?2004l[?2004h>         'quantization_efficiency': float(fmt(d['_quant_eff'], 4)),
+[?2004l[?2004h>         'fl_score': float(fmt(d['_fl_score'], 4)),
+[?2004l[?2004h>         'fl_ready': bool(d['fl_ready']),
+[?2004l[?2004h>         'inference_score': float(fmt(d['_inference_score'], 4)),
+[?2004l[?2004h>     })
+[?2004l[?2004h> 
+[?2004l[?2004h> analysis = {
+[?2004l[?2004h>     'summary': {
+[?2004l[?2004h>         'total_devices': n,
+[?2004l[?2004h>         'mean_compression_ratio': float(fmt(mean_cr, 3)),
+[?2004l[?2004h>         'std_dev_fl_score': float(fmt(std_fl, 4)),
+[?2004l[?2004h>         'fl_ready_devices': fl_ready_count,
+[?2004l[?2004h>     },
+[?2004l[?2004h>     'devices': out_devices,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/deployment_analysis.json', 'w', encoding='utf-8') as f:
+[?2004l[?2004h>     json.dump(analysis, f, indent=2)
+[?2004l[?2004h>     f.write('\n')
+[?2004l[?2004h> 
+[?2004l[?2004h> # Build text report
+[?2004l[?2004h> lines = []
+[?2004l[?2004h> lines.append('EDGE AI DEPLOYMENT ANALYSIS')
+[?2004l[?2004h> lines.append('============================')
+[?2004l[?2004h> lines.append('')
+[?2004l[?2004h> lines.append('Summary Statistics:')
+[?2004l[?2004h> lines.append(f"- Total Devices: {n}")
+[?2004l[?2004h> lines.append(f"- Mean Compression Ratio: {fmt(mean_cr, 3)}")
+[?2004l[?2004h> lines.append(f"- Std Dev FL Score: {fmt(std_fl, 4)}")
+[?2004l[?2004h> lines.append(f"- FL-Ready Devices: {fl_ready_count}")
+[?2004l[?2004h> lines.append('')
+[?2004l[?2004h> lines.append('Device Rankings (by Inference Score):')
+[?2004l[?2004h> 
+[?2004l[?2004h> for d in out_devices:
+[?2004l[?2004h>     comp_status = 'needed' if d['compression_needed'] else 'not needed'
+[?2004l[?2004h>     fl_status = 'ready' if d['fl_ready'] else 'not ready'
+[?2004l[?2004h>     lines.append(f"{d['rank']}. {d['device_id']} ({d['hardware_type']})")
+[?2004l[?2004h>     lines.append(f"   Compression: {comp_status}, Target Size: {fmt(d['target_compressed_size_mb'], 2)} MB")
+[?2004l[?2004h>     lines.append(f"   Quantization: {d['quantization_level']}, Efficiency: {fmt(d['quantization_efficiency'], 4)}")
+[?2004l[?2004h>     lines.append(f"   FL Score: {fmt(d['fl_score'], 4)}, Status: {fl_status}")
+[?2004l[?2004h>     lines.append(f"   Inference Score: {fmt(d['inference_score'], 4)}")
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/deployment_report.txt', 'w', encoding='utf-8') as f:
+[?2004l[?2004h>     f.write('\n'.join(lines))
+[?2004l[?2004h>     f.write('\n')
+[?2004l[?2004h> 
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@d39c3d055ae3:/app# python3 /app/edge_ai_deploy.py
+[?2004l[?2004hroot@d39c3d055ae3:/app# ls -la /app/deployment_analysis.json /app/deployment_report.txt
+[?2004l-rw-r--r--. 1 root root 1161 Apr 30 12:59 /app/deployment_analysis.json
+-rw-r--r--. 1 root root  769 Apr 30 12:59 /app/deployment_report.txt
+[?2004hroot@d39c3d055ae3:/app# python3 -c "import json; d=json.load(open('/app/deployment_analysis.json')); print(d['summary']); print('devices:', len(d['devices']))"
+[?2004l{'total_devices': 3, 'mean_compression_ratio': 2.494, 'std_dev_fl_score': 2.0026, 'fl_ready_devices': 1}
+devices: 3
+[?2004hroot@d39c3d055ae3:/app# head -n 40 /app/deployment_report.txt
+[?2004lEDGE AI DEPLOYMENT ANALYSIS
+============================
+
+Summary Statistics:
+- Total Devices: 3
+- Mean Compression Ratio: 2.494
+- Std Dev FL Score: 2.0026
+- FL-Ready Devices: 1
+
+Device Rankings (by Inference Score):
+1. device_001 (edge_gpu)
+   Compression: not needed, Target Size: 1753.50 MB
+   Quantization: INT4, Efficiency: 5.6000
+   FL Score: 0.7674, Status: ready
+   Inference Score: 0.9512
+2. device_002 (edge_cpu)
+   Compression: not needed, Target Size: 677.50 MB
+   Quantization: INT4, Efficiency: 5.6000
+   FL Score: 0.3709, Status: not ready
+   Inference Score: 0.8743
+3. device_003 (micro_controller)
+   Compression: needed, Target Size: 55.75 MB
+   Quantization: INT4, Efficiency: 5.6000
+   FL Score: 0.3612, Status: not ready
+   Inference Score: 0.0000
+[?2004hroot@d39c3d055ae3:/app# grep -n "std_fl" -n /app/edge_ai_deploy.py && grep -n "var =" -n /app/edge_ai_deploy.py
+[?2004l108:std_fl = math.sqrt(var)
+134:        'std_dev_fl_score': float(fmt(std_fl, 4)),
+152:lines.append(f"- Std Dev FL Score: {fmt(std_fl, 4)}")
+107:var = sum((x - mean_cr) ** 2 for x in fl_scores) / n if n else 0.0  # note: spec says std dev of FL scores; use population std dev
+[?2004hroot@d39c3d055ae3:/app# perl -0777 -i -pe 's/mean_cr = sum\(compression_ratios\) \/ n if n else 0\.0\nvar = sum\(\(x - mean_cr\) \*\* 2 for x in fl_scores\) \/ n if n else 0\.0  # note: spec says std dev of FL scores; use population std dev\nstd_fl = math\.sqrt\(var\)/mean_cr = sum(compression_ratios) \/ n if n else 0.0\nmean_fl = sum(fl_scores) \/ n if n else 0.0\nvar = sum((x - mean_fl) ** 2 for x in fl_scores) \/ n if n else 0.0  # population std dev\nstd_fl = math.sqrt(var)/s' /app/edge_ai_deploy.py
+[?2004l[?2004hroot@d39c3d055ae3:/app# python3 /app/edge_ai_deploy.py
+[?2004l[?2004hroot@d39c3d055ae3:/app# python3 -c "import json; d=json.load(open('/app/deployment_analysis.json')); print(d['summary'])"
+[?2004l{'total_devices': 3, 'mean_compression_ratio': 2.494, 'std_dev_fl_score': 0.1893, 'fl_ready_devices': 1}
+[?2004hroot@d39c3d055ae3:/app# grep -n "Std Dev FL Score" -n /app/deployment_report.txt
+[?2004l7:- Std Dev FL Score: 0.1893
+[?2004hroot@d39c3d055ae3:/app# 

@@ -1,0 +1,112 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@648046cafef4:/app# cat << 'EOF' > /app/app/indexer.py
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import fcntl
+> import re
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     ignore_patterns = []
+>     ignore_file = '/data/ignore.txt'
+>     if os.path.exists(ignore_file):
+>         with open(ignore_file, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip('\n')
+>                 if not line: continue
+>                 if line.lstrip().startswith('#'): continue
+>                 pattern = unicodedata.normalize('NFC', line)
+>                 ignore_patterns.append(pattern)
+>
+>     regexes = []
+>     for pat in ignore_patterns:
+>         def escape_and_replace(p):
+>             parts = p.split('*')
+>             return '[^/]*'.join(re.escape(part) for part in parts)
+>
+>         if pat.startswith('/'):
+>             regex = '^' + escape_and_replace(pat[1:]) + '$'
+>         elif '/' not in pat:
+>             regex = '(^|/)' + escape_and_replace(pat) + '($|/)'
+>         else:
+>             regex = '(^|/)' + escape_and_replace(pat) + '$'
+>         regexes.append(re.compile(regex))
+>
+>     def is_ignored(rel_path):
+>         for r in regexes:
+>             if r.search(rel_path):
+>                 return True
+>         return False
+>
+>     files_to_index = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir):
+>         valid_dirs = []
+>         for d in dirnames:
+>             full_d = os.path.join(dirpath, d)
+>             if os.path.islink(full_d):
+>                 continue
+>             rel_d = os.path.relpath(full_d, root_dir).replace('\\', '/')
+>             nfc_rel_d = unicodedata.normalize('NFC', rel_d)
+>             if not is_ignored(nfc_rel_d):
+>                 valid_dirs.append(d)
+>         dirnames[:] = valid_dirs
+>
+>         for f in filenames:
+>             full_f = os.path.join(dirpath, f)
+>             if os.path.islink(full_f):
+>                 continue
+>             rel_f = os.path.relpath(full_f, root_dir).replace('\\', '/')
+>             nfc_rel_f = unicodedata.normalize('NFC', rel_f)
+>
+>             if is_ignored(nfc_rel_f):
+>                 continue
+>
+>             if nfc_rel_f in files_to_index:
+>                 existing_orig = files_to_index[nfc_rel_f][0]
+>                 if rel_f > existing_orig:
+>                     files_to_index[nfc_rel_f] = (rel_f, full_f)
+>             else:
+>                 files_to_index[nfc_rel_f] = (rel_f, full_f)
+>
+>     results = []
+>     for nfc_path, (orig_path, full_f) in files_to_index.items():
+>         try:
+>             size = os.path.getsize(full_f)
+>             h = hashlib.sha256()
+>             with open(full_f, 'rb') as f:
+>                 while chunk := f.read(65536):
+>                     h.update(chunk)
+>             sha256 = h.hexdigest()
+>             results.append((nfc_path, sha256, size))
+>         except OSError:
+>             pass
+>
+>     lock_path = db_path + '.lock'
+>     with open(lock_path, 'w') as lock_f:
+>         fcntl.flock(lock_f, fcntl.LOCK_EX)
+>         try:
+>             conn = sqlite3.connect(db_path, timeout=60.0)
+>             with conn:
+>                 conn.execute('PRAGMA journal_mode=WAL')
+>                 conn.execute('''CREATE TABLE IF NOT EXISTS files (
+>                     path TEXT PRIMARY KEY,
+>                     sha256 TEXT NOT NULL,
+>                     size INTEGER NOT NULL
+>                 )''')
+>                 conn.execute('DELETE FROM files')
+>                 conn.executemany('''INSERT INTO files (path, sha256, size)
+>                                     VALUES (?, ?, ?)''', results)
+>         finally:
+>             conn.close()
+>             fcntl.flock(lock_f, fcntl.LOCK_UN)
+> EOF
+root@648046cafef4:/app# python3 -m py_compile /app/app/indexer.py
+root@648046cafef4:/app#

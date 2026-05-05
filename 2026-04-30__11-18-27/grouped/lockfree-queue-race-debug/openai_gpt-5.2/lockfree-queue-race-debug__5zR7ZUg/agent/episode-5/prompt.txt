@@ -1,0 +1,130 @@
+New Terminal Output:
+
+root@fb7208367a1b:/app# nl -ba /app/stress_test.cpp | sed -n '80,160p'
+    80      std::vector<std::thread> producer_threads;
+    81      std::vector<std::thread> consumer_threads;
+    82      std::vector<std::vector<uint64_t>> consumer_results(NUM_CONSUMERS);
+    83
+    84      // Start consumer threads
+    85      for (int i = 0; i < NUM_CONSUMERS; ++i) {
+    86          consumer_threads.emplace_back(consumer, std::ref(queue), std::ref(consumer_results[i]));
+    87      }
+    88
+    89      // Start producer threads
+    90      for (int i = 0; i < NUM_PRODUCERS; ++i) {
+    91          producer_threads.emplace_back(producer, std::ref(queue), i);
+    92      }
+    93
+    94      auto start_time = std::chrono::high_resolution_clock::now();
+    95
+    96      // Watchdog thread: abort if we exceed wall-clock timeout
+    97      std::thread watchdog([&start_time]() {
+    98          while (true) {
+    99              std::this_thread::sleep_for(std::chrono::seconds(1));
+   100              auto now = std::chrono::high_resolution_clock::now();
+   101              auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+   102              if (elapsed >= WALL_CLOCK_TIMEOUT_SEC) {
+   103                  std::cerr << "TIMEOUT: stress test exceeded " << WALL_CLOCK_TIMEOUT_SEC
+   104                            << "s wall clock limit" << std::endl;
+   105                  timed_out.store(true, std::memory_order_relaxed);
+   106                  std::this_thread::sleep_for(std::chrono::seconds(2));
+   107                  std::cerr << "STRESS TEST FAILED" << std::endl;
+   108                  std::cerr << "  - Wall clock timeout after " << elapsed << "s" << std::endl;
+   109                  _exit(1);
+   110              }
+   111          }
+   112      });
+   113      watchdog.detach();
+   114
+   115      // Release all threads
+   116      start_flag.store(true, std::memory_order_release);
+   117
+   118      // Wait for producers
+   119      for (auto& t : producer_threads) {
+   120          t.join();
+   121      }
+   122
+   123      std::cout << "All producers finished" << std::endl;
+   124
+   125      // Wait for consumers
+   126      for (auto& t : consumer_threads) {
+   127          t.join();
+   128      }
+   129
+   130      done.store(true, std::memory_order_release);
+   131
+   132      auto end_time = std::chrono::high_resolution_clock::now();
+   133      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+   134
+   135      std::cout << "All consumers finished" << std::endl;
+   136      std::cout << "Duration: " << duration.count() << " ms" << std::endl;
+   137      std::cout << std::endl;
+   138
+   139      // Collect all dequeued values
+   140      for (const auto& results : consumer_results) {
+   141          all_dequeued.insert(all_dequeued.end(), results.begin(), results.end());
+   142      }
+   143
+   144      // Verify results
+   145      uint64_t expected_count = static_cast<uint64_t>(NUM_PRODUCERS) * OPS_PER_THREAD;
+   146
+   147      std::cout << "=== Results ===" << std::endl;
+   148      std::cout << "Expected: " << expected_count << std::endl;
+   149      std::cout << "Enqueued: " << total_enqueued.load() << std::endl;
+   150      std::cout << "Dequeued: " << all_dequeued.size() << std::endl;
+   151
+   152      // Check for duplicates and missing values
+   153      std::unordered_set<uint64_t> seen;
+   154      uint64_t duplicates = 0;
+   155      uint64_t invalid_values = 0;
+   156
+   157      for (uint64_t val : all_dequeued) {
+   158          if (val == 0 || val == SENTINEL) {
+   159              invalid_values++;
+   160              continue;
+root@fb7208367a1b:/app# perl -i -pe 's/^\s*done\.store\(true, std::memory_order_release\);\s*$// if $.==130' /app/stress_test.cpp
+root@fb7208367a1b:/app# perl -0777 -i -pe 's/auto start_time = std::chrono::high_resolution_clock::now\(\);\n\n    \/\/ Watchdog thread: abort if we exceed wall
+-clock timeout/auto start_time = std::chrono::high_resolution_clock::now();\n\n    std::atomic<bool> done{false};\n\n    \/\/ Watchdog thread: abort if we excee
+d wall-clock timeout/s' /app/stress_test.cpp
+root@fb7208367a1b:/app# perl -0777 -i -pe 's/std::thread watchdog\(\[&start_time\]\) \{\n        while \(true\) \{\n            std::this_thread::sleep_for\(std
+::chrono::seconds\(1\)\);\n            auto now = std::chrono::high_resolution_clock::now\(\);\n            auto elapsed = std::chrono::duration_cast<std::chron
+o::seconds>\(now - start_time\)\.count\(\);\n            if \(elapsed >= WALL_CLOCK_TIMEOUT_SEC\) \{\n                std::cerr << "TIMEOUT: stress test exceede
+d " << WALL_CLOCK_TIMEOUT_SEC\n                          << "s wall clock limit" << std::endl;\n                timed_out\.store\(true, std::memory_order_relaxe
+d\);\n                std::this_thread::sleep_for\(std::chrono::seconds\(2\)\);\n                std::cerr << "STRESS TEST FAILED" << std::endl;\n
+  std::cerr << "  - Wall clock timeout after " << elapsed << "s" << std::endl;\n                _exit\(1\);\n            \}\n        \}\n    \}\);/std::thread w
+atchdog([&start_time, &done]() {\n        while (!done.load(std::memory_order_acquire)) {\n            std::this_thread::sleep_for(std::chrono::seconds(1));\n
+          if (done.load(std::memory_order_acquire)) break;\n            auto now = std::chrono::high_resolution_clock::now();\n            auto elapsed = std::c
+hrono::duration_cast<std::chrono::seconds>(now - start_time).count();\n            if (elapsed >= WALL_CLOCK_TIMEOUT_SEC) {\n                std::cerr << "TIMEO
+UT: stress test exceeded " << WALL_CLOCK_TIMEOUT_SEC\n                          << "s wall clock limit" << std::endl;\n                timed_out.store(true, std
+::memory_order_relaxed);\n                std::this_thread::sleep_for(std::chrono::seconds(2));\n                std::cerr << "STRESS TEST FAILED" << std::endl;
+\n                std::cerr << "  - Wall clock timeout after " << elapsed << "s" << std::endl;\n                _exit(1);\n            }\n        }\n    });/s'
+/app/stress_test.cpp
+root@fb7208367a1b:/app# perl -0777 -i -pe 's/for \(auto& t : consumer_threads\) \{\n        t\.join\(\);\n    \}\n\n    auto end_time =/for (auto& t : consumer_
+threads) {\n        t.join();\n    }\n\n    done.store(true, std::memory_order_release);\n\n    auto end_time =/s' /app/stress_test.cpp
+root@fb7208367a1b:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@fb7208367a1b:/app# /app/stress_test_tsan 2>&1 | tee /tmp/tsan_out.txt
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 12765 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+TIMEOUT: stress test exceeded 120s wall clock limit
+root@fb7208367a1b:/app# grep -F "ThreadSanitizer: reported" /tmp/tsan_out.txt || true
+root@fb7208367a1b:/app#

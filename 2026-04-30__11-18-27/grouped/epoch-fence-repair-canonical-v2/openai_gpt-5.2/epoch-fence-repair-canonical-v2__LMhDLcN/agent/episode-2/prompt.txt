@@ -1,0 +1,297 @@
+Current terminal state:
+New Terminal Output:
+
+root@d9c045fe26f4:/app# cat > solution.py <<'PY'
+> import re
+> from dataclasses import dataclass, field
+> from typing import Dict, List, Optional, Set, Tuple
+>
+ >
+ > _TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> _NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+>
+> @dataclass
+> class TxInfo:
+>     tx: str
+>     shard: str
+>
+>     # Presence (in valid prefix)
+>     has_begin: bool = False
+>     has_prepare: bool = False
+>     has_end: bool = False
+>
+>     has_commit: bool = False
+>     has_abort: bool = False
+>
+>     # Whether these ops were observed before prerequisites (for insertion prerequisites)
+>     prepare_without_begin: bool = False
+>     vote_without_prepare: bool = False
+>
+>     # Votes
+>     vote_seen: bool = False
+>     vote_yes: bool = False
+>     vote_no: bool = False
+>
+>     # FENCE monotonicity
+>     last_fence: Optional[int] = None
+>
+e>     # Irreparable reason (tx-level), excluding shard BAD_EPOCH
+>     bad_reason: Optional[str] = None
+>
+>     # State machine (EPOCH ignored)
+>     state: str = "NEW"  # NEW, BEGUN, PREPARED, DECIDED_COMMIT, DECIDED_ABORT, ENDED
+>
+>
+> def _malformed() -> bool:
+>     return True
+>
+>
+> def _parse_line(line: str) -> Optional[Tuple[int, str, str, Optional[str]]]:
+>     """Return (idx, tx, op, arg) or None if malformed."""
+>     parts = line.split(" ")
+>     if len(parts) < 3 or len(parts) > 4:
+>         return None
+>
+>     idx_s, tx, op = parts[0], parts[1], parts[2]
+>     arg = parts[3] if len(parts) == 4 else None
+>
+>     if not idx_s.isdigit() or int(idx_s) <= 0:
+>         return None
+>     idx = int(idx_s)
+>
+t>     if _TX_RE.fullmatch(tx) is None:
+>         return None
+>
+>     if op in {"BEGIN", "PREPARE", "COMMIT", "ABORT", "END"}:
+>         if arg is not None:
+>             return None
+>     elif op == "VOTE":
+>         if arg not in {"YES", "NO"}:
+>             return None
+>     elif op in {"FENCE", "EPOCH"}:
+>         if arg is None or _NONCE_RE.fullmatch(arg) is None:
+>             return None
+>     else:
+>         return None
+>
+>     return idx, tx, op, arg
+>
+>
+> def solve(lines: List[str]) -> str:
+>     # Track shard EPOCH monotonicity
+>     shard_last_epoch: Dict[str, int] = {}
+>     shard_bad: Set[str] = set()  # poisoned shards due to epoch violation
+>
+>     txs: Dict[str, TxInfo] = {}
+>
+f>     def get_tx(tx: str) -> TxInfo:
+>         if tx not in txs:
+>             txs[tx] = TxInfo(tx=tx, shard=tx[0])
+>         return txs[tx]
+>
+_>     # Process valid prefix
+>     for raw in lines:
+>         if not raw or raw.startswith("#"):
+>             continue
+>         parsed = _parse_line(raw)
+>         if parsed is None:
+>             break
+>         _idx, tx, op, arg = parsed
+>
+>         shard = tx[0]
+>
+>         if op == "EPOCH":
+>             # shard-level only
+>             val = int(arg, 16)  # type: ignore[arg-type]
+>             if shard in shard_bad:
+:
+         >                 continue
+>             if shard in shard_last_epoch and val <= shard_last_epoch[shard]:
+>                 shard_bad.add(shard)
+>             else:
+>                 shard_last_epoch[shard] = val
+>             continue
+>
+>         t = get_tx(tx)
+>
+>         # If already irreparable, we still need to keep scanning to find other tx/shard issues,
+>         # but tx state doesn't matter further.
+>
+>         if op == "FENCE":
+>             val = int(arg, 16)  # type: ignore[arg-type]
+>             if t.last_fence is not None and val <= t.last_fence:
+>                 if t.bad_reason is None:
+>                     t.bad_reason = "BAD_FENCE"
+>             else:
+>                 t.last_fence = val
+>             continue
+>
+>         # For other ops, update presence flags
+>         if op == "BEGIN":
+>             t.has_begin = True
+>         elif op == "PREPARE":
+>             t.has_prepare = True
+>             if not t.has_begin:
+>                 # prepare observed before any begin in prefix
+>                 t.prepare_without_begin = True
+>         elif op == "VOTE":
+>             t.vote_seen = True
+>             if not t.has_prepare:
+>                 t.vote_without_prepare = True
+>             if arg == "YES":
+>                 t.vote_yes = True
+>             else:
+>                 t.vote_no = True
+>             if t.vote_yes and t.vote_no and t.bad_reason is None:
+>                 t.bad_reason = "BAD_VOTE"
+>         elif op == "COMMIT":
+>             t.has_commit = True
+>         elif op == "ABORT":
+>             t.has_abort = True
+>         elif op == "END":
+>             t.has_end = True
+>
+>         # State machine checks for illegal transitions (BAD_ORDER)
+>         if t.bad_reason is not None:
+>             continue
+>
+>         st = t.state
+>         if op == "BEGIN":
+>             if st != "NEW":
+>                 t.bad_reason = "BAD_ORDER"
+>             else:
+>                 t.state = "BEGUN"
+>         elif op == "PREPARE":
+>             if st != "BEGUN":
+>                 t.bad_reason = "BAD_ORDER"
+>             else:
+>                 t.state = "PREPARED"
+>         elif op == "VOTE":
+>             if st != "PREPARED":
+>                 t.bad_reason = "BAD_ORDER"
+>         elif op == "COMMIT":
+>             if st != "PREPARED":
+>                 t.bad_reason = "BAD_ORDER"
+>             else:
+>                 # commit allowed only if all observed votes are YES (or none)
+>                 if t.vote_no:
+>                     t.bad_reason = "BAD_ORDER"
+>                 else:
+>                     t.state = "DECIDED_COMMIT"
+>         elif op == "ABORT":
+>             if st in {"BEGUN", "PREPARED", "DECIDED_ABORT"}:
+>                 t.state = "DECIDED_ABORT"
+>             else:
+>                 t.bad_reason = "BAD_ORDER"
+>         elif op == "END":
+>             if st in {"DECIDED_COMMIT", "DECIDED_ABORT"}:
+>                 t.state = "ENDED"
+>             else:
+>                 t.bad_reason = "BAD_ORDER"
+>
+>     # Decide outputs
+>     bad_lines: List[str] = []
+>     ins_lines: List[Tuple[str, str, Optional[str]]] = []
+>
+>     # Mark shard-bad txs
+>     for tx, t in txs.items():
+>         if t.shard in shard_bad:
+>             bad_lines.append(f"BAD {tx} BAD_EPOCH")
+>
+>     for tx, t in txs.items():
+>         if t.shard in shard_bad:
+>             continue
+>
+>         if t.bad_reason is not None:
+>             bad_lines.append(f"BAD {tx} {t.bad_reason}")
+>             continue
+>
+>         # Additional irreparable checks from spec
+>         has_decision = t.has_commit or t.has_abort
+>         if t.has_end and not has_decision:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>         if t.has_commit and t.vote_no:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>         if has_decision and not t.has_prepare:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>
+>         # Compute minimal insertions
+>         need_begin = False
+>         need_prepare = False
+>
+>         if not t.has_begin:
+>             need_begin = True
+>         if t.prepare_without_begin:
+>             need_begin = True
+>         if t.vote_without_prepare:
+>             need_begin = True
+>             need_prepare = True
+>         if t.has_prepare and not t.has_begin:
+>             need_begin = True
+>
+>         if need_begin:
+>             ins_lines.append((tx, "BEGIN", None))
+>         if need_prepare and not t.has_prepare:
+>             ins_lines.append((tx, "PREPARE", None))
+>
+>         # Decision handling
+>         if not has_decision:
+>             if t.vote_no:
+>                 ins_lines.append((tx, "ABORT", None))
+>                 decided_abort = True
+>             else:
+>                 ins_lines.append((tx, "COMMIT", None))
+>                 decided_abort = False
+>         else:
+>             decided_abort = t.has_abort and not t.has_commit
+>
+>         # END handling
+>         if not t.has_end:
+>             ins_lines.append((tx, "END", None))
+>
+>     bad_lines.sort(key=lambda s: s.split(" ")[1])
+>
+>     ins_lines.sort(key=lambda x: (x[0], OP_ORDER[x[1]], "" if x[2] is None else x[2]))
+>     ins_out = [
+>         f"INS {tx} {op}" + ("" if arg is None else f" {arg}")
+>         for (tx, op, arg) in ins_lines
+>     ]
+>
+>     out = bad_lines + ins_out
+>     return "OK" if not out else "\n".join(out)
+>
+>
+> if __name__ == "__main__":
+>     import sys
+>     print(solve(sys.stdin.read().splitlines()))
+> PY
+root@d9c045fe26f4:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@d9c045fe26f4:/app# python -c "from solution import solve; print(solve(['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO']))"
+BAD c1 BAD_VOTE
+root@d9c045fe26f4:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','
+6 b1 EPOCH 00000001']))"
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 COMMIT
+INS b1 END
+root@d9c045fe26f4:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

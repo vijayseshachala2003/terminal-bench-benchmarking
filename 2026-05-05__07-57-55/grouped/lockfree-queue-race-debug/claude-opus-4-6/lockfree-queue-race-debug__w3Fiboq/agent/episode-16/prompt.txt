@@ -1,0 +1,81 @@
+New Terminal Output:
+
+root@3e32ac3b8863:/app# cat > /app/analysis.json << 'JSON_EOF'
+> {
+ocate_node",
+      "location": "allocate_node() - free_list_.compare_exchange_weak",
+      "description": "The free list pop operation loaded a node pointer and its next pointer, then used CAS to swing the free list head. Between loading node->n
+ext and the CAS, other threads could pop the node, reuse it, free it back to the list with a different next pointer. The CAS would succeed with a stale next val
+ue, corrupting the free list and leading to use-after-free or lost nodes.",
+      "fix_applied": "Eliminated the free list entirely. Nodes are now allocated with new and never reused during operation. This removes the ABA problem on the
+ free list completely. Nodes are only cleaned up in the destructor when no concurrent access is possible."
+    },
+    {
+      "bug_id": 5,
+      "name": "Use-after-free due to immediate node recycling",
+      "location": "dequeue() calling free_node() and allocate_node() reusing freed nodes",
+      "description": "When a node was dequeued, it was immediately pushed onto the free l>   "bugs_identified": [
+ist via free_node(). However, other threads in dequeue() may ha>     {
+>       "bug_id": 1,
+>       "name": "Relaxed memory ordering on all atomic operations",
+>       "location": "enqueue() and dequeue() - all atomic loads, stores, and CAS operations",
+>       "description": "All atomic operations used memory_order_relaxed, which provides only atomicity but no synchronization or ordering guarantees. In enqueue
+(), the store of the new node's value (via the Node constructor) is not guaranteed to be visible to a consumer that dequeues it, because the CAS linking the nod
+e uses relaxed ordering. In dequeue(), reading next->value with relaxed ordering on the head->next load means the consumer may see uninitialized or stale data.
+This violates the happens-before relationship required between producer and consumer: the release on the enqueue CAS must synchronize-with the acquire on the de
+queue load of next.",
+>       "fix_applied": "Changed all head_/tail_ loads to memory_order_acquire, the CAS that links a new node (tail->next CAS) to memory_order_release on success
+, the CAS that advances head_ to memory_order_acq_rel on success and memory_order_acquire on failure, and tail advancement CAS operations to memory_order_releas
+e. This establishes proper happens-before relationships: the release store in enqueue synchronizes with the acquire load in dequeue, ensuring the node's value i
+s visible."
+>     },
+>     {
+>       "bug_id": 2,
+>       "name": "ABA problem on head_ pointer in dequeue",
+>       "location": "dequeue() - head_.compare_exchange_weak",
+>       "description": "The head_ pointer was a plain atomic<Node*>. Between a thread loading head_ and performing its CAS, other threads could dequeue the node
+, free it, allocate a new node at the same address, and enqueue it. The original thread's CAS would succeed because the pointer value matches, but the queue sta
+te has changed entirely. This leads to lost messages, double-frees, and data corruption.",
+>       "fix_applied": "Replaced atomic<Node*> head_ with atomic<uint64_t> using a packed tagged pointer (16-bit tag in upper bits, 48-bit pointer in lower bits
+ on x86-64). Each CAS increments the tag, so even if a node is recycled to the same address, the tag mismatch causes the CAS to correctly fail."
+>     },
+>     {
+>       "bug_id": 3,
+>       "name": "ABA problem on tail_ pointer in enqueue",
+>       "location": "enqueue() - tail_.compare_exchange_weak and tail_.compare_exchange_strong",
+>       "description": "Same ABA vulnerability as head_. The tail_ pointer was a plain atomic<Node*>. A thread could load tail_, then other threads could advanc
+e tail_ multiple times with nodes being freed and reallocated at the same address, causing the original thread's CAS to succeed incorrectly and potentially corr
+upt the queue structure.",
+>       "fix_applied": "Replaced atomic<Node*> tail_ with atomic<uint64_t> using the same packed tagged pointer scheme. Each tail advancement increments the tag
+ counter, preventing ABA on the tail pointer."
+>     },
+>     {
+>       "bug_id": 4,
+>       "name": "ABA problem on free_list_ in allocate_node",
+>       "location": "allocate_node() - free_list_.compare_exchange_weak",
+>       "description": "The free list pop operation loaded a node pointer and its next pointer, then used CAS to swing the free list head. Between loading node-
+>next and the CAS, other threads could pop the node, reuse it, free it back to the list with a different next pointer. The CAS would succeed with a stale next v
+alue, corrupting the free list and leading to use-after-free or lost nodes.",
+>       "fix_applied": "Eliminated the free list entirely. Nodes are now allocated with new and never reused during operation. This removes the ABA problem on t
+he free list completely. Nodes are only cleaned up in the destructor when no concurrent access is possible."
+>     },
+>     {
+>       "bug_id": 5,
+>       "name": "Use-after-free due to immediate node recycling",
+>       "location": "dequeue() calling free_node() and allocate_node() reusing freed nodes",
+>       "description": "When a node was dequeued, it was immediately pushed onto the free list via free_node(). However, other threads in dequeue() may have alr
+eady loaded a pointer to this node (from head_) and could be about to dereference it to read head->next. The freed node could be popped from the free list by al
+locate_node(), have its value and next pointer overwritten, and then the thread holding the stale pointer would read corrupted data. This caused data corruption
+, crashes, and lost messages.",
+>       "fix_applied": "Implemented deferred reclamation by intentionally leaking retired nodes during operation. After a successful dequeue CAS, the old sentin
+el node is passed to retire_node() which does not free it. This ensures the node's memory remains valid and readable for any thread that may still hold a refere
+nce to it. Nodes still in the queue are cleaned up in the destructor. In a production system, hazard pointers or epoch-based reclamation would be used instead o
+f leaking."
+>     }
+>   ],
+>   "tsan_clean": true,
+>   "stress_test_passed": true,
+>   "total_bugs_fixed": 5
+> }
+> JSON_EOF
+root@3e32ac3b8863:/app#

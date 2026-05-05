@@ -1,0 +1,118 @@
+New Terminal Output:
+
+root@1b1a90e96d3e:/app# nl -ba /app/analyze_deps.py | sed -n '450,520p'
+   450                      found: Optional[ImportItem] = None
+   451                      while s is not None:
+   452                          if base in s.imported:
+   453                              found = s.imported[base]
+   454                              break
+   455                          s = s.parent
+   456                      if found and found.kind == "import":
+   457                          resolved = resolve_import_to_module(f, project_dir, module_index, found.module, 0)
+   458                          if resolved and node.attr not in module_exports.get(resolved, set()):
+   459                              errors.append(Error("invalid_attribute_access",
+   460                                  _to_app_path(project_dir, f),
+   461                                  (
+   462                                      f"Invalid attribute access: module {resolved} "
+   463                                      f"has no attribute {node.attr}"
+   464                                  ),
+   465                              ))
+   466
+   467              def visit_Call(self, node: ast.Call) -> Any:
+   468                  if isinstance(node.func, ast.Name):
+   469                      fn = node.func.id
+   470                      sig = function_sigs.get(fn)
+   471                      if sig:
+   472                          pos = len(node.args)
+   473                          if pos < sig.min_pos or (sig.max_pos is not None and pos > sig.max_pos):
+   474                              exp = f"{sig.min_pos}..{sig.max_pos}" if sig.max_pos is not None else f"{sig.min_pos}+"
+   475                              errors.append(Error("type_error",
+   476                              _to_app_path(project_dir, f),
+   477                              (
+   478                              f"Type error: call to {fn} has {pos} "
+   479                              f"positional args; expected {exp}"
+   480                              ),
+   481                              ))
+   482          V().visit(t)
+   483
+   484          for it, used in import_usage.items():
+   485              local = it.asname or (it.name.split(".")[0] if it.kind == "import" else it.name)
+   486              used = used or (local in used_import_names)
+   487              if used:
+   488                  continue
+   489              if it.kind == "from" and it.name == "*":
+   490                  modname = ("." * it.level) + (it.module or "")
+   491                  errors.append(Error("unused_import", _to_app_path(project_dir, f), f"Unused import: wildcard from {modname}"))
+   492              else:
+   493                  local = it.asname or (it.name.split(".")[0] if it.kind == "import" else it.name)
+   494                  errors.append(Error("unused_import", _to_app_path(project_dir, f), f"Unused import: {local}"))
+   495
+   496      return {
+   497          "valid_imports": not any(e.type == "invalid_import" for e in errors),
+   498          "no_circular_deps": not any(e.type == "circular_dependency" for e in errors),
+   499          "no_unused_imports": not any(e.type == "unused_import" for e in errors),
+   500          "all_refs_defined": not any(e.type == "undefined_reference" for e in errors),
+   501          "valid_attribute_access": not any(e.type == "invalid_attribute_access" for e in errors),
+   502          "type_consistent": not any(e.type == "type_error" for e in errors),
+   503          "errors": [e.__dict__ for e in errors],
+   504      }
+   505
+   506
+   507  def main(argv: Optional[List[str]] = None) -> int:
+   508      ap = argparse.ArgumentParser()
+   509      ap.add_argument("--project-dir", required=True)
+   510      ap.add_argument("--out", required=True)
+   511      ns = ap.parse_args(argv)
+   512
+   513      report = analyze(Path(ns.project_dir))
+   514      outp = Path(ns.out)
+   515      try:
+   516          outp.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+   517      except Exception:
+   518          print(json.dumps(report))
+   519          return 1
+   520      return 0
+root@1b1a90e96d3e:/app# python - <<'PY'
+> from pathlib import Path
+> p=Path('/app/analyze_deps.py')
+> lines=p.read_text(encoding='utf-8').splitlines(True)
+>
+> out=[]
+> injected=False
+> for i,ln in enumerate(lines):
+>     out.append(ln)
+>     if (not injected) and ln.strip()=='V().visit(t)':
+>         lead = ln[:len(ln)-len(ln.lstrip(' '))]
+>         out.append(lead + '# Fallback: mark imports used if their local name appears in any Load Name node\n')
+>         out.append(lead + 'loads = {n.id for n in ast.walk(t) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}\n')
+>         out.append(lead + 'for it2 in list(import_usage.keys()):\n')
+>         out.append(lead + '    if it2.kind == "from" and it2.name == "*":\n')
+>         out.append(lead + '        continue\n')
+>         out.append(lead + '    local2 = it2.asname or (it2.name.split(".")[0] if it2.kind == "import" else it2.name)\n')
+>         out.append(lead + '    if local2 in loads:\n')
+>         out.append(lead + '        import_usage[it2] = True\n')
+>         injected=True
+>
+> p.write_text(''.join(out), encoding='utf-8')
+> print('injected fallback', injected)
+> PY
+injected fallback True
+root@1b1a90e96d3e:/app# python -m py_compile /app/analyze_deps.py
+root@1b1a90e96d3e:/app# python /app/analyze_deps.py --project-dir /tmp/proj --out /tmp/report.json
+root@1b1a90e96d3e:/app# cat /tmp/report.json
+{
+  "all_refs_defined": true,
+  "errors": [
+    {
+      "file": "/app/a.py",
+      "message": "Unused import: b",
+      "type": "unused_import"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}
+root@1b1a90e96d3e:/app#

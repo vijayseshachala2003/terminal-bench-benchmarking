@@ -1,0 +1,118 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@f3ded6e0ff44:/app# cat << 'EOF' > /app/app/indexer.py
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import re
+> import time
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     ignore_patterns = []
+>     try:
+>         with open('/data/ignore.txt', 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip()
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 ignore_patterns.append(unicodedata.normalize('NFC', line))
+>     except FileNotFoundError:
+>         pass
+>
+>     compiled_ignores = []
+>     for pat in ignore_patterns:
+>         def pat_to_regex(p):
+>             parts = p.split('*')
+>             escaped_parts = [re.escape(part) for part in parts]
+>             return '[^/]*'.join(escaped_parts)
+>
+>         if pat.startswith('/'):
+>             regex_str = '^' + pat_to_regex(pat[1:]) + '$'
+>         elif '/' not in pat:
+>             regex_str = '(^|/)' + pat_to_regex(pat) + '($|/)'
+>         else:
+>             regex_str = '(^|/)' + pat_to_regex(pat) + '$'
+>         compiled_ignores.append(re.compile(regex_str))
+>
+>     def is_ignored(rel_nfc):
+>         for reg in compiled_ignores:
+>             if reg.search(rel_nfc):
+>                 return True
+>         return False
+>
+>     files_to_index = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir):
+>         valid_dirs = []
+>         for d in dirnames:
+>             full_d = os.path.join(dirpath, d)
+>             if os.path.islink(full_d):
+>                 continue
+>             rel_d = os.path.relpath(full_d, root_dir).replace('\\', '/')
+>             rel_d_nfc = unicodedata.normalize('NFC', rel_d)
+>             if not is_ignored(rel_d_nfc):
+>                 valid_dirs.append(d)
+>         dirnames[:] = valid_dirs
+>
+>         for f in filenames:
+>             full_f = os.path.join(dirpath, f)
+>             if os.path.islink(full_f):
+>                 continue
+>             rel_f = os.path.relpath(full_f, root_dir).replace('\\', '/')
+>             rel_f_nfc = unicodedata.normalize('NFC', rel_f)
+>             if is_ignored(rel_f_nfc):
+>                 continue
+>
+>             if rel_f_nfc in files_to_index:
+>                 existing_orig = files_to_index[rel_f_nfc][0]
+>                 if rel_f <= existing_orig:
+>                     continue
+>
+>             try:
+>                 stat = os.stat(full_f)
+>                 size = stat.st_size
+>                 files_to_index[rel_f_nfc] = (rel_f, full_f, size)
+>             except OSError:
+>                 pass
+>
+>     results = []
+>     for rel_f_nfc in sorted(files_to_index.keys()):
+>         rel_f, full_f, size = files_to_index[rel_f_nfc]
+>         sha256 = hashlib.sha256()
+>         try:
+>             with open(full_f, 'rb') as f:
+>                 while chunk := f.read(8192):
+>                     sha256.update(chunk)
+>             results.append((rel_f_nfc, sha256.hexdigest(), size))
+>         except OSError:
+>             pass
+>
+>     for _ in range(100):
+>         try:
+>             conn = sqlite3.connect(db_path, timeout=30.0)
+>             conn.execute('PRAGMA journal_mode=WAL')
+>             conn.execute('PRAGMA synchronous=NORMAL')
+>             conn.execute('PRAGMA busy_timeout=30000')
+>             with conn:
+>                 conn.execute('''CREATE TABLE IF NOT EXISTS files (
+>                     path TEXT PRIMARY KEY,
+>                     sha256 TEXT NOT NULL,
+>                     size INTEGER NOT NULL
+>                 )''')
+>                 conn.executemany('''INSERT OR REPLACE INTO files (path, sha256, size)
+>                     VALUES (?, ?, ?)''', results)
+>             conn.close()
+>             break
+>         except sqlite3.OperationalError as e:
+>             if 'locked' in str(e).lower() or 'busy' in str(e).lower():
+>                 time.sleep(0.5)
+>             else:
+>                 raise
+> EOF
+root@f3ded6e0ff44:/app# python3 -m py_compile /app/app/indexer.py
+root@f3ded6e0ff44:/app#

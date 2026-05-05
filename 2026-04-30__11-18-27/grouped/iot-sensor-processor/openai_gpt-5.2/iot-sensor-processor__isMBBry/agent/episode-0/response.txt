@@ -1,0 +1,43 @@
+{
+  "analysis": "We are in /app with no prior work shown. Need to discover existing sensor_*.json files, parse all safely (skip empty/malformed), compute per-device stats and global stats with 1 decimal, detect anomalies using global mean and stddev over valid numeric temperatures, find connectivity issues where timestamp or temperature missing/null/empty string, count distinct device_id across all parsed rows, then write /app/sensor_analysis.json and /app/sensor_report.txt in required sorted formats.",
+  "plan": "1) List sensor_*.json inputs present under /app and inspect a couple to confirm structure. 2) Create a Python analyzer script that: iterates all matching files excluding outputs; robustly loads JSON (handle empty/malformed); normalizes rows to dicts; collects distinct device_ids from any row; identifies connectivity issues (missing/null/empty timestamp or temperature); collects valid numeric temperature readings with integer timestamps; computes global mean/stddev; flags anomalies outside ±2 stddev; computes per-device min/max/avg/count; computes summary totals and global min/max/avg; sorts device_stats by device_id and anomalies by timestamp; writes sensor_analysis.json and sensor_report.txt. 3) Run the script and show the generated outputs for verification.",
+  "commands": [
+    {
+      "keystrokes": "ls -la /app\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "ls -1 /app/sensor_*.json 2>/dev/null || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport glob,os\nfiles=sorted(glob.glob('/app/sensor_*.json'))\nprint('count',len(files))\nfor f in files:\n    print(os.path.basename(f), os.path.getsize(f))\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "head -n 40 /app/sensor_*.json 2>/dev/null | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/analyze_sensors.py <<'PY'\n#!/usr/bin/env python3\nimport json, glob, os, math\nfrom collections import defaultdict\n\ndef is_missing(v):\n    return v is None or (isinstance(v,str) and v.strip()==\"\")\n\ndef to_float(v):\n    if isinstance(v,(int,float)):\n        return float(v)\n    if isinstance(v,str):\n        s=v.strip()\n        if s==\"\":\n            return None\n        try:\n            return float(s)\n        except Exception:\n            return None\n    return None\n\ndef to_int(v):\n    if isinstance(v,bool):\n        return None\n    if isinstance(v,int):\n        return v\n    if isinstance(v,float) and v.is_integer():\n        return int(v)\n    if isinstance(v,str):\n        s=v.strip()\n        if s==\"\":\n            return None\n        try:\n            return int(float(s))\n        except Exception:\n            return None\n    return None\n\ndef round1(x):\n    return float(f\"{x:.1f}\")\n\ndef load_rows(path):\n    try:\n        with open(path,'r',encoding='utf-8') as f:\n            raw=f.read()\n    except Exception:\n        return []\n    if raw.strip()==\"\":\n        return []\n    try:\n        data=json.loads(raw)\n    except Exception:\n        return []\n    # Accept list of readings, or dict with 'readings', or single reading dict\n    if isinstance(data,list):\n        rows=data\n    elif isinstance(data,dict):\n        if isinstance(data.get('readings'),list):\n            rows=data['readings']\n        else:\n            rows=[data]\n    else:\n        return []\n    out=[]\n    for r in rows:\n        if isinstance(r,dict):\n            out.append(r)\n    return out\n\ndef main():\n    # discover inputs; exclude our outputs if they match pattern\n    files=sorted(glob.glob('/app/sensor_*.json'))\n    files=[f for f in files if os.path.basename(f) not in {'sensor_analysis.json'}]\n\n    distinct_devices=set()\n    connectivity_issues=[]\n\n    valid_readings=[]  # tuples: (device_id, timestamp_int, temp_float)\n\n    total_rows_parsed=0\n\n    for f in files:\n        rows=load_rows(f)\n        for r in rows:\n            total_rows_parsed += 1\n            device_id = r.get('device_id')\n            if device_id is None:\n                # if device_id missing, still treat as unknown device for counting/issues\n                device_id = \"unknown\"\n            else:\n                device_id = str(device_id)\n            distinct_devices.add(device_id)\n\n            ts_raw = r.get('timestamp')\n            temp_raw = r.get('temperature')\n\n            missing = is_missing(ts_raw) or is_missing(temp_raw)\n            if missing:\n                connectivity_issues.append({'device_id': device_id, 'issue_type': 'missing_data'})\n                continue\n\n            ts = to_int(ts_raw)\n            temp = to_float(temp_raw)\n            if ts is None or temp is None or math.isnan(temp) or math.isinf(temp):\n                connectivity_issues.append({'device_id': device_id, 'issue_type': 'missing_data'})\n                continue\n\n            valid_readings.append((device_id, ts, float(temp)))\n\n    temps=[t for _,__,t in valid_readings]\n\n    # Global stats\n    if temps:\n        mean = sum(temps)/len(temps)\n        var = sum((t-mean)**2 for t in temps)/len(temps)\n        std = math.sqrt(var)\n        gmin = min(temps)\n        gmax = max(temps)\n    else:\n        mean = 0.0\n        std = 0.0\n        gmin = 0.0\n        gmax = 0.0\n\n    # Per-device stats\n    per=defaultdict(list)\n    for dev,ts,temp in valid_readings:\n        per[dev].append(temp)\n\n    device_stats=[]\n    for dev in sorted(per.keys()):\n        arr=per[dev]\n        device_stats.append({\n            'device_id': dev,\n            'min_temp': round1(min(arr)),\n            'max_temp': round1(max(arr)),\n            'avg_temp': round1(sum(arr)/len(arr)),\n            'reading_count': int(len(arr))\n        })\n\n    # Anomalies: outside 2 stddev of global mean (if std==0 -> none)\n    anomalies=[]\n    if temps and std>0:\n        lo = mean - 2*std\n        hi = mean + 2*std\n        for dev,ts,temp in valid_readings:\n            if temp < lo or temp > hi:\n                anomalies.append({\n                    'device_id': dev,\n                    'timestamp': int(ts),\n                    'temperature': round1(temp)\n                })\n\n    anomalies.sort(key=lambda x: x['timestamp'])\n\n    summary={\n        'total_devices': int(len(distinct_devices)),\n        'total_readings': int(len(valid_readings)),\n        'min_temperature': round1(gmin),\n        'max_temperature': round1(gmax),\n        'avg_temperature': round1(mean),\n        'anomaly_count': int(len(anomalies)),\n        'connectivity_issues_count': int(len(connectivity_issues))\n    }\n\n    out={\n        'device_stats': device_stats,\n        'anomalies': anomalies,\n        'connectivity_issues': connectivity_issues,\n        'summary': summary\n    }\n\n    with open('/app/sensor_analysis.json','w',encoding='utf-8') as f:\n        json.dump(out,f,indent=2,sort_keys=False)\n        f.write('\\n')\n\n    report = (\n        \"IOT SENSOR ANALYSIS REPORT\\n\"\n        \"==========================\\n\"\n        f\"Total Devices: {summary['total_devices']}\\n\"\n        f\"Total Readings: {summary['total_readings']}\\n\"\n        f\"Temperature Range: {summary['min_temperature']:.1f}°C to {summary['max_temperature']:.1f}°C\\n\"\n        f\"Average Temperature: {summary['avg_temperature']:.1f}°C\\n\"\n        f\"Anomalies Detected: {summary['anomaly_count']}\\n\"\n        f\"Connectivity Issues: {summary['connectivity_issues_count']}\\n\"\n        \"==========================\\n\"\n    )\n    with open('/app/sensor_report.txt','w',encoding='utf-8') as f:\n        f.write(report)\n\nif __name__=='__main__':\n    main()\nPY\nchmod +x /app/analyze_sensors.py\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 /app/analyze_sensors.py\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ls -la /app/sensor_analysis.json /app/sensor_report.txt\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat /app/sensor_report.txt\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport json\np='/app/sensor_analysis.json'\nwith open(p) as f: d=json.load(f)\nprint('keys',d.keys())\nprint('summary',d['summary'])\nprint('device_stats',len(d['device_stats']),'anomalies',len(d['anomalies']),'issues',len(d['connectivity_issues']))\n# quick checks\nids=[x['device_id'] for x in d['device_stats']]\nprint('device_stats sorted:', ids==sorted(ids))\nts=[x['timestamp'] for x in d['anomalies']]\nprint('anomalies sorted:', ts==sorted(ts))\nPY\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": true
+}

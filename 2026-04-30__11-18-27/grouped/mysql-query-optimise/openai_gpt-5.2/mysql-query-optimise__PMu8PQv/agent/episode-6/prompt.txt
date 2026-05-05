@@ -1,0 +1,111 @@
+New Terminal Output:
+
+root@9402f7503758:/app# cd /app
+root@9402f7503758:/app# grep -n "Temporal correlations" -n /app/optimize.py
+255:    # Temporal correlations
+root@9402f7503758:/app# python3 - <<'PY'
+> import re
+> path='/app/optimize.py'
+> text=open(path,'r',encoding='utf-8').read()
+> # Replace the whole temporal correlation block between the marker comment and the next section (Greedy recommendations)
+> pattern=re.compile(r"\n\s*# Temporal correlations\n.*?\n\s*# Greedy recommendations\n", re.S)
+> replacement="""
+>     # Temporal correlations (window-based co-occurrence; each window contributes at most 1 per pair)
+>     events = []
+>     for pat, tss in pat_occurs.items():
+>         for ts in tss:
+>             events.append((ts, pat))
+>     events.sort()
+>
+>     pair_counts = defaultdict(int)
+>     pair_deltas = defaultdict(list)
+>
+>     for i in range(len(events)):
+>         start_ts = events[i][0]
+>         end_ts = start_ts + WINDOW
+>         j = i
+>         pats_in_window = defaultdict(list)  # pattern -> list of timestamps
+>         while j < len(events) and events[j][0] <= end_ts:
+>             ts, pat = events[j]
+>             pats_in_window[pat].append(ts)
+>             j += 1
+>
+>         pats = sorted(pats_in_window.keys())
+>         if len(pats) < 2:
+>             continue
+>
+>         for a_idx in range(len(pats)):
+>             for b_idx in range(a_idx + 1, len(pats)):
+>                 a, b = pats[a_idx], pats[b_idx]
+>                 pair_counts[(a, b)] += 1
+>                 # avg_time_delta: minimal abs delta between any events of the two patterns in this window
+>                 mind = None
+>                 for ta in pats_in_window[a]:
+>                     for tb in pats_in_window[b]:
+>                         d = abs(tb - ta)
+>                         if mind is None or d < mind:
+>                             mind = d
+>                 pair_deltas[(a, b)].append(float(mind or 0.0))
+>
+>     temporal = []
+>     for (a, b), cnt in pair_counts.items():
+>         if cnt >= 3:
+>             deltas = pair_deltas[(a, b)]
+>             avg_delta = sum(deltas) / len(deltas) if deltas else 0.0
+>             temporal.append({'pattern1': a, 'pattern2': b, 'correlation_strength': int(cnt), 'avg_time_delta': round1(avg_delta)})
+>
+>     temporal = sorted(temporal, key=lambda d: (-d['correlation_strength'], d['pattern1'], d['pattern2']))
+>
+>     # Greedy recommendations
+> """
+> new_text, n = pattern.subn("\n"+replacement, text, count=1)
+> if n!=1:
+>     raise SystemExit(f"Failed to patch temporal block (matches={n}).")
+> open(path,'w',encoding='utf-8').write(new_text)
+> print('patched')
+> PY
+patched
+root@9402f7503758:/app# python3 /app/optimize.py
+root@9402f7503758:/app# python3 -c "import json; d=json.load(open('/app/optimization.json')); print('corr',d['temporal_correlations'])"
+corr [{'pattern1': 'SELECT * FROM USERS WHERE ID = ?', 'pattern2': 'SELECT P.* FROM PRODUCTS P JOIN ORDER_ITEMS OI ON P.ID = OI.PRODUCT_ID WHERE OI.ORDER_ID = ?
+', 'correlation_strength': 27, 'avg_time_delta': 5.6}, {'pattern1': 'SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?', 'pattern2': 'SELECT OI.* FROM ORDER_
+ITEMS OI JOIN ORDERS O ON OI.ORDER_ID = O.ID WHERE O.USER_ID = ?', 'correlation_strength': 26, 'avg_time_delta': 9.4}, {'pattern1': 'SELECT * FROM USERS WHERE I
+D = ?', 'pattern2': 'SELECT * FROM USERS WHERE ID IN (?)', 'correlation_strength': 25, 'avg_time_delta': 21.4}]
+root@9402f7503758:/app# sed -n '1,120p' /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 989.2 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 6.1, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.2, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 27):
+   - SELECT * FROM USERS WHERE ID = ?
+   - SELECT P.* FROM PRODUCTS P JOIN ORDER_ITEMS OI ON P.ID = OI....
+2. Pattern Pair (Strength: 26):
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+   - SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID...
+3. Pattern Pair (Strength: 25):
+   - SELECT * FROM USERS WHERE ID = ?
+   - SELECT * FROM USERS WHERE ID IN (?)
+
+RECOMMENDED INDEXES (5 max):
+1. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+2. users(id) - Impact: 49.9, Cost: 214.6 [high_impact]
+3. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+4. order_items(order_id) - Impact: 25.2, Cost: 230.2 [high_impact]
+5. orders(status) - Impact: 5.4, Cost: 122.0 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 169.5
+- Remaining budget: 10.8 points
+- Tables optimized: 4
+root@9402f7503758:/app#

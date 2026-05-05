@@ -1,0 +1,119 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+print("test")root@33d072e5056e:/app# rm /app/analyze.py
+root@33d072e5056e:/app# cat > /app/analyze.py << 'EOF'
+[:80]} | freq={p['frequency']} avg={p['avg_execution_time']} total={p['total_time']}")
+EOF
+> import json
+> import re
+> import glob
+> import math
+> from collections import defaultdict
+>
+> with open('/app/query_metadata.json') as f:
+>     metadata = json.load(f)
+>
+> budget = metadata['budget']
+> tables_meta = metadata['tables']
+>
+> def parse_slow_logs(log_files):
+>     entries = []
+>     for log_file in log_files:
+>         with open(log_file) as f:
+>             lines = f.readlines()
+>         i = 0
+>         while i < len(lines):
+>             line = lines[i].strip()
+>             if line.startswith('# Time:'):
+>                 time_str = line[len('# Time:'):].strip()
+>                 query_time = None
+>                 timestamp = None
+>                 sql_lines = []
+>                 i += 1
+>                 while i < len(lines) and not lines[i].strip().startswith('# Time:'):
+>                     l = lines[i].strip()
+>                     if l.startswith('# Query_time:'):
+>                         m = re.search(r'Query_time:\s*([\d.]+)', l)
+>                         if m:
+>                             query_time = float(m.group(1))
+>                     elif l.startswith('SET timestamp='):
+>                         m = re.search(r'SET timestamp=(\d+)', l)
+>                         if m:
+>                             timestamp = int(m.group(1))
+>                     elif not l.startswith('#') and not l.startswith('SET ') and not l.startswith('use ') and l:
+>                         sql_lines.append(l)
+>                     i += 1
+>                 if query_time is not None and sql_lines and timestamp is not None:
+>                     sql = ' '.join(sql_lines).rstrip(';').strip()
+>                     entries.append({'timestamp': timestamp, 'query_time': query_time, 'sql': sql})
+>             else:
+>                 i += 1
+>     return entries
+>
+> log_files = sorted(glob.glob('/app/mysql_slow_*.log'))
+> entries = parse_slow_logs(log_files)
+> print(f"Total entries parsed: {len(entries)}")
+>
+> def normalize_query(sql):
+>     normalized = sql.upper()
+>     normalized = re.sub(r"IN\s*\([^)]+\)", "IN (?)", normalized)
+>     normalized = re.sub(r"'[^']*'", "?", normalized)
+>     normalized = re.sub(r'\b\d+\.\d+\b', '?', normalized)
+>     normalized = re.sub(r'\b\d+\b', '?', normalized)
+>     normalized = re.sub(r'\s+', ' ', normalized).strip()
+>     return normalized
+>
+> slow_entries = [e for e in entries if e['query_time'] > 1.0]
+> print(f"Slow entries: {len(slow_entries)}")
+>
+> pattern_groups = defaultdict(list)
+> for entry in slow_entries:
+>     pattern = normalize_query(entry['sql'])
+>     pattern_groups[pattern].append(entry)
+>
+> print(f"Unique patterns: {len(pattern_groups)}")
+>
+> normalized_patterns = []
+> for pattern, grp in pattern_groups.items():
+>     freq = len(grp)
+>     avg_t = sum(e['query_time'] for e in grp) / freq
+>     total_t = sum(e['query_time'] for e in grp)
+>     normalized_patterns.append({
+>         'pattern': pattern,
+>         'frequency': freq,
+>         'avg_execution_time': round(avg_t, 1),
+>         'total_time': round(total_t, 1),
+>         'entries': grp
+>     })
+>
+> normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+>
+> for p in normalized_patterns:
+>     print(f"  {p['pattern'][:80]} | freq={p['frequency']} avg={p['avg_execution_time']} total={p['total_time']}")
+> EOF
+root@33d072e5056e:/app# python3 /app/analyze.py
+Total entries parsed: 145
+Slow entries: 145
+Unique patterns: 18
+  SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? | freq=14 avg=5.0 total=69.5
+  SELECT * FROM USERS WHERE EMAIL = ? | freq=10 avg=6.1 total=60.9
+  SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID | freq=10 avg=5.8 total=57.5
+  SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID = O.ID WHERE O.USER | freq=8 avg=7.0 total=56.0
+  SELECT * FROM ORDERS WHERE STATUS IN (?) | freq=13 avg=4.2 total=54.1
+  SELECT * FROM USERS WHERE ID IN (?) | freq=8 avg=6.6 total=52.5
+  SELECT * FROM ORDERS WHERE STATUS = ? | freq=9 avg=5.2 total=46.7
+  SELECT * FROM USERS WHERE COUNTRY = ? | freq=8 avg=5.5 total=44.1
+  SELECT * FROM ORDERS WHERE ID = ? | freq=7 avg=5.4 total=38.0
+  SELECT P.* FROM PRODUCTS P JOIN ORDER_ITEMS OI ON P.ID = OI.PRODUCT_ID WHERE OI. | freq=8 avg=4.5 total=35.6
+  SELECT U.*, O.* FROM USERS U JOIN ORDERS O ON U.ID = O.USER_ID WHERE U.ID = ? | freq=8 avg=3.8 total=30.6
+  SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREATED_AT | freq=7 avg=3.8 total=26.6
+  SELECT * FROM USERS WHERE ID = ? | freq=8 avg=3.2 total=25.6
+  SELECT O.* FROM ORDERS O JOIN USERS U ON O.USER_ID = U.ID WHERE U.EMAIL = ? | freq=9 avg=2.7 total=24.6
+  SELECT * FROM ORDERS WHERE USER_ID = ? AND STATUS = ? | freq=4 avg=5.6 total=22.3
+  SELECT * FROM ORDERS WHERE USER_ID = ? | freq=6 avg=3.4 total=20.2
+  SELECT * FROM USERS WHERE STATUS = ? | freq=4 avg=4.9 total=19.5
+  SELECT * FROM PRODUCTS WHERE CATEGORY = ? | freq=4 avg=4.3 total=17.4
+root@33d072e5056e:/app#

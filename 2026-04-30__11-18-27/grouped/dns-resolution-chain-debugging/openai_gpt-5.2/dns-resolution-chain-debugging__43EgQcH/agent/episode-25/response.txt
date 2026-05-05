@@ -1,0 +1,43 @@
+{
+  "analysis": "Resolver still fails to parse the trusted-keys line: 'expected number near <pubkey>'. That means the trusted-keys syntax we wrote is wrong for BIND 9.18: it expects the format `name initial-key <keyid> <alg> <base64>` or similar, not flags/proto/alg. So it treats the flags field as keyid? Actually error at line 2 near pubkey indicates it expected another number (probably algorithm) but got base64 due to missing a field. We should use correct BIND 9.18 trust-anchors syntax with `initial-key` and provide the DNSKEY RR in braces. The recommended is: `trust-anchors { \"secure.example.com\" initial-key 257 3 13 \"<pubkey>\"; };` But earlier static-ds failed due to wrong field order; for initial-key we can use flags proto alg pubkey. We'll write trust-anchors with initial-key and ensure numeric fields are present. Then named-checkconf should pass.",
+  "plan": "1) Extract KSK DNSKEY fields (flags, proto, alg, pubkey) from the key file. 2) Rewrite resolver named.conf with a top-level trust-anchors block using `initial-key` and those fields. 3) Validate with named-checkconf and start resolver. 4) Test secure.example.com resolution via resolver; confirm NOERROR and AD flag. 5) Then bring up secondary and verify AXFR and run test queries; finally write dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "python3 - <<'PY'\nimport glob,re\nkeys=sorted(glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key'))\nksk=None\nfor fn in keys:\n    for line in open(fn):\n        if line.lstrip().startswith(';'): continue\n        if ' DNSKEY ' in line and re.search(r'\\s257\\s', line):\n            ksk=line.strip(); break\n    if ksk: break\nif not ksk: raise SystemExit('no KSK RR')\nparts=ksk.split()\nname=parts[0].rstrip('.')+'.'\nflags=int(parts[4]); proto=int(parts[5]); alg=int(parts[6]); pub=parts[7]\nprint(name,flags,proto,alg,pub)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport glob,re\n# extract KSK DNSKEY from key file\nkeys=sorted(glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key'))\nksk=None\nfor fn in keys:\n    for line in open(fn):\n        if line.lstrip().startswith(';'): continue\n        if ' DNSKEY ' in line and re.search(r'\\s257\\s', line):\n            ksk=line.strip(); break\n    if ksk: break\nif not ksk: raise SystemExit('no KSK RR')\nparts=ksk.split()\nname=parts[0].rstrip('.')+'.'\nflags=parts[4]; proto=parts[5]; alg=parts[6]; pub=parts[7]\nconf=f'''trust-anchors {{\n    \"{name}\" initial-key {flags} {proto} {alg} \"{pub}\";\n}};\n\noptions {{\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 {{ 127.0.0.1; }};\n    listen-on-v6 {{ none; }};\n    allow-query {{ any; }};\n    allow-recursion {{ any; }};\n    recursion yes;\n    dnssec-validation yes;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n}};\n\nzone \"example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\nzone \"secure.example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\ncontrols {{ }};\n'''\nopen('/app/dns/resolver/named.conf','w').write(conf)\nprint('wrote resolver config with trust-anchors initial-key')\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,40p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

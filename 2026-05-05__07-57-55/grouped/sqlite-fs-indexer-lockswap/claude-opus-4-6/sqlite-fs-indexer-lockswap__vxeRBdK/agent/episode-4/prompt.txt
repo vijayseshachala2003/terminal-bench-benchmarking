@@ -1,0 +1,277 @@
+New Terminal Output:
+
+root@b52ca0597593:/app# cat /app/app/indexer.py
+import hashlib
+import os
+import sqlite3
+import tempfile
+import unicodedata
+import fnmatch
+import shutil
+
+
+def _read_ignore_patterns():
+    """Read /data/ignore.txt and return list of NFC-normalized patterns."""
+    patterns = []
+    try:
+        with open('/data/ignore.txt', 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.rstrip('\n').rstrip('\r')
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith('#'):
+                    continue
+                # Normalize pattern to NFC
+                pat = unicodedata.normalize('NFC', line.strip())
+                patterns.append(pat)
+    except (FileNotFoundError, OSError):
+        pass
+    return patterns
+
+
+def _pattern_matches(pattern, rel_path):
+    """
+    Check if a pattern matches a relative path according to the ignore rules.
+
+    Rules:
+    1. Leading '/' -> match against full relative path (strip the '/')
+    2. No '/' in pattern -> match against each path component
+    3. Contains '/' but no leading '/' -> match full path or any suffix after '/'
+    4. '*' matches zero or more chars but not '/'. '**' is two literal '*' chars.
+    """
+    # We need a custom match function where * doesn't match /
+    # and ** is literal (two * chars, not recursive glob)
+
+    if pattern.startswith('/'):
+        # Rule 1: anchored match against full relative path
+        pat = pattern[1:]
+        return _glob_match(pat, rel_path)
+    elif '/' not in pattern:
+        # Rule 2: match against each path component
+        components = rel_path.split('/')
+        for comp in components:
+            if _glob_match(pattern, comp):
+                return True
+        return False
+    else:
+        # Rule 3: contains '/' but no leading '/'
+        # Match against full path or any suffix starting after a '/'
+        if _glob_match(pattern, rel_path):
+            return True
+        # Try matching against suffixes
+        idx = 0
+        while True:
+            idx = rel_path.find('/', idx)
+            if idx == -1:
+                break
+            suffix = rel_path[idx + 1:]
+            if _glob_match(pattern, suffix):
+                return True
+            idx += 1
+        return False
+
+
+def _glob_match(pattern, text):
+    """
+    Match pattern against text where:
+    - '*' matches zero or more characters except '/'
+    - '?' matches exactly one character except '/'
+    - '**' is two literal '*' (not special recursive glob)
+    - Other characters match literally
+
+    We convert to a regex-free approach using dynamic programming.
+    """
+    # We'll use a simple DP approach
+    # First, parse pattern into tokens
+    # Since ** should be two literal *, we need to be careful
+    # Actually, the spec says ** means two literal * in the PATH.
+    # But in the pattern, * is a wildcard. So ** in a pattern means
+    # "match something that * would match, then match something * would match again"
+    # which is equivalent to just * (zero or more non-/ chars).
+    # Wait, re-reading: "**" in a pattern is NOT a special recursive glob;
+    # it means two literal '*' characters in the path at that point.
+    # So if pattern has **, it should match literal ** in the path.
+    # That means we need to handle ** specially: it matches the literal string "**"
+
+    # Let me re-read: "The two-character sequence ** in a pattern is not a special
+    # recursive glob; it means two literal * characters in the path at that point."
+    # So ** in pattern matches literal "**" in the path.
+
+    # Parse pattern: split into segments
+    # Single * = wildcard (match 0+ non-/ chars)
+    # ** = literal "**"
+    # We need to distinguish single * from **
+
+    # Tokenize: scan through pattern
+    tokens = []  # list of (type, value) where type is 'literal' or 'star'
+    i = 0
+    while i < len(pattern):
+        if pattern[i] == '*':
+            if i + 1 < len(pattern) and pattern[i + 1] == '*':
+                # ** -> literal "**"
+                tokens.append(('literal', '**'))
+                i += 2
+            else:
+                # single * -> wildcard
+                tokens.append(('star', None))
+                i += 1
+        else:
+            # Collect literal characters
+            j = i
+            while j < len(pattern) and pattern[j] != '*':
+                j += 1
+            tokens.append(('literal', pattern[i:j]))
+            i = j
+
+    # Now do DP matching
+    # dp[j] = set of positions in text that we can be at after matching tokens[0:j]
+    # Start: position 0
+    # For 'literal' token: advance by len(value), must match exactly
+    # For 'star' token: match 0 or more non-'/' characters
+
+    positions = {0}
+    for token_type, token_val in tokens:
+        new_positions = set()
+        if token_type == 'literal':
+            for pos in positions:
+                end = pos + len(token_val)
+                if end <= len(text) and text[pos:end] == token_val:
+                    new_positions.add(end)
+        elif token_type == 'star':
+            for pos in positions:
+                # Match 0 or more non-/ chars
+                p = pos
+                new_positions.add(p)
+                while p < len(text) and text[p] != '/':
+                    p += 1
+                    new_positions.add(p)
+        positions = new_positions
+        if not positions:
+            return False
+
+    return len(text) in positions
+
+
+def _should_ignore(patterns, rel_path_nfc):
+    """Check if a NFC-normalized relative path should be ignored."""
+    for pat in patterns:
+        try:
+            if _pattern_matches(pat, rel_path_nfc):
+                return True
+        except Exception:
+            # Malformed patterns must not crash the indexer
+            continue
+    return False
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash and size of a file."""
+    h = hashlib.sha256()
+    size = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+
+    ignore_patterns = _read_ignore_patterns()
+
+    # Normalize root_dir
+    root_dir = os.path.abspath(root_dir)
+
+    # Collect all files: {nfc_rel_path: (original_rel_path, full_path)}
+    # For Unicode collision handling, keep the entry with the largest original rel path
+    file_map = {}  # nfc_path -> (original_rel_path, full_path)
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Filter out symlinked directories from dirnames to prevent traversal
+        dirnames[:] = [
+            d for d in dirnames
+            if not os.path.islink(os.path.join(dirpath, d))
+        ]
+        # Sort dirnames for deterministic traversal
+        dirnames.sort()
+
+        for filename in sorted(filenames):
+            full_path = os.path.join(dirpath, filename)
+
+            # Skip symlinks
+            if os.path.islink(full_path):
+                continue
+
+            # Compute relative path with forward slashes
+            rel_path = os.path.relpath(full_path, root_dir)
+            rel_path = rel_path.replace(os.sep, '/')
+
+            # NFC normalize
+            nfc_path = unicodedata.normalize('NFC', rel_path)
+
+            # Check ignore patterns (use NFC path)
+            if _should_ignore(ignore_patterns, nfc_path):
+                continue
+
+            # Handle Unicode collisions: keep lexicographically largest original
+            if nfc_path in file_map:
+                existing_orig, existing_full = file_map[nfc_path]
+                if rel_path > existing_orig:
+                    file_map[nfc_path] = (rel_path, full_path)
+            else:
+                file_map[nfc_path] = (rel_path, full_path)
+
+    # Build rows sorted by NFC path for determinism
+    rows = []
+    for nfc_path in sorted(file_map.keys()):
+        orig_rel, full_path = file_map[nfc_path]
+        try:
+            sha256_hex, size = _hash_file(full_path)
+        except (OSError, IOError):
+            continue
+        rows.append((nfc_path, sha256_hex, size))
+
+    # Write to a temporary database file, then atomically replace the target.
+    # This ensures concurrency safety: each writer creates its own temp file,
+    # and the final rename is atomic on POSIX.
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(db_dir, exist_ok=True)
+
+    # Use a temp file in the same directory for atomic rename
+    fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db.tmp')
+    os.close(fd)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute(
+                'CREATE TABLE files ('
+                '  path TEXT PRIMARY KEY,'
+                '  sha256 TEXT NOT NULL,'
+                '  size INTEGER NOT NULL'
+                ')'
+            )
+            conn.executemany(
+                'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+                rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Atomic replace
+        # On POSIX, os.replace is atomic if src and dst are on the same filesystem
+        os.replace(tmp_path, os.path.abspath(db_path))
+    except BaseException:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+root@b52ca0597593:/app#

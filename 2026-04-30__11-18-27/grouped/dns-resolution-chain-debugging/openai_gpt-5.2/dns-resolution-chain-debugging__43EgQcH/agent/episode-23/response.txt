@@ -1,0 +1,47 @@
+{
+  "analysis": "Resolver config is currently invalid because the trust-anchors static-ds line is malformed: it shows `static-ds 13 2 <digest> \"\";` missing required numeric fields (keytag, algorithm, digesttype) and the digest got placed where a number is expected. Also, the attempt to extract KSK DNSKEY via dig returned none, likely because primary was not answering DNSKEY at that moment or because recursion flags; but we can extract the KSK directly from the generated key files in /app/dns/primary/keys (K*.key). Best path: remove trust-anchors entirely and write resolver config with `trusted-keys` derived from the KSK .key file contents (which contains the DNSKEY RR). This avoids relying on dig parsing. Then start resolver and proceed. Additionally, secondary status still needs verification after resolver fixed.",
+  "plan": "1) List DNSSEC key files for secure.example.com and extract the KSK DNSKEY RR from the .key file (it contains flags 257). 2) Rewrite /app/dns/resolver/named.conf using a top-level trusted-keys block with that DNSKEY RR’s public key. Remove any trust-anchors blocks. 3) Validate with named-checkconf and start resolver. 4) Confirm resolver listens on 5300 and secure.example.com resolves with NOERROR (and ideally AD). 5) Ensure secondary is running/listening on 5302 and verify AXFR for both zones. 6) Run /app/test_queries.txt through resolver. 7) Write /app/dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "ls -la /app/dns/primary/keys | grep 'Ksecure\\.example\\.com' || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -H 'DNSKEY' /app/dns/primary/keys/Ksecure.example.com.+013+*.key || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport glob,re\nkeys=sorted(glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key'))\nif not keys:\n    raise SystemExit('no key files')\nksk_rr=None\nfor fn in keys:\n    txt=open(fn).read()\n    for line in txt.splitlines():\n        if line.strip().startswith(';'): continue\n        if ' DNSKEY ' in line and re.search(r'\\s257\\s', line):\n            ksk_rr=line.strip(); break\n    if ksk_rr: break\nif not ksk_rr:\n    raise SystemExit('no KSK DNSKEY RR found in key files')\nparts=ksk_rr.split()\nname=parts[0].rstrip('.')+'.'\nflags=int(parts[4]); proto=int(parts[5]); alg=int(parts[6]); pub=parts[7]\nconf=f'''trusted-keys {{\n    \"{name}\" {flags} {proto} {alg} \"{pub}\";\n}};\n\noptions {{\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 {{ 127.0.0.1; }};\n    listen-on-v6 {{ none; }};\n    allow-query {{ any; }};\n    allow-recursion {{ any; }};\n    recursion yes;\n    dnssec-validation yes;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n}};\n\nzone \"example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\nzone \"secure.example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\ncontrols {{ }};\n'''\nopen('/app/dns/resolver/named.conf','w').write(conf)\nprint('Wrote resolver named.conf using KSK from',fn)\nprint('KSK RR:',ksk_rr)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1 | grep -E 'status:|flags:'\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

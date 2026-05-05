@@ -1,0 +1,277 @@
+New Terminal Output:
+
+root@770ce4292da5:/app# cat > /app/analyze.py << 'PYEOF'
+> import json
+> import glob
+> import math
+> import os
+>
+> # Discover all sensor_*.json files, excluding our output
+> files = sorted(glob.glob('/app/sensor_*.json'))
+> files = [f for f in files if os.path.basename(f) != 'sensor_analysis.json']
+>
+> all_readings = []
+>
+> for fpath in files:
+>     # Read file content
+>     try:
+>         content = open(fpath, 'r').read().strip()
+>     except Exception:
+>         continue
+>
+>     if not content:
+>         # Empty file
+>         continue
+>
+>     try:
+>         data = json.loads(content)
+>     except json.JSONDecodeError:
+>         # Malformed JSON - skip
+>         continue
+>
+>     # data should be a list; if it's a dict, wrap it
+>     if isinstance(data, dict):
+>         data = [data]
+>     elif not isinstance(data, list):
+>         continue
+>
+>     for row in data:
+>         if not isinstance(row, dict):
+>             continue
+>         all_readings.append(row)
+>
+> # Collect all distinct device_ids
+> all_device_ids = set()
+> for r in all_readings:
+>     did = r.get('device_id')
+>     if did is not None:
+>         all_device_ids.add(str(did))
+>
+> # Separate valid readings (numeric temp and valid timestamp) from connectivity issues
+> def is_missing(val):
+>     """Check if a value is missing: None, empty string"""
+>     return val is None or val == ''
+>
+> valid_readings = []  # readings with valid numeric temperature and valid timestamp
+> connectivity_issues = {}  # device_id -> True
+>
+> for r in all_readings:
+>     ts = r.get('timestamp')
+>     temp = r.get('temperature')
+>     did = r.get('device_id', 'unknown')
+>
+>     if is_missing(ts) or is_missing(temp):
+>         connectivity_issues[str(did)] = True
+>     else:
+>         # Check temp is numeric
+>         if isinstance(temp, (int, float)) and not (isinstance(temp, float) and math.isnan(temp)):
+>             valid_readings.append({
+>                 'device_id': str(did),
+>                 'timestamp': int(ts) if not isinstance(ts, int) else ts,
+>                 'temperature': float(temp)
+>             })
+>         else:
+>             connectivity_issues[str(did)] = True
+>
+> # Calculate global mean and std dev from all valid readings
+> all_temps = [r['temperature'] for r in valid_readings]
+>
+> if all_temps:
+>     global_mean = sum(all_temps) / len(all_temps)
+>     variance = sum((t - global_mean) ** 2 for t in all_temps) / len(all_temps)
+>     global_std = math.sqrt(variance)
+> else:
+>     global_mean = 0.0
+>     global_std = 0.0
+>
+> # Detect anomalies: temperature outside 2 std devs from global mean
+> anomalies = []
+> for r in valid_readings:
+>     if abs(r['temperature'] - global_mean) > 2 * global_std:
+>         anomalies.append({
+>             'device_id': r['device_id'],
+>             'timestamp': r['timestamp'],
+>             'temperature': round(r['temperature'], 1)
+>         })
+>
+> # Sort anomalies by timestamp ascending
+> anomalies.sort(key=lambda x: x['timestamp'])
+>
+> # Calculate per-device stats (only from valid readings)
+> device_temps = {}
+> for r in valid_readings:
+>     did = r['device_id']
+>     if did not in device_temps:
+>         device_temps[did] = []
+>     device_temps[did].append(r['temperature'])
+>
+> device_stats = []
+> for did in sorted(device_temps.keys()):
+>     temps = device_temps[did]
+>     device_stats.append({
+>         'device_id': did,
+>         'min_temp': round(min(temps), 1),
+>         'max_temp': round(max(temps), 1),
+>         'avg_temp': round(sum(temps) / len(temps), 1),
+>         'reading_count': len(temps)
+>     })
+>
+> # Connectivity issues list
+> conn_issues = []
+> for did in sorted(connectivity_issues.keys()):
+>     conn_issues.append({
+>         'device_id': did,
+>         'issue_type': 'missing_data'
+>     })
+>
+> # Summary
+> total_devices = len(all_device_ids)
+> total_readings = len(valid_readings)
+> min_temp = round(min(all_temps), 1) if all_temps else 0.0
+> max_temp = round(max(all_temps), 1) if all_temps else 0.0
+> avg_temp = round(global_mean, 1) if all_temps else 0.0
+>
+> result = {
+>     'device_stats': device_stats,
+>     'anomalies': anomalies,
+>     'connectivity_issues': conn_issues,
+>     'summary': {
+>         'total_devices': total_devices,
+>         'total_readings': total_readings,
+>         'min_temperature': min_temp,
+>         'max_temperature': max_temp,
+>         'avg_temperature': avg_temp,
+>         'anomaly_count': len(anomalies),
+>         'connectivity_issues_count': len(conn_issues)
+>     }
+> }
+>
+> # Write JSON
+> with open('/app/sensor_analysis.json', 'w') as f:
+>     json.dump(result, f, indent=2)
+>
+> # Write text report
+> report = f"""IOT SENSOR ANALYSIS REPORT
+> ==========================
+> Total Devices: {total_devices}
+> Total Readings: {total_readings}
+> Temperature Range: {min_temp}°C to {max_temp}°C
+> Average Temperature: {avg_temp}°C
+> Anomalies Detected: {len(anomalies)}
+> Connectivity Issues: {len(conn_issues)}
+> =========================="""
+>
+> with open('/app/sensor_report.txt', 'w') as f:
+>     f.write(report + '\n')
+>
+> print('Analysis complete.')
+> print(f'Total devices: {total_devices}')
+> print(f'Total valid readings: {total_readings}')
+> print(f'Global mean: {global_mean:.1f}, std: {global_std:.1f}')
+> print(f'Anomalies: {len(anomalies)}')
+> print(f'Connectivity issues: {len(conn_issues)}')
+> PYEOF
+root@770ce4292da5:/app# python3 /app/analyze.py
+Analysis complete.
+Total devices: 5
+Total valid readings: 70
+Global mean: 101.3, std: 226.5
+Anomalies: 5
+Connectivity issues: 4
+root@770ce4292da5:/app# cat /app/sensor_analysis.json
+{
+  "device_stats": [
+    {
+      "device_id": "sensor_001",
+      "min_temp": 15.1,
+      "max_temp": 954.0,
+      "avg_temp": 88.5,
+      "reading_count": 20
+    },
+    {
+      "device_id": "sensor_002",
+      "min_temp": -20.0,
+      "max_temp": 858.0,
+      "avg_temp": 82.6,
+      "reading_count": 17
+    },
+    {
+      "device_id": "sensor_003",
+      "min_temp": 16.3,
+      "max_temp": 971.0,
+      "avg_temp": 145.1,
+      "reading_count": 16
+    },
+    {
+      "device_id": "sensor_004",
+      "min_temp": 15.8,
+      "max_temp": 967.0,
+      "avg_temp": 93.8,
+      "reading_count": 17
+    }
+  ],
+  "anomalies": [
+    {
+      "device_id": "sensor_004",
+      "timestamp": 1640997322,
+      "temperature": 967.0
+    },
+    {
+      "device_id": "sensor_001",
+      "timestamp": 1641006312,
+      "temperature": 954.0
+    },
+    {
+      "device_id": "sensor_002",
+      "timestamp": 1641014006,
+      "temperature": 858.0
+    },
+    {
+      "device_id": "sensor_003",
+      "timestamp": 1641016580,
+      "temperature": 817.0
+    },
+    {
+      "device_id": "sensor_003",
+      "timestamp": 1641027265,
+      "temperature": 971.0
+    }
+  ],
+  "connectivity_issues": [
+    {
+      "device_id": "sensor_001",
+      "issue_type": "missing_data"
+    },
+    {
+      "device_id": "sensor_002",
+      "issue_type": "missing_data"
+    },
+    {
+      "device_id": "sensor_003",
+      "issue_type": "missing_data"
+    },
+    {
+      "device_id": "sensor_999",
+      "issue_type": "missing_data"
+    }
+  ],
+  "summary": {
+    "total_devices": 5,
+    "total_readings": 70,
+    "min_temperature": -20.0,
+    "max_temperature": 971.0,
+    "avg_temperature": 101.3,
+    "anomaly_count": 5,
+    "connectivity_issues_count": 4
+  }
+}root@770ce4292da5:/app# cat /app/sensor_report.txt
+IOT SENSOR ANALYSIS REPORT
+==========================
+Total Devices: 5
+Total Readings: 70
+Temperature Range: -20.0°C to 971.0°C
+Average Temperature: 101.3°C
+Anomalies Detected: 5
+Connectivity Issues: 4
+==========================
+root@770ce4292da5:/app#

@@ -1,0 +1,188 @@
+Current terminal state:
+New Terminal Output:
+
+root@12619e37a928:/app# cat << 'EOF' > /app/solution.py
+> import re
+> from collections import defaultdict
+>
+> def solve(lines: list[str]) -> str:
+>     parsed = []
+>     for line in lines:
+>         line = line.split('#')[0].strip()
+>         if not line:
+>             continue
+>         parts = [p for p in line.split(' ') if p]
+>         if len(parts) < 3:
+>             break
+>         idx_str, tx, op = parts[0], parts[1], parts[2]
+>         args = parts[3:]
+>
+>         if not re.match(r'^[1-9][0-9]*$', idx_str):
+>             break
+>         if not re.match(r'^[a-z0-9]{1,8}$', tx):
+>             break
+>         if op not in ('BEGIN', 'PREPARE', 'VOTE', 'COMMIT', 'ABORT', 'END', 'FENCE', 'EPOCH'):
+>             break
+>
+>         if op == 'VOTE':
+>             if len(args) != 1 or args[0] not in ('YES', 'NO'):
+>                 break
+>         elif op in ('FENCE', 'EPOCH'):
+>             if len(args) != 1 or not re.match(r'^[A-F0-9]{8}$', args[0]):
+>                 break
+>         else:
+>             if len(args) > 0:
+>                 break
+>         parsed.append((idx_str, tx, op, args))
+>
+>     shard_epochs = defaultdict(list)
+>     bad_shards = set()
+>     for _, tx, op, args in parsed:
+>         if op == 'EPOCH':
+>             shard = tx[0]
+>             val = int(args[0], 16)
+>             if shard_epochs[shard] and val <= shard_epochs[shard][-1]:
+>                 bad_shards.add(shard)
+>             shard_epochs[shard].append(val)
+>
+>     tx_events = defaultdict(list)
+>     for _, tx, op, args in parsed:
+>         if op != 'EPOCH':
+>             tx_events[tx].append((op, args))
+>
+>     out_bad = []
+>     out_ins = []
+>
+>     for tx, events in tx_events.items():
+>         shard = tx[0]
+>         if shard in bad_shards:
+>             out_bad.append(f'BAD {tx} BAD_EPOCH')
+>             continue
+>
+>         state = 'NEW'
+>         votes = set()
+>         last_fence = -1
+>         bad_reason = None
+>         inserted = []
+>
+>         had_prepare = False
+>         had_decision = False
+>         had_end = False
+>
+>         for op, args in events:
+>             if op == 'FENCE':
+>                 val = int(args[0], 16)
+>                 if val <= last_fence:
+>                     bad_reason = 'BAD_FENCE'
+>                     break
+>                 last_fence = val
+>             elif op == 'BEGIN':
+>                 if state != 'NEW':
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 state = 'BEGUN'
+>             elif op == 'PREPARE':
+>                 if state == 'NEW':
+>                     inserted.append('BEGIN')
+>                     state = 'PREPARED'
+>                 elif state == 'BEGUN':
+>                     state = 'PREPARED'
+>                 else:
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 had_prepare = True
+>             elif op == 'VOTE':
+>                 if state == 'NEW':
+>                     inserted.extend(['BEGIN', 'PREPARE'])
+>                     state = 'PREPARED'
+>                     had_prepare = True
+>                 elif state == 'BEGUN':
+>                     inserted.append('PREPARE')
+>                     state = 'PREPARED'
+>                     had_prepare = True
+>                 elif state != 'PREPARED':
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 votes.add(args[0])
+>                 if 'YES' in votes and 'NO' in votes:
+>                     bad_reason = 'BAD_VOTE'
+>                     break
+>             elif op == 'COMMIT':
+>                 if not had_prepare:
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 if state != 'PREPARED' or 'NO' in votes:
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 state = 'DECIDED_COMMIT'
+>                 had_decision = True
+>             elif op == 'ABORT':
+>                 if not had_prepare:
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'):
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 state = 'DECIDED_ABORT'
+>                 had_decision = True
+>             elif op == 'END':
+>                 if not had_decision:
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+>                     bad_reason = 'BAD_ORDER'
+>                     break
+>                 state = 'ENDED'
+>                 had_end = True
+>
+>         if bad_reason:
+>             out_bad.append(f'BAD {tx} {bad_reason}')
+>             continue
+>
+>         if state == 'NEW':
+>             inserted.append('BEGIN')
+>             state = 'BEGUN'
+>         if state == 'BEGUN':
+>             inserted.append('PREPARE')
+>             state = 'PREPARED'
+>         if state == 'PREPARED':
+>             if 'NO' in votes:
+>                 inserted.append('ABORT')
+>                 state = 'DECIDED_ABORT'
+>             else:
+>                 inserted.append('COMMIT')
+>                 state = 'DECIDED_COMMIT'
+>         if state in ('DECIDED_COMMIT', 'DECIDED_ABORT'):
+>             inserted.append('END')
+>             state = 'ENDED'
+>
+>         for op in inserted:
+>             out_ins.append((tx, op))
+>
+>     out_bad.sort()
+>     op_order = {'BEGIN': 0, 'PREPARE': 1, 'VOTE': 2, 'COMMIT': 3, 'ABORT': 4, 'END': 5, 'FENCE': 6, 'EPOCH': 7}
+>     out_ins.sort(key=lambda x: (x[0], op_order[x[1]]))
+>
+>     res = out_bad + [f'INS {tx} {op}' for tx, op in out_ins]
+>     if not res:
+>         return 'OK'
+>     return '\n'.join(res)
+> EOF
+root@12619e37a928:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN', '2 a1 EPOCH 0000000A', '3 a2 BEGIN', '4 a2 EPOCH 00000009', '5 b1 BEG
+IN', '6 b1 EPOCH 00000001']))"
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+root@12619e37a928:/app# python3 -c "from solution import solve; print(solve(['1 c1 BEGIN', '2 c1 PREPARE', '3 c1 VOTE YES', '4 c1 VOTE NO']))"
+BAD c1 BAD_VOTE
+root@12619e37a928:/app# python3 -c "from solution import solve; print(solve(['1 d1 BEGIN', '2 d1 END']))"
+BAD d1 BAD_ORDER
+root@12619e37a928:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN', '2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@12619e37a928:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

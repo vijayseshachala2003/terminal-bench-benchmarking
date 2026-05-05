@@ -1,0 +1,289 @@
+Current terminal state:
+New Terminal Output:
+
+root@5118d53c42ed:/app# ls -la
+total 0
+drwxr-xr-x. 2 root root  6 Apr 30 09:45 .
+drwxr-xr-x. 1 root root 74 Apr 30 11:59 ..
+root@5118d53c42ed:/app# sed -n '1,200p' solution.py 2>/dev/null || echo 'solution.py not found'
+solution.py not found
+root@5118d53c42ed:/app# cat > solution.py <<'PY'
+> import re
+> from dataclasses import dataclass
+> from typing import List, Optional, Tuple, Dict, Set
+>
+>
+> IDX_RE = re.compile(r"^[1-9][0-9]*$")
+> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+>
+> @dataclass
+> class Event:
+>     tx: str
+>     op: str
+>     arg: Optional[str] = None
+>
+>
+> def _parse_line(line: str) -> Optional[Event]:
+>     """Parse a single non-empty non-comment line.
+>
+>     Returns Event on success, None on malformed.
+>     """
+>     parts = line.split(" ")
+>     if len(parts) < 3:
+>         return None
+>     if any(p == "" for p in parts):
+>         # enforce single spaces (split would create empty tokens)
+>         return None
+>     idx, tx, op = parts[0], parts[1], parts[2]
+>     if not IDX_RE.match(idx):
+>         return None
+>     if not TX_RE.match(tx):
+>         return None
+>
+>     arg = None
+>     if op in {"BEGIN", "PREPARE", "COMMIT", "ABORT", "END"}:
+>         if len(parts) != 3:
+ >             return None
+>     elif op == "VOTE":
+>         if len(parts) != 4:
+>             return None
+>         if parts[3] not in {"YES", "NO"}:
+>             return None
+>         arg = parts[3]
+>     elif op in {"FENCE", "EPOCH"}:
+>         if len(parts) != 4:
+>             return None
+>         if not NONCE_RE.match(parts[3]):
+>             return None
+>         arg = parts[3]
+>     else:
+>         return None
+>
+>     return Event(tx=tx, op=op, arg=arg)
+>
+>
+> def solve(lines: List[str]) -> str:
+>     # 1) Valid prefix parsing with strict cutoff
+>     valid_events: List[Event] = []
+>     for raw in lines:
+>         if raw == "" or raw.startswith("#"):
+>             continue
+>         ev = _parse_line(raw)
+>         if ev is None:
+>             break
+>         valid_events.append(ev)
+>
+>     # 2) Shard-level EPOCH monotonicity; collect tx set and per-tx events
+>     shard_last_epoch: Dict[str, int] = {}
+>     shard_bad: Set[str] = set()
+>
+>     tx_events: Dict[str, List[Event]] = {}
+>     seen_txs: Set[str] = set()
+>
+>     for ev in valid_events:
+>         seen_txs.add(ev.tx)
+>         tx_events.setdefault(ev.tx, []).append(ev)
+>
+>         if ev.op == "EPOCH":
+>             shard = ev.tx[0]
+>             val = int(ev.arg, 16)  # type: ignore[arg-type]
+>             if shard in shard_bad:
+>                 continue
+>             if shard in shard_last_epoch:
+>                 if val <= shard_last_epoch[shard]:
+>                     shard_bad.add(shard)
+>                 else:
+>                     shard_last_epoch[shard] = val
+>             else:
+>                 shard_last_epoch[shard] = val
+>
+>     # 3) Per-tx analysis
+>     bad_reasons: Dict[str, str] = {}
+>     insertions: List[Tuple[str, str, Optional[str]]] = []  # (tx, op, arg)
+>
+>     def mark_bad(tx: str, reason: str) -> None:
+>         # If multiple reasons arise, keep the first encountered in this order of checks.
+>         if tx not in bad_reasons:
+>             bad_reasons[tx] = reason
+>
+>     for tx in sorted(seen_txs):
+>         shard = tx[0]
+>         if shard in shard_bad:
+>             mark_bad(tx, "BAD_EPOCH")
+>             continue
+>
+>         evs = tx_events.get(tx, [])
+>
+>         # Track per-tx fence monotonicity (across all FENCE events)
+>         last_fence: Optional[int] = None
+>         fence_bad = False
+>
+>         # Track votes consistency (only meaningful if any votes appear)
+>         vote_seen: Optional[str] = None
+>         vote_conflict = False
+>
+>         # Track presence of key ops in the valid prefix (regardless of legality)
+>         seen_begin = False
+>         seen_prepare = False
+>         seen_commit = False
+>         seen_abort = False
+>         seen_end = False
+>
+>         # State machine to detect irreparable illegal transitions (BAD_ORDER)
+>         state = "NEW"
+>
+>         for ev in evs:
+>             if ev.op == "EPOCH":
+>                 continue  # ignored by per-tx protocol
+>
+>             if ev.op == "FENCE":
+>                 val = int(ev.arg, 16)  # type: ignore[arg-type]
+>                 if last_fence is not None and val <= last_fence:
+>                     fence_bad = True
+>                 last_fence = val
+>                 continue
+>
+>             if ev.op == "BEGIN":
+>                 seen_begin = True
+>                 if state != "NEW":
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 state = "BEGUN"
+>             elif ev.op == "PREPARE":
+>                 seen_prepare = True
+>                 if state != "BEGUN":
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 state = "PREPARED"
+>             elif ev.op == "VOTE":
+>                 if state != "PREPARED":
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 if vote_seen is None:
+>                     vote_seen = ev.arg
+>                 elif vote_seen != ev.arg:
+>                     vote_conflict = True
+>             elif ev.op == "COMMIT":
+>                 seen_commit = True
+>                 if state != "PREPARED":
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 # COMMIT only if all observed votes are YES (or none)
+>                 if vote_seen == "NO":
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 state = "DECIDED_COMMIT"
+>             elif ev.op == "ABORT":
+>                 seen_abort = True
+>                 if state not in {"BEGUN", "PREPARED", "DECIDED_ABORT"}:
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 state = "DECIDED_ABORT"
+>             elif ev.op == "END":
+>                 seen_end = True
+>                 if state not in {"DECIDED_COMMIT", "DECIDED_ABORT"}:
+>                     mark_bad(tx, "BAD_ORDER")
+>                     break
+>                 state = "ENDED"
+>             else:
+>                 # should be unreachable due to parser
+>                 mark_bad(tx, "BAD_ORDER")
+>                 break
+>
+>         if tx in bad_reasons:
+>             continue
+>
+>         if fence_bad:
+>             mark_bad(tx, "BAD_FENCE")
+>             continue
+>
+>         if vote_conflict:
+>             mark_bad(tx, "BAD_VOTE")
+>             continue
+>
+>         # 4) Bespoke irreparable cases (spec section 6)
+>         has_decision = seen_commit or seen_abort
+>         if seen_end and not has_decision:
+>             mark_bad(tx, "BAD_ORDER")
+>             continue
+>         if seen_commit and vote_seen == "NO":
+>             mark_bad(tx, "BAD_ORDER")
+>             continue
+>         if has_decision and not seen_prepare:
+>             mark_bad(tx, "BAD_ORDER")
+>             continue
+>
+>         # 5) Compute canonical minimal insertions
+>         # Prerequisites based on presence ordering issues: if PREPARE exists but no BEGIN before it, etc.
+>         # We already would have marked BAD_ORDER for illegal transitions in the observed sequence.
+>         # Now only add missing prerequisites if they never existed at all in prefix.
+>         if not seen_begin:
+>             insertions.append((tx, "BEGIN", None))
+>             seen_begin = True
+>         if not seen_prepare:
+>             # Only needed if there are votes or decisions missing prepare? But decision-without-prepare already BAD.
+>             # For repair, if any vote exists, prepare is required; otherwise, prepare is required to reach decision.
+>             needs_prepare = True
+>             if needs_prepare:
+>                 insertions.append((tx, "PREPARE", None))
+>                 seen_prepare = True
+>
+>         # Decision handling
+>         if not has_decision:
+>             if vote_seen == "NO":
+>                 insertions.append((tx, "ABORT", None))
+>                 seen_abort = True
+>             else:
+>                 insertions.append((tx, "COMMIT", None))
+>                 seen_commit = True
+>             has_decision = True
+>
+>         if not seen_end:
+>             insertions.append((tx, "END", None))
+>
+>     # 6) Output formatting
+>     bad_lines = [f"BAD {tx} {reason}" for tx, reason in sorted(bad_reasons.items())]
+>
+>     ins_lines_sorted = sorted(
+>         insertions,
+>         key=lambda t: (t[0], OP_ORDER[t[1]], "" if t[2] is None else t[2]),
+>     )
+>     ins_lines = [
+>         f"INS {tx} {op}" + ("" if arg is None else f" {arg}")
+>         for tx, op, arg in ins_lines_sorted
+>     ]
+>
+>     out = bad_lines + ins_lines
+>     if not out:
+>         return "OK"
+>     return "\n".join(out)
+> PY
+root@5118d53c42ed:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@5118d53c42ed:/app# python -c "from solution import solve; lines=['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO']; print(solve(lines))"
+BAD c1 BAD_VOTE
+root@5118d53c42ed:/app# python -c "from solution import solve; lines=['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','6 b1 E
+POCH 00000001']; print(solve(lines))"
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+root@5118d53c42ed:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

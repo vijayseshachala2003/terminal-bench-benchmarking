@@ -1,0 +1,266 @@
+New Terminal Output:
+
+root@601ce129bfa5:/app# cat > /app/optimize.py <<'PY'
+> import glob, re, json, math
+> from collections import defaultdict
+> from datetime import datetime
+>
+> META_PATH = '/app/query_metadata.json'
+> LOG_GLOB = '/app/mysql_slow_*.log'
+> OUT_JSON = '/app/optimization.json'
+> OUT_TXT = '/app/recommendations.txt'
+>
+> with open(META_PATH) as f:
+>     meta = json.load(f)
+> BUDGET = float(meta.get('budget', 0))
+> TABLES = meta.get('tables', {})
+>
+> # ---------------- Parsing ----------------
+>
+> time_re = re.compile(r'^# Time: (.+)$')
+> qt_re = re.compile(r'^# Query_time: ([0-9.]+)\b')
+> set_ts_re = re.compile(r'^SET timestamp=(\d+);')
+>
+>
+R> def parse_time_to_epoch(s: str):
+>     # Example: 2026-04-30 09:49:51.021094+0000
+>     s = s.strip()
+>     try:
+>         dt = datetime.strptime(s, '%Y-%m-%d %H:%M:%S.%f%z')
+>         return int(dt.timestamp())
+>     except Exception:
+>         try:
+>             dt = datetime.strptime(s, '%Y-%m-%d %H:%M:%S%z')
+>             return int(dt.timestamp())
+>         except Exception:
+>             return None
+>
+>
+> def parse_logs():
+>     events = []  # {ts:int, qt:float, sql:str}
+>     for path in sorted(glob.glob(LOG_GLOB)):
+>         with open(path, 'r', errors='replace') as f:
+>             cur_time = None
+>             cur_qt = None
+>             cur_set_ts = None
+>             for line in f:
+>                 line = line.rstrip('\n')
+>                 m = time_re.match(line)
+>                 if m:
+(>                     cur_time = parse_time_to_epoch(m.group(1))
+>                     cur_qt = None
+>                     cur_set_ts = None
+>                     continue
+>                 m = qt_re.match(line)
+>                 if m:
+>                     try:
+>                         cur_qt = float(m.group(1))
+>                     except Exception:
+>                         cur_qt = None
+>                     continue
+>                 m = set_ts_re.match(line)
+>                 if m:
+>                     cur_set_ts = int(m.group(1))
+>                     continue
+>
+ >                 # SQL line: skip comments and other directives
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 if line.lower().startswith('use '):
+>                     continue
+>                 if line.lower().startswith('set timestamp='):
+>                     continue
+>
+>                 # Heuristic: SQL statement ends with ';' in one line in this fixture
+>                 if ';' in line:
+>                     sql = line.strip()
+>                     if sql.endswith(';'):
+>                         sql = sql[:-1]
+>                     ts = cur_set_ts if cur_set_ts is not None else cur_time
+>                     if ts is None or cur_qt is None:
+>                         continue
+>                     events.append({'ts': int(ts), 'qt': float(cur_qt), 'sql': sql})
+>     return events
+>
+> # ---------------- Normalization ----------------
+>
+> # Replace IN (...) lists first (including strings/numbers)
+> in_list_re = re.compile(r'\bIN\s*\((?:[^)(]*|\([^)]*\))*\)', re.IGNORECASE)
+> str_re = re.compile(r"'(?:\\'|''|[^'])*'")
+> # numbers: integers/decimals (avoid parts of identifiers)
+> num_re = re.compile(r'(?<![A-Z0-9_])\d+(?:\.\d+)?(?![A-Z0-9_])', re.IGNORECASE)
+>
+>
+> def normalize_sql(sql: str) -> str:
+>     s = sql.strip()
+>     s = re.sub(r'\s+', ' ', s)
+ed_>
+>     # Standardize IN lists to IN (?)
+>     def _in_sub(m):
+>         return 'IN (?)'
+>     s = in_list_re.sub(_in_sub, s)
+>
+>     # Replace strings then numbers
+>     s = str_re.sub('?', s)
+>     s = num_re.sub('?', s)
+>
+>     # Normalize spacing around operators and punctuation
+>     # commas
+>     s = re.sub(r'\s*,\s*', ', ', s)
+>     # equals/comp operators
+>     s = re.sub(r'\s*(=|>=|<=|<>|!=|<|>)\s*', r' \1 ', s)
+>     # parentheses spacing
+>     s = re.sub(r'\(\s*', '(', s)
+>     s = re.sub(r'\s*\)', ')', s)
+>     s = re.sub(r'\s+', ' ', s).strip()
+>
+>     return s.upper()
+>
+> # ---------------- SQL table/alias extraction ----------------
+>
+> from_join_re = re.compile(r'\bFROM\s+([A-Z0-9_]+)(?:\s+([A-Z0-9_]+))?', re.IGNORECASE)
+> join_re = re.compile(r'\bJOIN\s+([A-Z0-9_]+)(?:\s+([A-Z0-9_]+))?', re.IGNORECASE)
+>
+>
+> def alias_map(norm_sql: str):
+>     # norm_sql is uppercase; aliases are uppercase too
+>     amap = {}
+>     m = from_join_re.search(norm_sql)
+>     if m:
+>         t, a = m.group(1), m.group(2)
+>         amap[t] = t
+>         if a and a not in ('ON', 'WHERE', 'ORDER', 'GROUP', 'LIMIT'):
+>             amap[a] = t
+>     for m in join_re.finditer(norm_sql):
+>         t, a = m.group(1), m.group(2)
+>         amap[t] = t
+>         if a and a not in ('ON', 'WHERE', 'ORDER', 'GROUP', 'LIMIT'):
+>             amap[a] = t
+>     return amap
+>
+> # Extract columns from WHERE, ON, ORDER BY
+> where_clause_re = re.compile(r'\bWHERE\b(.+?)(?:\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)', re.IGNORECASE)
+> on_clause_re = re.compile(r'\bON\b(.+?)(?:\bJOIN\b|\bWHERE\b|\bORDER\s+B
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+    'cost': cand['cost'],
+>         'reason': 'high_impact'
+>     })
+>     budget_used += cost
+>     per_table[t] += 1
+>
+> recommended.sort(key=lambda x: (-x['impact_score'], x['table'] + '(' + ','.join(x['columns']) + ')'))
+>
+> total_impact = round1(sum(x['impact_score'] for x in recommended))
+> budget_used_r = round1(budget_used)
+>
+> # ---------------- Write JSON ----------------
+>
+> out = {
+>     'normalized_patterns': normalized_patterns,
+>     'index_candidates': index_candidates,
+>     'temporal_correlations': correlations_top,
+>     'recommended_indexes': recommended,
+>     'total_budget_used': budget_used_r,
+>     'total_impact': total_impact,
+> }
+>
+> with open(OUT_JSON, 'w') as f:
+>     json.dump(out, f, indent=2)
+>
+> # ---------------- Write text report ----------------
+>
+> total_slow_queries = len(slow_events)
+> unique_patterns = len(normalized_patterns)
+>
+> lines = []
+> lines.append('ADVANCED MYSQL OPTIMIZATION ANALYSIS')
+> lines.append('=====================================')
+> lines.append(f'Total Slow Queries: {total_slow_queries}')
+> lines.append(f'Unique Query Patterns: {unique_patterns}')
+> lines.append(f'Total Budget: {int(BUDGET)} points')
+> lines.append(f'Budget Used: {budget_used_r:.1f} points')
+> lines.append('')
+> lines.append('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):')
+>
+> for i, pinfo in enumerate(normalized_patterns[:5], start=1):
+>     p = pinfo['pattern']
+>     impact = pattern_impact_for_text.get(p, 0.0)
+>     freq = pinfo['frequency']
+>     avg = pinfo['avg_execution_time']
+>     total = pinfo['total_time']
+>     lines.append(f"{i}. {trunc60(p)} (Impact: {impact:.1f}, Freq: {freq}, Avg: {avg:.1f}s, Total: {total:.1f}s)")
+>
+> lines.append('')
+> lines.append('TEMPORAL CORRELATIONS:')
+> if correlations_top:
+>     for i, c in enumerate(correlations_top, start=1):
+>         lines.append(f"{i}. Pattern Pair (Strength: {c['correlation_strength']}):")
+>         lines.append(f"   - {trunc60(c['pattern1'])}")
+>         lines.append(f"   - {trunc60(c['pattern2'])}")
+> else:
+>     lines.append('1. Pattern Pair (Strength: 0):')
+>     lines.append('   - N/A')
+>     lines.append('   - N/A')
+>
+> lines.append('')
+> lines.append('RECOMMENDED INDEXES (5 max):')
+> if recommended:
+>     for i, r in enumerate(recommended, start=1):
+>         cols = ','.join(r['columns'])
+>         lines.append(f"{i}. {r['table']}({cols}) - Impact: {r['impact_score']:.1f}, Cost: {r['cost']:.1f} [{r['reason']}]")
+> else:
+>     lines.append('1. N/A - Impact: 0.0, Cost: 0.0 [high_impact]')
+>
+> lines.append('')
+> lines.append('OPTIMIZATION SUMMARY:')
+> lines.append(f'- Estimated total impact reduction: {total_impact:.1f}')
+> lines.append(f'- Remaining budget: {round1(BUDGET - budget_used):.1f} points')
+> lines.append(f'- Tables optimized: {len([t for t,c in per_table.items() if c>0])}')
+>
+> with open(OUT_TXT, 'w') as f:
+>     f.write('\n'.join(lines) + '\n')
+>
+> PY
+root@601ce129bfa5:/app# python3 /app/optimize.py
+root@601ce129bfa5:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('patterns',len(d['normalized_patterns']),'cands',len(d['index_
+candidates']),'reco',len(d['recommended_indexes']));print('budget_used',d['total_budget_used'],'impact',d['total_impact'])"
+patterns 18 cands 10 reco 3
+budget_used 873.3 impact 119.0
+root@601ce129bfa5:/app# head -n 80 /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 873.3 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 6.1, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 5.8, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE STATUS = ?
+2. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE COUNTRY = ?
+3. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+
+RECOMMENDED INDEXES (5 max):
+1. orders(id) - Impact: 53.8, Cost: 230.8 [high_impact]
+2. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+3. orders(id,user_id) - Impact: 31.4, Cost: 450.9 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 119.0
+- Remaining budget: 126.7 points
+- Tables optimized: 2
+root@601ce129bfa5:/app# python3 -m json.tool /app/optimization.json >/dev/null && echo "optimization.json valid"
+optimization.json valid
+root@601ce129bfa5:/app#

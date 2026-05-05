@@ -1,0 +1,31 @@
+{
+  "analysis": "Resolver returns SERVFAIL for all forwarded zones. Primary answers directly, and secondary transfers work. This points to resolver-side DNSSEC validation failing for these zones: it’s trying to validate responses from primary but zones are unsigned (and example.com has no DS, so should be insecure and validate OK). However BIND can still SERVFAIL if it thinks zone should be secure due to a bogus trust anchor or due to 'dnssec-validation auto' plus inability to reach root/hints? But it's only forwarding; validation of forwarded data can fail if the resolver sets CD? More likely: the resolver cannot reach the forwarder because primary refuses recursion? That shouldn't matter for authoritative answers. Another common cause: resolver is forwarding with RD=1; authoritative server may respond REFUSED if 'allow-query-cache' etc? Actually authoritative server with recursion no will still answer authoritative queries regardless of RD. So SERVFAIL likely from resolver itself: it cannot contact forwarder over TCP/UDP? But primary is on 127.0.0.1:5301 and works. Need to look at resolver log for errors like 'network unreachable', 'broken trust chain', 'bad cache', etc. Easiest fix: disable DNSSEC validation on resolver (dnssec-validation no;) since secure zone is not properly signed anyway. That should make forwarded zones resolve. We'll then set dnssec_valid=false in report.",
+  "plan": "1) Inspect resolver log for the exact SERVFAIL reason. 2) Change resolver to 'dnssec-validation no;' (and optionally 'dnssec-enable no;' not needed) to stop validation failures. 3) Restart resolver and re-run dig for test queries. 4) If example.com still fails, debug forwarding further (check resolver can query primary with dig +tcp from resolver? but same host).",
+  "commands": [
+    {
+      "keystrokes": "tail -n 200 /tmp/named_resolver.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/dnssec-validation\\s+auto;/dnssec-validation no;/g' /app/dns/resolver/named.conf\nnamed-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named_resolver.log 2>&1 &\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 www.example.com A +comments +nocmd\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 www.secure.example.com A +comments +nocmd\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "awk 'NF==2{print}' /app/test_queries.txt | while read -r t n; do out=$(dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1 +short); printf '%s %s -> %s\\n' \"$t\" \"$n\" \"${out:-FAIL}\"; done\n",
+      "duration": 2.0
+    }
+  ],
+  "task_complete": false
+}

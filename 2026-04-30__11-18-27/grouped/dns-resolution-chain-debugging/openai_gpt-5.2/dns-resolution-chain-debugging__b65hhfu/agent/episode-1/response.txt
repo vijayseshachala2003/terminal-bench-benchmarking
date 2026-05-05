@@ -1,0 +1,71 @@
+{
+  "analysis": "Multiple blocking issues prevent services from starting and zones from loading: (1) primary named.conf TSIG secret is invalid base64, so named-checkconf fails. (2) secondary named.conf has a syntax error near a ';' (likely the leading '; BUG:' comment style is fine, so error may be elsewhere) and also cannot use /var/cache/bind because it is not writable in this environment. (3) resolver named.conf has a syntax error ('}' expected near ';') and also fails due to /var/cache/bind not writable. (4) secure.example.com signed zone is broken/expired with multiple base64 errors; it will not load. (5) example.com zone loads but has delegation/glue warnings for sub.example.com NS targets without A/AAAA; may cause intermittent resolution depending on resolver behavior. We must fix directory paths, config syntax, TSIG key consistency/validity, and DNSSEC for secure zone (either re-sign properly or serve unsigned with validation handled appropriately).",
+  "plan": "1) Fix the non-writable working directory by changing all three named.conf options { directory ... } to use a writable path under /app (e.g., /app/dns/{primary,secondary,resolver}/cache) and create those directories. 2) Fix primary TSIG secret to valid base64 and ensure secondary uses the exact same secret; simplest is to generate a new TSIG secret with dnssec-keygen/tsig-keygen and paste into both configs. 3) Fix syntax errors in secondary and resolver configs (likely missing brace/semicolon). Re-run named-checkconf until clean. 4) Fix secure.example.com DNSSEC: the existing .signed file is invalid/expired; regenerate a correct signed zone using dnssec-signzone with new KSK/ZSK, update named.conf to serve the new .signed, and ensure the resolver can validate by configuring a trust anchor for secure.example.com (managed-keys for root won’t help for an internal zone). We'll add a trusted-keys or managed-keys statement for secure.example.com using the new DNSKEY. 5) Address example.com glue warnings by adding A records for ns1.sub.example.com and ns2.sub.example.com (or make them in-zone and provide glue) so delegation is consistent. 6) Start all three named instances, verify AXFR from secondary works for both zones, run all /app/test_queries.txt through resolver, and confirm DNSSEC validation (AD flag / +dnssec) for secure.example.com. 7) Write /app/dns_health.json accordingly.",
+  "commands": [
+    {
+      "keystrokes": "set -euo pipefail\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/cache /app/dns/secondary/cache /app/dns/resolver/cache /app/dns/secondary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'directory\\|secret\\|max-ncache-ttl\\|forwarders\\|zone \"' -n /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/primary/cache\";#' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/secondary/cache\";#' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/resolver/cache\";#' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tsig-keygen -a hmac-sha256 transfer-key | tee /tmp/transfer-key.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "NEWSECRET=$(awk -F'\"' '/secret/{print $2}' /tmp/transfer-key.conf); echo \"$NEWSECRET\" | wc -c\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(key\\s+\"transfer-key\"\\s*\\{\\s*algorithm\\s+hmac-sha256;\\s*secret\\s+\")[^\"]*(\";\\s*\\};)/$1'\"$ENV{NEWSECRET}\"'$2/s' /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "export NEWSECRET=$(awk -F'\"' '/secret/{print $2}' /tmp/transfer-key.conf)\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(key\\s+\"transfer-key\"\\s*\\{\\s*algorithm\\s+hmac-sha256;\\s*secret\\s+\")[^\"]*(\";\\s*\\};)/$1'\"$ENV{NEWSECRET}\"'$2/s' /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/secondary/named.conf | sed -n '1,140p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

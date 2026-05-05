@@ -1,0 +1,162 @@
+New Terminal Output:
+
+root@767fb16c16ca:/app/dns/primary# ls -la /app/dns/secondary && echo '---' && (wc -l /app/dns/secondary/named.conf; sed -n '1,200p' /app/dns/secondary/named.co
+nf)
+total 0
+drwxr-xr-x. 1 root root 37 Apr 30 12:15 .
+drwxr-xr-x. 1 root root 54 Apr 30 09:39 ..
+drwxr-xr-x. 2 root root  6 Apr 30 12:15 cache
+drwxr-xr-x. 1 root root 26 Apr 30 09:39 keys
+-rw-r--r--. 1 root root  0 Apr 30 12:15 named.conf
+drwxr-xr-x. 1 root root  6 Apr 30 09:47 zones
+---
+0 /app/dns/secondary/named.conf
+root@767fb16c16ca:/app/dns/primary# if [ ! -s /app/dns/secondary/named.conf ]; then cat > /app/dns/secondary/named.conf <<'EOF'
+> options {
+>     directory "/app/dns/secondary/cache";
+>     listen-on port 5302 { 127.0.0.1; };
+>     listen-on-v6 { none; };
+>     allow-query { any; };
+>     recursion no;
+>     dnssec-validation auto;
+>     pid-file "/var/run/named/named-secondary.pid";
+> };
+>
+> key "transfer-key" {
+>     algorithm hmac-sha256;
+>     secret "QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=";
+> };
+>
+> server 127.0.0.1 {
+>     keys { transfer-key; };
+> };
+>
+> zone "example.com" {
+>     type slave;
+>     file "/app/dns/secondary/zones/example.com.zone";
+>     masters port 5301 { 127.0.0.1 key transfer-key; };
+> };
+>
+> zone "secure.example.com" {
+>     type slave;
+>     file "/app/dns/secondary/zones/secure.example.com.zone";
+>     masters port 5301 { 127.0.0.1 key transfer-key; };
+> };
+>
+> logging {
+>     channel default_log {
+>         file "/var/log/named/named-secondary.log" versions 3 size 5m;
+>         severity info;
+>         print-time yes;
+>     };
+>     category default { default_log; };
+> };
+> EOF
+> fi
+root@767fb16c16ca:/app/dns/primary# named-checkconf /app/dns/secondary/named.conf
+root@767fb16c16ca:/app/dns/primary# perl -0777 -i -pe 's/(\(\s*\n\s*2024010101\s*; Serial)/("\n")/s' /dev/null 2>/dev/null || true
+root@767fb16c16ca:/app/dns/primary# perl -i -pe 's/(\s*2024010101\s*; Serial)/2024010102      ; Serial/; s/(86400\s*\)\s*; Negative Cache TTL.*)/300 )
+ ; Negative Cache TTL/;' /app/dns/primary/zones/example.com.zone
+root@767fb16c16ca:/app/dns/primary# perl -i -pe 's/^a\s+IN\s+CNAME\s+b\.example\.com\./a       IN      A       192.168.1.30/; s/^b\s+IN\s+CNAME\s+a\.example\.co
+m\./b       IN      A       192.168.1.31/' /app/dns/primary/zones/example.com.zone
+root@767fb16c16ca:/app/dns/primary# grep -n '^sub\s' -n /app/dns/primary/zones/example.com.zone
+26:sub     IN      NS      ns1.sub.example.com.
+27:sub     IN      NS      ns2.sub.example.com.
+root@767fb16c16ca:/app/dns/primary# cat >> /app/dns/primary/zones/example.com.zone <<'EOF'
+>
+> ; Glue for delegated sub.example.com nameservers
+> ns1.sub IN      A       192.168.1.40
+> ns2.sub IN      A       192.168.1.41
+> EOF
+root@767fb16c16ca:/app/dns/primary# named-checkzone example.com /app/dns/primary/zones/example.com.zone
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: loaded serial 2024010102
+OK
+root@767fb16c16ca:/app/dns/primary# awk '$4=="DNSKEY" && $5=="257"{print; exit}' /app/dns/primary/zones/secure.example.com.zone.signed > /tmp/secure.ksk.dnskey
+&& cat /tmp/secure.ksk.dnskey
+root@767fb16c16ca:/app/dns/primary# KSKLINE=$(cat /tmp/secure.ksk.dnskey); grep -q '^trusted-keys' /app/dns/resolver/named.conf || perl -0777 -i -pe 's/\};\n\nl
+ogging/\n\ntrusted-keys {\n    '"$KSKLINE"'\n};\n\nlogging/s' /app/dns/resolver/named.conf
+root@767fb16c16ca:/app/dns/primary# named-checkconf /app/dns/resolver/named.conf
+/app/dns/resolver/named.conf:18: unknown option 'trusted-keys'
+/app/dns/resolver/named.conf:22: unknown option 'logging'
+/app/dns/resolver/named.conf:30: '}' expected near end of file
+root@767fb16c16ca:/app/dns/primary# pkill named || true
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &
+[1] 1415
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &
+[2] 1433
+[1]   Exit 1                  named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &
+[3] 1452
+[2]   Exit 1                  named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1
+root@767fb16c16ca:/app/dns/primary# ss -lntup | grep -E ':(5300|5301|5302)\b' || true
+[3]+  Exit 1                  named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1
+root@767fb16c16ca:/app/dns/primary# dig @127.0.0.1 -p 5301 example.com SOA +noall +answer
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+
+; <<>> DiG 9.18.39-0ubuntu0.22.04.3-Ubuntu <<>> @127.0.0.1 -p 5301 example.com SOA +noall +answer
+
+[... output limited to 10000 bytes; 71 interior bytes omitted ...]
+ion denied
+30-Apr-2026 12:16:50.702 sizing zone task pool based on 2 zones
+30-Apr-2026 12:16:50.722 obtaining root key for view _default from '/etc/bind/bind.keys'
+30-Apr-2026 12:16:50.722 set up managed keys zone for view _default, file 'managed-keys.bind'
+30-Apr-2026 12:16:50.742 configuring command channel from '/etc/bind/rndc.key'
+30-Apr-2026 12:16:50.742 open: /etc/bind/rndc.key: permission denied
+30-Apr-2026 12:16:50.752 command channel listening on 127.0.0.1#953
+30-Apr-2026 12:16:50.752 configuring command channel from '/etc/bind/rndc.key'
+30-Apr-2026 12:16:50.752 open: /etc/bind/rndc.key: permission denied
+30-Apr-2026 12:16:50.752 command channel listening on ::1#953
+30-Apr-2026 12:16:50.752 not using config file logging statement for logging due to -g option
+30-Apr-2026 12:16:50.752 checking logging configuration failed: permission denied
+30-Apr-2026 12:16:50.772 loading configuration: permission denied
+30-Apr-2026 12:16:50.772 exiting (due to fatal error)
+root@767fb16c16ca:/app/dns/primary# tail -n 120 /tmp/named-resolver.log
+30-Apr-2026 12:16:51.182 starting BIND 9.18.39-0ubuntu0.22.04.3-Ubuntu (Extended Support Version) <id:>
+30-Apr-2026 12:16:51.182 running on Linux x86_64 6.1.159-181.297.amzn2023.x86_64 #1 SMP PREEMPT_DYNAMIC Mon Dec 22 22:31:59 UTC 2025
+30-Apr-2026 12:16:51.182 built with  '--build=x86_64-linux-gnu' '--prefix=/usr' '--includedir=${prefix}/include' '--mandir=${prefix}/share/man' '--infodir=${pre
+fix}/share/info' '--sysconfdir=/etc' '--localstatedir=/var' '--disable-option-checking' '--disable-silent-rules' '--libdir=${prefix}/lib/x86_64-linux-gnu' '--ru
+nstatedir=/run' '--disable-maintainer-mode' '--disable-dependency-tracking' '--libdir=/usr/lib/x86_64-linux-gnu' '--sysconfdir=/etc/bind' '--with-python=python3
+' '--localstatedir=/' '--enable-threads' '--enable-largefile' '--with-libtool' '--enable-shared' '--disable-static' '--with-gost=no' '--with-openssl=/usr' '--wi
+th-gssapi=yes' '--with-libidn2' '--with-json-c' '--with-lmdb=/usr' '--with-gnu-ld' '--with-maxminddb' '--with-atf=no' '--enable-ipv6' '--enable-rrl' '--enable-f
+ilter-aaaa' '--disable-native-pkcs11' 'build_alias=x86_64-linux-gnu' 'CFLAGS=-g -O2 -ffile-prefix-map=/build/bind9-xkiknB/bind9-9.18.39=. -flto=auto -ffat-lto-o
+bjects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-strict-aliasing -fno-delete-null-pointer-checks -DNO_VERSION_
+DATE -DDIG_SIGCHASE' 'LDFLAGS=-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -flto=auto -Wl,-z,relro -Wl,-z,now -ledit' 'CPPFLAGS=-Wdate-time -D_FORTIFY_
+SOURCE=2'
+30-Apr-2026 12:16:51.182 running as: named -c /app/dns/resolver/named.conf -g
+30-Apr-2026 12:16:51.182 compiled by GCC 11.4.0
+30-Apr-2026 12:16:51.182 compiled with OpenSSL version: OpenSSL 3.0.2 15 Mar 2022
+30-Apr-2026 12:16:51.182 linked to OpenSSL version: OpenSSL 3.0.2 15 Mar 2022
+30-Apr-2026 12:16:51.182 compiled with libuv version: 1.43.0
+30-Apr-2026 12:16:51.182 linked to libuv version: 1.43.0
+30-Apr-2026 12:16:51.182 compiled with libxml2 version: 2.9.13
+30-Apr-2026 12:16:51.182 linked to libxml2 version: 20913
+30-Apr-2026 12:16:51.182 compiled with json-c version: 0.15
+30-Apr-2026 12:16:51.182 linked to json-c version: 0.15
+30-Apr-2026 12:16:51.182 compiled with zlib version: 1.2.11
+30-Apr-2026 12:16:51.182 linked to zlib version: 1.2.11
+30-Apr-2026 12:16:51.182 ----------------------------------------------------
+30-Apr-2026 12:16:51.182 BIND 9 is maintained by Internet Systems Consortium,
+30-Apr-2026 12:16:51.182 Inc. (ISC), a non-profit 501(c)(3) public-benefit
+30-Apr-2026 12:16:51.182 corporation.  Support and training for BIND 9 are
+30-Apr-2026 12:16:51.182 available at https://www.isc.org/support
+30-Apr-2026 12:16:51.182 ----------------------------------------------------
+30-Apr-2026 12:16:51.182 found 4 CPUs, using 4 worker threads
+30-Apr-2026 12:16:51.182 using 4 UDP listeners per interface
+30-Apr-2026 12:16:51.182 DNSSEC algorithms: RSASHA1 NSEC3RSASHA1 RSASHA256 RSASHA512 ECDSAP256SHA256 ECDSAP384SHA384 ED25519 ED448
+30-Apr-2026 12:16:51.182 DS algorithms: SHA-1 SHA-256 SHA-384
+30-Apr-2026 12:16:51.182 HMAC algorithms: HMAC-MD5 HMAC-SHA1 HMAC-SHA224 HMAC-SHA256 HMAC-SHA384 HMAC-SHA512
+30-Apr-2026 12:16:51.182 TKEY mode 2 support (Diffie-Hellman): yes
+30-Apr-2026 12:16:51.182 TKEY mode 3 support (GSS-API): yes
+30-Apr-2026 12:16:51.192 the initial working directory is '/app/dns/primary'
+30-Apr-2026 12:16:51.192 loading configuration from '/app/dns/resolver/named.conf'
+30-Apr-2026 12:16:51.192 the working directory is now '/app/dns/resolver/cache'
+30-Apr-2026 12:16:51.192 /app/dns/resolver/named.conf:18: unknown option 'trusted-keys'
+30-Apr-2026 12:16:51.192 /app/dns/resolver/named.conf:22: unknown option 'logging'
+30-Apr-2026 12:16:51.192 /app/dns/resolver/named.conf:30: '}' expected near end of file
+30-Apr-2026 12:16:51.202 loading configuration: unexpected token
+30-Apr-2026 12:16:51.202 exiting (due to fatal error)
+root@767fb16c16ca:/app/dns/primary#

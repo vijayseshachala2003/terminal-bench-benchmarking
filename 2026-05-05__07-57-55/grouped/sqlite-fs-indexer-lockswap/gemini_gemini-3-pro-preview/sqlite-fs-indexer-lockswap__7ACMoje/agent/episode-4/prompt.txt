@@ -1,0 +1,146 @@
+Current terminal state:
+New Terminal Output:
+
+root@537e870c2837:/app# cat << 'EOF' > /app/app/indexer.py
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import re
+> import time
+>
+> def glob_to_regex(pattern):
+>     # ** means two literal * characters
+>     # * means zero or more characters except /
+>     # Escape other regex specials
+>     parts = []
+>     i = 0
+>     while i < len(pattern):
+>         if pattern[i:i+2] == '**':
+>             parts.append(r'\*\*')
+>             i += 2
+>         elif pattern[i] == '*':
+>             parts.append(r'[^/]*')
+>             i += 1
+>         else:
+>             parts.append(re.escape(pattern[i]))
+>             i += 1
+>     return ''.join(parts)
+>
+> def compile_ignore_patterns(ignore_file='/data/ignore.txt'):
+>     if not os.path.exists(ignore_file):
+>         return []
+>
+>     patterns = []
+>     with open(ignore_file, 'r', encoding='utf-8') as f:
+>         for line in f:
+>             line = line.strip()
+>             if not line or line.startswith('#'):
+>                 continue
+>
+>             line = unicodedata.normalize('NFC', line)
+>
+>             if line.startswith('/'):
+>                 # Match full relative path
+>                 regex = '^' + glob_to_regex(line[1:]) + '$'
+>                 patterns.append(re.compile(regex))
+>             elif '/' not in line:
+>                 # Match any component
+>                 regex = '^' + glob_to_regex(line) + '$'
+>                 patterns.append((re.compile(regex), 'component'))
+>             else:
+>                 # Match full relative path or suffix starting after /
+>                 regex = '(^|/)' + glob_to_regex(line) + '$'
+>                 patterns.append(re.compile(regex))
+>     return patterns
+>
+> def is_ignored(rel_path, patterns):
+>     components = rel_path.split('/')
+>     for p in patterns:
+>         if isinstance(p, tuple) and p[1] == 'component':
+>             if any(p[0].match(c) for c in components):
+>                 return True
+>         else:
+>             if p.match(rel_path):
+>                 return True
+>     return False
+>
+> def hash_file(path):
+>     h = hashlib.sha256()
+>     try:
+>         with open(path, 'rb') as f:
+>             while chunk := f.read(8192):
+>                 h.update(chunk)
+>     except OSError:
+>         return None
+>     return h.hexdigest()
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     patterns = compile_ignore_patterns()
+>
+>     files_to_index = {}
+>
+>     for root, dirs, files in os.walk(root_dir):
+>         # Do not follow symlinks
+>         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+>
+>         for f in files:
+>             full_path = os.path.join(root, f)
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             if os.name == 'nt':
+>                 rel_path = rel_path.replace('\\', '/')
+>
+>             nfc_rel_path = unicodedata.normalize('NFC', rel_path)
+>
+>             if is_ignored(nfc_rel_path, patterns):
+>                 continue
+>
+>             if nfc_rel_path in files_to_index:
+>                 if rel_path > files_to_index[nfc_rel_path]['orig_rel_path']:
+>                     files_to_index[nfc_rel_path] = {'orig_rel_path': rel_path, 'full_path': full_path}
+>             else:
+>                 files_to_index[nfc_rel_path] = {'orig_rel_path': rel_path, 'full_path': full_path}
+>
+>     results = []
+>     for nfc_rel_path in sorted(files_to_index.keys()):
+>         info = files_to_index[nfc_rel_path]
+>         full_path = info['full_path']
+>         try:
+>             size = os.path.getsize(full_path)
+>             sha256 = hash_file(full_path)
+>             if sha256 is not None:
+>                 results.append((nfc_rel_path, sha256, size))
+>         except OSError:
+>             pass
+>
+>     # Concurrency handling
+>     for _ in range(100):
+>         try:
+>             conn = sqlite3.connect(db_path, timeout=60.0)
+>             conn.execute('PRAGMA journal_mode=WAL')
+>             conn.execute('BEGIN IMMEDIATE')
+>             conn.execute('''
+>                 CREATE TABLE IF NOT EXISTS files (
+>                     path TEXT PRIMARY KEY,
+>                     sha256 TEXT NOT NULL,
+>                     size INTEGER NOT NULL
+>                 )
+>             ''')
+>             conn.execute('DELETE FROM files')
+>             conn.executemany('INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)', results)
+>             conn.commit()
+>             conn.close()
+>             break
+>         except sqlite3.OperationalError as e:
+>             if 'locked' in str(e) or 'busy' in str(e):
+>                 time.sleep(0.1)
+>             else:
+>                 raise
+> EOF
+root@537e870c2837:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

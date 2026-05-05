@@ -1,0 +1,194 @@
+New Terminal Output:
+
+root@1b1a90e96d3e:/app# grep -n "used_import_names" -n /app/analyze_deps.py | head -n 50
+342:        used_import_names: Set[str] = set()
+430:                                used_import_names.add(n)
+486:            used = used or (local in used_import_names)
+root@1b1a90e96d3e:/app# nl -ba /app/analyze_deps.py | sed -n '330,460p'
+   330          files = []
+   331          for m in cyc[:-1]:
+   332              fp = module_index.get(m) or module_index.get(m + ".__init__")
+   333              files.append(_to_app_path(project_dir, fp) if fp else m)
+   334          msg = "Circular dependency: " + " -> ".join(files + [files[0]])
+   335          errors.append(Error("circular_dependency", files[0], msg))
+   336
+   337      builtins_set = set(dir(builtins))
+   338
+   339      # per-file checks
+   340      for f, t in trees.items():
+   341          import_usage: Dict[ImportItem, bool] = {}
+   342          used_import_names: Set[str] = set()
+   343          function_sigs: Dict[str, FunctionSig] = {}
+   344
+   345          class V(ast.NodeVisitor):
+   346              def __init__(self):
+   347                  self.scope = Scope(None)
+   348
+   349              def visit_Import(self, node: ast.Import) -> Any:
+   350                  for a in node.names:
+   351                      local = a.asname or a.name.split(".")[0]
+   352                      item = ImportItem("import", a.name, 0, a.name, a.asname, getattr(node, "lineno", 0))
+   353                      self.scope.define_import(local, item)
+   354                      import_usage[item] = False
+   355
+   356              def visit_ImportFrom(self, node: ast.ImportFrom) -> Any:
+   357                  for a in node.names:
+   358                      item = ImportItem("from", node.module, node.level or 0, a.name, a.asname, getattr(node, "lineno", 0))
+   359                      import_usage[item] = False
+   360                      if a.name == "*":
+   361                          resolved = resolve_import_to_module(f, project_dir, module_index, node.module, node.level or 0)
+   362                          if resolved:
+   363                              self.scope.wildcard_modules.append(resolved)
+   364                          continue
+   365                      local = a.asname or a.name
+   366                      self.scope.define_import(local, item)
+   367
+   368              def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+   369                  self.scope.define(node.name)
+   370                  function_sigs[node.name] = compute_sig(node)
+   371                  parent = self.scope
+   372                  self.scope = Scope(parent)
+   373                  for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+   374                      self.scope.define(a.arg)
+   375                  if node.args.vararg:
+   376                      self.scope.define(node.args.vararg.arg)
+   377                  if node.args.kwarg:
+   378                      self.scope.define(node.args.kwarg.arg)
+   379                  self.generic_visit(node)
+   380                  self.scope = parent
+   381
+   382              def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+   383                  return self.visit_FunctionDef(node)
+   384
+   385              def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+   386                  self.scope.define(node.name)
+   387                  parent = self.scope
+   388                  self.scope = Scope(parent)
+   389                  self.generic_visit(node)
+   390                  self.scope = parent
+   391
+   392              def visit_Assign(self, node: ast.Assign) -> Any:
+   393                  for t_ in node.targets:
+   394                      for n in iter_assigned_names(t_):
+   395                          self.scope.define(n)
+   396                  self.generic_visit(node)
+   397
+   398              def visit_AnnAssign(self, node: ast.AnnAssign) -> Any:
+   399                  for n in iter_assigned_names(node.target):
+   400                      self.scope.define(n)
+   401                  self.generic_visit(node)
+   402
+   403              def visit_For(self, node: ast.For) -> Any:
+   404                  for n in iter_assigned_names(node.target):
+   405                      self.scope.define(n)
+   406                  self.generic_visit(node)
+   407
+   408              def visit_With(self, node: ast.With) -> Any:
+   409                  for it_ in node.items:
+   410                      if it_.optional_vars is not None:
+   411                          for n in iter_assigned_names(it_.optional_vars):
+   412                              self.scope.define(n)
+   413                  self.generic_visit(node)
+   414
+   415              def visit_ExceptHandler(self, node: ast.ExceptHandler) -> Any:
+   416                  if node.name:
+   417                      self.scope.define(node.name)
+   418                  self.generic_visit(node)
+   419
+   420              def visit_Name(self, node: ast.Name) -> Any:
+   421                  if isinstance(node.ctx, ast.Load):
+   422                      n = node.id
+   423                      if n in builtins_set:
+   424                          return
+   425                      if self.scope.is_defined(n):
+   426                          s = self.scope
+   427                          while s is not None:
+   428                              if n in s.imported:
+   429                                  import_usage[s.imported[n]] = True
+   430                                  used_import_names.add(n)
+   431                                  break
+   432                              s = s.parent
+   433                          return
+   434                      for mod in self.scope.wildcard_modules:
+   435                          if n in module_exports.get(mod, set()):
+   436                              for it2 in list(import_usage.keys()):
+   437                                  if it2.kind == "from" and it2.name == "*":
+   438                                      resolved = resolve_import_to_module(f, project_dir, module_index, it2.module, it2.level)
+   439                                      if resolved == mod:
+   440                                          import_usage[it2] = True
+   441                                          # wildcard usage tracked via import_usage
+   442                              return
+   443                      errors.append(Error("undefined_reference", _to_app_path(project_dir, f), f"Undefined reference: {n}"))
+   444                  self.generic_visit(node)
+   445
+   446              def visit_Attribute(self, node: ast.Attribute) -> Any:
+   447                  if isinstance(node.value, ast.Name) and isinstance(node.ctx, ast.Load):
+   448                      base = node.value.id
+   449                      s = self.scope
+   450                      found: Optional[ImportItem] = None
+   451                      while s is not None:
+   452                          if base in s.imported:
+   453                              found = s.imported[base]
+   454                              break
+   455                          s = s.parent
+   456                      if found and found.kind == "import":
+   457                          resolved = resolve_import_to_module(f, project_dir, module_index, found.module, 0)
+   458                          if resolved and node.attr not in module_exports.get(resolved, set()):
+   459                              errors.append(Error("invalid_attribute_access",
+   460                                  _to_app_path(project_dir, f),
+root@1b1a90e96d3e:/app# python - <<'PY'
+> from pathlib import Path
+> p=Path('/app/analyze_deps.py')
+> text=p.read_text(encoding='utf-8').splitlines(True)
+> out=[]
+> imported=False
+> for ln in text:
+>     out.append(ln)
+>     if ln.strip()=='import json':
+>         # add os import for debug env
+>         out.append('import os\n')
+>     if ln.strip()=='def analyze(project_dir: Path) -> Dict[str, Any]:':
+>         imported=True
+>     # insert debug inside visit_Name right after n=node.id
+>     if 'n = node.id' in ln and 'visit_Name' in ''.join(out[-5:]):
+>         lead = ln[:len(ln)-len(ln.lstrip(' '))]
+>         out.append(lead + 'if os.environ.get("ANALYZE_DEPS_DEBUG") and n=="foo":\n')
+>         out.append(lead + '    print("DEBUG Name foo load")\n')
+>     if 'if n in s.imported:' in ln:
+>         lead = ln[:len(ln)-len(ln.lstrip(' '))]
+>         out.append(lead + 'if os.environ.get("ANALYZE_DEPS_DEBUG") and n=="foo":\n')
+>         out.append(lead + '    print("DEBUG foo in imported")\n')
+>
+> Path('/app/analyze_deps.py').write_text(''.join(out), encoding='utf-8')
+> print('debug patched')
+> PY
+debug patched
+root@1b1a90e96d3e:/app# python -m py_compile /app/analyze_deps.py
+Sorry: IndentationError: expected an indented block after 'if' statement on line 431 (analyze_deps.py, line 432)root@1b1a90e96d3e:/app# ANALYZE_DEPS_DEBUG=1 pyt
+hon /app/analyze_deps.py --project-dir /tmp/proj --out /tmp/report.json
+  File "/app/analyze_deps.py", line 432
+    if os.environ.get("ANALYZE_DEPS_DEBUG") and n=="foo":
+    ^^
+IndentationError: expected an indented block after 'if' statement on line 431
+root@1b1a90e96d3e:/app# cat /tmp/report.json
+{
+  "all_refs_defined": true,
+  "errors": [
+    {
+      "file": "/app/a.py",
+      "message": "Unused import: b",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/a.py",
+      "message": "Unused import: foo",
+      "type": "unused_import"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}
+root@1b1a90e96d3e:/app#

@@ -1,0 +1,335 @@
+[?2004hroot@8a79162954bd:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@8a79162954bd:/app# clear
+[?2004l[H[J[3J[?2004hroot@8a79162954bd:/app# ls -la /app
+[?2004ltotal 44
+drwxr-xr-x. 1 root root 16384 Apr 30 09:48 .
+drwxr-xr-x. 1 root root    74 Apr 30 13:20 ..
+-rwxr-xr-x. 1 root root  2454 Apr 30 09:48 generate_sensor_data.sh
+-rw-r--r--. 1 root root  2208 Apr 30 09:48 sensor_001.json
+-rw-r--r--. 1 root root  1810 Apr 30 09:48 sensor_002.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_003.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_004.json
+-rw-r--r--. 1 root root     0 Apr 30 09:48 sensor_empty.json
+-rw-r--r--. 1 root root   181 Apr 30 09:48 sensor_issues_only.json
+-rw-r--r--. 1 root root    79 Apr 30 09:48 sensor_malformed.json
+[?2004hroot@8a79162954bd:/app# ls -1 /app/sensor_*.json 2>/dev/null || true
+[?2004l/app/sensor_001.json
+/app/sensor_002.json
+/app/sensor_003.json
+/app/sensor_004.json
+/app/sensor_empty.json
+/app/sensor_issues_only.json
+/app/sensor_malformed.json
+[?2004hroot@8a79162954bd:/app# cat > /app/analyze_sensors.py <<'PY'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> import json, math, glob, os
+[?2004l[?2004h> 
+[?2004l[?2004h> def is_missing(v):
+[?2004l[?2004h>     if v is None:
+[?2004l[?2004h>         return True
+[?2004l[?2004h>     if isinstance(v, str) and v.strip() == "":
+[?2004l[?2004h>         return True
+[?2004l[?2004h>     return False
+[?2004l[?2004h> 
+[?2004l[?2004h> def to_float(v):
+[?2004l[?2004h>     if is_missing(v):
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         return float(v)
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h> def to_int(v):
+[?2004l[?2004h>     if is_missing(v):
+[?2004l[?2004h>         return None
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         # allow numeric strings like "1712345678" or floats like 1712345678.0
+[?2004l[?2004h>         return int(float(v))
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         return None
+[?2004l[?2004h> 
+[?2004l[?2004h> def extract_rows(obj):
+[?2004l[?2004h>     # Accept common shapes: list[dict], {"readings": [...]}, {"data": [...]}
+[?2004l[?2004h>     if isinstance(obj, list):
+[?2004l[?2004h>         return obj
+[?2004l[?2004h>     if isinstance(obj, dict):
+[?2004l[?2004h>         for k in ("readings", "data", "rows", "records"):
+[?2004l[?2004h>             if k in obj and isinstance(obj[k], list):
+[?2004l[?2004h>                 return obj[k]
+[?2004l[?2004h>     return []
+[?2004l[?2004h> 
+[?2004l[?2004h> sensor_dir = "/app"
+[?2004l[?2004h> output_json = os.path.join(sensor_dir, "sensor_analysis.json")
+[?2004l[?2004h> output_txt = os.path.join(sensor_dir, "sensor_report.txt")
+[?2004l[?2004h> 
+[?2004l[?2004h> files = sorted(glob.glob(os.path.join(sensor_dir, "sensor_*.json")))
+[?2004l[?2004h> # Exclude our own output if it matches the pattern
+[?2004l[?2004h> files = [f for f in files if os.path.basename(f) != "sensor_analysis.json"]
+[?2004l[?2004h> 
+[?2004le[?2004h> all_rows = []  # rows that we successfully interpret as dicts
+[?2004l[?2004h> all_devices = set()
+[?2004l[?2004h> connectivity_issues = []
+[?2004l[?2004h> valid_temps = []  # global valid numeric temperatures
+[?2004l[?2004h> valid_temp_rows = []  # (device_id, timestamp_int, temp_float)
+[?2004l[?2004h> 
+[?2004l[?2004h> total_readings = 0
+[?2004l[?2004h> 
+[?2004l[?2004h> for path in files:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         with open(path, "r", encoding="utf-8") as fh:
+[?2004l[?2004h>             raw = fh.read()
+[?2004l[?2004h>         if raw.strip() == "":
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         obj = json.loads(raw)
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         # malformed JSON / unreadable: skip
+[?2004l[?2004h>         continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     rows = extract_rows(obj)
+[?2004l[?2004h>     if not isinstance(rows, list):
+[?2004l[?2004h>         continue
+[?2004l[?2004h> 
+[?2004l[?2004h>     for r in rows:
+[?2004l[?2004h>         if not isinstance(r, dict):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         total_readings += 1
+[?2004l[?2004h>         device_id = r.get("device_id")
+[?2004l[?2004h>         if device_id is None:
+[?2004l[?2004h>             # still count as a reading, but cannot count device; treat as connectivity issue?
+[?2004l[?2004h>             # Spec only asks issues for missing timestamp/temperature; keep device_id as "unknown" for issue entries.
+[?2004l[?2004h>             device_id_norm = "unknown"
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             device_id_norm = str(device_id)
+[?2004l[?2004h>             all_devices.add(device_id_norm)
+[?2004l[?2004h> 
+[?2004l[?2004h>         ts = r.get("timestamp")
+[?2004l[?2004h>         temp = r.get("temperature")
+[?2004l[?2004h> 
+[?2004l[?2004h>         ts_missing = is_missing(ts) or (to_int(ts) is None)
+[?2004l[?2004h>         temp_f = to_float(temp)
+[?2004l[?2004h>         temp_missing = is_missing(temp) or (temp_f is None)
+[?2004l[?2004h> 
+[?2004l[?2004h>         if ts_missing or temp_missing:
+[?2004l[?2004h>             connectivity_issues.append({"device_id": device_id_norm, "issue_type": "missing_data"})
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             # valid for stats/anomaly detection
+[?2004l[?2004h>             ts_i = to_int(ts)
+[?2004l[?2004h>             valid_temps.append(temp_f)
+[?2004l[?2004h>             valid_temp_rows.append((device_id_norm, ts_i, temp_f))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Compute global stats
+[?2004l[?2004h> if valid_temps:
+[?2004l[?2004h>     n = len(valid_temps)
+[?2004l[?2004h>     mean = sum(valid_temps) / n
+[?2004l[?2004h>     var = sum((x - mean) ** 2 for x in valid_temps) / n
+[?2004l[?2004h>     std = math.sqrt(var)
+[?2004l[?2004h>     gmin = min(valid_temps)
+[?2004l[?2004h>     gmax = max(valid_temps)
+[?2004l[?2004h> else:
+[?2004l[?2004h>     mean = None
+[?2004l[?2004h>     std = None
+[?2004l[?2004h>     gmin = None
+[?2004l[?2004h>     gmax = None
+[?2004l[?2004h> 
+[?2004l[?2004h> # Per-device stats (only from valid numeric temps)
+[?2004l[?2004h> by_dev = {}
+[?2004l[?2004h> for dev, ts, temp in valid_temp_rows:
+[?2004l[?2004h>     d = by_dev.setdefault(dev, {"temps": []})
+[?2004l[?2004h>     d["temps"].append(temp)
+[?2004l[?2004h> 
+[?2004l[?2004h> device_stats = []
+[?2004l[?2004h> for dev in sorted(by_dev.keys()):
+[?2004l[?2004h>     temps = by_dev[dev]["temps"]
+[?2004l[?2004h>     mn = min(temps)
+[?2004l[?2004h>     mx = max(temps)
+[?2004l[?2004h>     avg = sum(temps) / len(temps)
+[?2004l[?2004h>     device_stats.append({
+[?2004l[?2004h>         "device_id": dev,
+[?2004l[?2004h>         "min_temp": round(mn, 1),
+[?2004l[?2004h>         "max_temp": round(mx, 1),
+[?2004l[?2004h>         "avg_temp": round(avg, 1),
+[?2004l[?2004h>         "reading_count": int(len(temps)),
+[?2004l[?2004h>     })
+[?2004l[?2004h> 
+[?2004l[?2004h> # Anomalies: outside 2 stddev from global mean
+[?2004l[?2004h> anomalies = []
+[?2004l[?2004h> if valid_temps and std is not None:
+[?2004l[?2004h>     # If std == 0, no value can be outside mean +/- 0 unless NaN; treat as no anomalies.
+[?2004l[?2004h>     if std > 0:
+[?2004l[?2004h>         lo = mean - 2 * std
+[?2004l[?2004h>         hi = mean + 2 * std
+[?2004l[?2004h>         for dev, ts, temp in valid_temp_rows:
+[?2004l[?2004h>             if temp < lo or temp > hi:
+[?2004l[?2004h>                 anomalies.append({
+[?2004l[?2004h>                     "device_id": dev,
+[?2004l[?2004h>                     "timestamp": int(ts),
+[?2004l[?2004h>                     "temperature": round(temp, 1),
+[?2004l[?2004h>                 })
+[?2004l[?2004h> 
+[?2004l[?2004h> anomalies.sort(key=lambda x: x["timestamp"])
+[?2004l[?2004h> 
+[?2004l[?2004h> # Summary values with 1 decimal where applicable
+[?2004l[?2004h> summary = {
+[?2004l[?2004h>     "total_devices": int(len(all_devices)),
+[?2004l[?2004h>     "total_readings": int(total_readings),
+[?2004l[?2004h>     "min_temperature": round(gmin, 1) if gmin is not None else None,
+[?2004l[?2004h>     "max_temperature": round(gmax, 1) if gmax is not None else None,
+[?2004l[?2004h>     "avg_temperature": round(mean, 1) if mean is not None else None,
+[?2004l[?2004h>     "anomaly_count": int(len(anomalies)),
+[?2004l[?2004h>     "connectivity_issues_count": int(len(connectivity_issues)),
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> out = {
+[?2004l[?2004h>     "device_stats": device_stats,
+[?2004l[?2004h>     "anomalies": anomalies,
+[?2004l[?2004h>     "connectivity_issues": connectivity_issues,
+[?2004l[?2004h>     "summary": summary,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> with open(output_json, "w", encoding="utf-8") as fh:
+[?2004l[?2004h>     json.dump(out, fh, indent=2, sort_keys=False)
+[?2004l[?2004h>     fh.write("\n")
+[?2004l[?2004h> 
+[?2004l[?2004h> # Text report formatting. If temps missing, print as N/A.
+[?2004l[?2004h> min_str = f"{summary['min_temperature']:.1f}" if isinstance(summary["min_temperature"], (int, float)) else "N/A"
+[?2004l[?2004h> max_str = f"{summary['max_temperature']:.1f}" if isinstance(summary["max_temperature"], (int, float)) else "N/A"
+[?2004l[?2004h> avg_str = f"{summary['avg_temperature']:.1f}" if isinstance(summary["avg_temperature"], (int, float)) else "N/A"
+[?2004l[?2004h> 
+[?2004l[?2004h> report = (
+[?2004l[?2004h> "IOT SENSOR ANALYSIS REPORT\n"
+[?2004l[?2004h> "==========================\n"
+[?2004l[?2004h> f"Total Devices: {summary['total_devices']}\n"
+[?2004l[?2004h> f"Total Readings: {summary['total_readings']}\n"
+[?2004l[?2004h> f"Temperature Range: {min_str}°C to {max_str}°C\n"
+[?2004l[?2004h> f"Average Temperature: {avg_str}°C\n"
+[?2004l[?2004h> f"Anomalies Detected: {summary['anomaly_count']}\n"
+[?2004l[?2004h> f"Connectivity Issues: {summary['connectivity_issues_count']}\n"
+[?2004l[?2004h> "==========================\n"
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> with open(output_txt, "w", encoding="utf-8") as fh:
+[?2004l[?2004h>     fh.write(report)
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@8a79162954bd:/app# chmod +x /app/analyze_sensors.py
+[?2004l[?2004hroot@8a79162954bd:/app# python3 /app/analyze_sensors.py
+[?2004l[?2004hroot@8a79162954bd:/app# ls -la /app/sensor_analysis.json /app/sensor_report.txt
+[?2004l-rw-r--r--. 1 root root 1886 Apr 30 13:20 /app/sensor_analysis.json
+-rw-r--r--. 1 root root  232 Apr 30 13:20 /app/sensor_report.txt
+[?2004hroot@8a79162954bd:/app# head -n 50 /app/sensor_report.txt
+[?2004lIOT SENSOR ANALYSIS REPORT
+==========================
+Total Devices: 5
+Total Readings: 76
+Temperature Range: -20.0°C to 971.0°C
+Average Temperature: 101.3°C
+Anomalies Detected: 5
+Connectivity Issues: 6
+==========================
+[?2004hroot@8a79162954bd:/app# python3 -c 'import json; d=json.load(open("/app/sensor_analysis.json")); print("keys",d.keys()); print("summary",d["summary"]); print("device_stats",len(d["device_stats"]),"anomalies",len(d["anomalies"]),"issues",len(d["connectivity_issues"]))'
+[?2004lkeys dict_keys(['device_stats', 'anomalies', 'connectivity_issues', 'summary'])
+summary {'total_devices': 5, 'total_readings': 76, 'min_temperature': -20.0, 'max_temperature': 971.0, 'avg_temperature': 101.3, 'anomaly_count': 5, 'connectivity_issues_count': 6}
+device_stats 4 anomalies 5 issues 6
+[?2004hroot@8a79162954bd:/app# python3 - <<'PY'
+[?2004l[?2004h> import json,glob,os
+[?2004l[?2004h> from collections import Counter
+[?2004l[?2004h> 
+[?2004l[?2004h> # Load produced analysis
+[?2004l[?2004h> ana=json.load(open('/app/sensor_analysis.json'))
+[?2004l[?2004h> print('device_stats_ids:', [d['device_id'] for d in ana['device_stats']])
+[?2004l[?2004h> print('connectivity_issue_device_ids:', sorted(set(x['device_id'] for x in ana['connectivity_issues'])))
+[?2004l[?2004h> print('anomalies_sorted:', all(ana['anomalies'][i]['timestamp']<=ana['anomalies'][i+1]['timestamp'] for i in range(len(ana['anomalies'])-1)))
+[?2004l[?2004h> print('device_stats_sorted:', [d['device_id'] for d in ana['device_stats']] == sorted([d['device_id'] for d in ana['device_stats']]))
+[?2004l[?2004h> 
+[?2004l[?2004h> # Independently parse inputs to count distinct non-missing device_id from any parsed row
+[?2004l[?2004h> files=sorted(glob.glob('/app/sensor_*.json'))
+[?2004l[?2004h> files=[f for f in files if os.path.basename(f)!='sensor_analysis.json']
+[?2004l[?2004h> 
+[?2004l[?2004h> def extract_rows(obj):
+[?2004l[?2004h>     if isinstance(obj,list):
+[?2004l[?2004h>         return obj
+[?2004l[?2004h>     if isinstance(obj,dict):
+[?2004l[?2004h>         for k in ('readings','data','rows','records'):
+[?2004l[?2004h>             if k in obj and isinstance(obj[k],list):
+[?2004l[?2004h>                 return obj[k]
+[?2004l[?2004h>     return []
+[?2004l[?2004h> 
+[?2004l[?2004h> def is_missing(v):
+[?2004l[?2004h>     return v is None or (isinstance(v,str) and v.strip()=='')
+[?2004l[?2004h> 
+[?2004l[?2004h> seen=set(); total_rows=0; parsed_files=0
+[?2004l[?2004h> for p in files:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         raw=open(p,'r',encoding='utf-8').read()
+[?2004l[?2004h>         if raw.strip()=='':
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         obj=json.loads(raw)
+[?2004l[?2004h>     except Exception:
+[?2004l[?2004h>         continue
+[?2004l[?2004h>     parsed_files+=1
+[?2004l[?2004h>     for r in extract_rows(obj):
+[?2004l[?2004h>         if not isinstance(r,dict):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         total_rows+=1
+[?2004l[?2004h>         did=r.get('device_id')
+[?2004l[?2004h>         if not is_missing(did):
+[?2004l[?2004h>             seen.add(str(did))
+[?2004l[?2004h> print('parsed_files:',parsed_files,'total_rows:',total_rows,'distinct_device_ids:',len(seen),sorted(seen))
+[?2004l[?2004h> print('summary.total_devices:',ana['summary']['total_devices'])
+[?2004l[?2004h> PY
+[?2004ldevice_stats_ids: ['sensor_001', 'sensor_002', 'sensor_003', 'sensor_004']
+connectivity_issue_device_ids: ['sensor_001', 'sensor_002', 'sensor_003', 'sensor_999']
+anomalies_sorted: True
+device_stats_sorted: True
+parsed_files: 5 total_rows: 76 distinct_device_ids: 5 ['sensor_001', 'sensor_002', 'sensor_003', 'sensor_004', 'sensor_999']
+summary.total_devices: 5
+[?2004hroot@8a79162954bd:/app# jq '.summary, {device_stats_count:(.device_stats|length), anomalies_count:(.anomalies|length), connectivity_issues_count:(.connectivity_issues|length)}' /app/sensor_analysis.json
+[?2004l[1;39m{
+  [0m[34;1m"total_devices"[0m[1;39m: [0m[0;39m5[0m[1;39m,
+  [0m[34;1m"total_readings"[0m[1;39m: [0m[0;39m76[0m[1;39m,
+  [0m[34;1m"min_temperature"[0m[1;39m: [0m[0;39m-20[0m[1;39m,
+  [0m[34;1m"max_temperature"[0m[1;39m: [0m[0;39m971[0m[1;39m,
+  [0m[34;1m"avg_temperature"[0m[1;39m: [0m[0;39m101.3[0m[1;39m,
+  [0m[34;1m"anomaly_count"[0m[1;39m: [0m[0;39m5[0m[1;39m,
+  [0m[34;1m"connectivity_issues_count"[0m[1;39m: [0m[0;39m6[0m[1;39m
+[1;39m}[0m
+[1;39m{
+  [0m[34;1m"device_stats_count"[0m[1;39m: [0m[0;39m4[0m[1;39m,
+  [0m[34;1m"anomalies_count"[0m[1;39m: [0m[0;39m5[0m[1;39m,
+  [0m[34;1m"connectivity_issues_count"[0m[1;39m: [0m[0;39m6[0m[1;39m
+[1;39m}[0m
+[?2004hroot@8a79162954bd:/app# perl -0777 -i -pe 's/round\(([^,\)]+), 1\)/fmt1($1)/g; s/"min_temperature": fmt1\(gmin\) if gmin is not None else None/"min_temperature": fmt1(gmin) if gmin is not None else None/; s/"max_temperature": fmt1\(gmax\) if gmax is not None else None/"max_temperature": fmt1(gmax) if gmax is not None else None/; s/"avg_temperature": fmt1\(mean\) if mean is not None else None/"avg_temperature": fmt1(mean) if mean is not None else None/;' /app/analyze_sensors.py
+[?2004l[?2004hroot@8a79162954bd:/app# python3 - <<'PY'
+[?2004l[?2004h> import re
+[?2004l[?2004h> p='/app/analyze_sensors.py'
+[?2004l[?2004h> src=open(p,'r',encoding='utf-8').read().splitlines()
+[?2004l[?2004h> # Insert fmt1 helper after imports if not present
+[?2004l[?2004h> if not any(line.startswith('def fmt1') for line in src):
+[?2004l[?2004h>     out=[]
+[?2004l[?2004h>     inserted=False
+[?2004l[?2004h>     for line in src:
+[?2004l[?2004h>         out.append(line)
+[?2004l[?2004h>         if not inserted and line.strip()=='import json, math, glob, os':
+[?2004l[?2004h>             out.append('')
+[?2004l[?2004h>             out.append('def fmt1(x):')
+[?2004l[?2004h>             out.append('    return float(f"{x:.1f}")')
+[?2004l[?2004h>             inserted=True
+[?2004l[?2004h>     open(p,'w',encoding='utf-8').write("\n".join(out)+"\n")
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@8a79162954bd:/app# python3 /app/analyze_sensors.py
+[?2004l[?2004hroot@8a79162954bd:/app# python3 - <<'PY'
+[?2004l[?2004h> import json
+[?2004l[?2004h> ana=json.load(open('/app/sensor_analysis.json'))
+[?2004l[?2004h> print(ana['summary'])
+[?2004l[?2004h> print('sample device_stats:', ana['device_stats'][0])
+[?2004l[?2004h> print('sample anomaly:', (ana['anomalies'][0] if ana['anomalies'] else None))
+[?2004l[?2004h> PY
+[?2004l{'total_devices': 5, 'total_readings': 76, 'min_temperature': -20.0, 'max_temperature': 971.0, 'avg_temperature': 101.3, 'anomaly_count': 5, 'connectivity_issues_count': 6}
+sample device_stats: {'device_id': 'sensor_001', 'min_temp': 15.1, 'max_temp': 954.0, 'avg_temp': 88.5, 'reading_count': 20}
+sample anomaly: {'device_id': 'sensor_004', 'timestamp': 1640997322, 'temperature': 967.0}
+[?2004hroot@8a79162954bd:/app# grep -n 'min_temperature\|max_temperature\|avg_temperature' -n /app/sensor_analysis.json | head
+[?2004l88:    "min_temperature": -20.0,
+89:    "max_temperature": 971.0,
+90:    "avg_temperature": 101.3,
+[?2004hroot@8a79162954bd:/app# 

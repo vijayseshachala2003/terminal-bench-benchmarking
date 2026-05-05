@@ -1,0 +1,155 @@
+{
+  "analysis": "Multiple fatal issues prevent services from starting and zones from loading: (1) All configs set directory \"/var/cache/bind\" which is not writable in this environment, causing named to fail parsing with permission denied. (2) Primary TSIG secret is invalid base64, so named-checkconf fails. (3) Secondary named.conf has a syntax error due to a semicolon in a comment position and also a mismatched TSIG secret vs primary. (4) Resolver named.conf has a syntax error: stray ';' after dnssec-validation auto. (5) secure.example.com signed zone file is invalid/expired and has bad base64 in RRSIG/DNSKEY/etc, so it cannot be served/validated as-is. Need to: change working directories to writable paths under /app/dns/*, fix TSIG key by using the provided key files (likely valid base64 and matching), fix resolver syntax, and re-sign secure.example.com zone with fresh DNSSEC keys so validation works. Then start services, verify AXFR and test queries, and write dns_health.json.",
+  "plan": "1) Inspect the TSIG key files in primary/secondary and update both named.conf files to include the same valid key material (or inline the correct base64 secret). 2) Change options { directory } on all three configs to writable per-service directories (e.g., /app/dns/primary/cache, /app/dns/secondary/cache, /app/dns/resolver/cache) and create them. 3) Fix resolver syntax error (remove stray ';' after dnssec-validation auto). 4) Fix secondary syntax error (remove/adjust the problematic comment line) and ensure it uses the same TSIG secret as primary. 5) Replace the broken/expired secure.example.com.zone.signed by generating fresh DNSSEC keys and signing the unsigned zone (secure.example.com.zone), then update primary to serve the newly signed file. 6) Re-run named-checkconf/named-checkzone, restart named instances, verify zone transfers (AXFR) and resolver queries from /app/test_queries.txt, and confirm DNSSEC validation (AD flag) via resolver. 7) Create /app/dns_health.json summarizing zones healthy, issues fixed, transfer status, and dnssec_valid.",
+  "commands": [
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/primary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/secondary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/cache /app/dns/secondary/cache /app/dns/resolver/cache /app/dns/secondary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/primary/cache\";#g' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/secondary/cache\";#g' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/resolver/cache\";#g' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/dnssec-validation\\s+auto;\\s*;/dnssec-validation auto;/g' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'BUG: TSIG' -n /app/dns/secondary/named.conf || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's/^; BUG: TSIG.*$/\\/\\/ TSIG key configured below (must match primary)/' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{\\s*algorithm\\s+hmac-sha256;\\s*secret\\s*\"[^\"]*\";\\s*\\};/do { local $\\/; open my $fh, \"<\", \"\\/app\\/dns\\/primary\\/keys\\/transfer.key\" or die $!; my $k=<$fh>; $k =~ s/\\r//g; $k }/se' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{\\s*algorithm\\s+hmac-sha256;\\s*secret\\s*\"[^\"]*\";\\s*\\};/do { local $\\/; open my $fh, \"<\", \"\\/app\\/dns\\/secondary\\/keys\\/transfer.key\" or die $!; my $k=<$fh>; $k =~ s/\\r//g; $k }/se' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "diff -u /app/dns/primary/keys/transfer.key /app/dns/secondary/keys/transfer.key || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cp -f /app/dns/primary/keys/transfer.key /app/dns/secondary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[\\s\\S]*?\\};/do { local $\\/; open my $fh, \"<\", \"\\/app\\/dns\\/primary\\/keys\\/transfer.key\" or die $!; my $k=<$fh>; $k =~ s/\\r//g; $k }/se' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ls -la /app/dns/primary/zones/secure.example.com.zone /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f Ksecure.example.com.*.key Ksecure.example.com.*.private dsset-secure.example.com. keyset-secure.example.com.\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-keygen -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dnssec-keygen -f KSK -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dnssec-signzone -o secure.example.com -N increment -t -k $(ls Ksecure.example.com.*KSK*.key | sed 's/\\.key$//') secure.example.com.zone $(ls Ksecure.example.com.*ZSK*.key | sed 's/\\.key$//')\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

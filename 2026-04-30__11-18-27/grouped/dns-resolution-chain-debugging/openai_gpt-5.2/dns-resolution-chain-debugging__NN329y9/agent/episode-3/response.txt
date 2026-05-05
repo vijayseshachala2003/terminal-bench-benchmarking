@@ -1,0 +1,55 @@
+{
+  "analysis": "Resolver now starts and listens on 5300, but primary/secondary still exit because TSIG secret replacement failed (still bad base64). The perl command used $ENV{TSIG_SECRET} which was not exported, so it likely wrote an empty/garbled secret. Additionally, resolver is trying to write session key to /run/named/session.key and read /etc/bind/rndc.key (permission denied); those are non-fatal but noisy. Resolver also cannot reach primary on 5301 (connection refused) because primary is down, so managed-keys fetch fails. Next: fix TSIG secret correctly (use a known-good base64 and ensure it is inserted verbatim), add session-keyfile and disable/redirect controls to avoid /etc/bind/rndc.key permission issues, then restart primary/secondary and confirm ports 5301/5302 are up.",
+  "plan": "1) Stop named to avoid confusion. 2) Generate and set a valid base64 TSIG secret and directly edit both primary and secondary named.conf to use it (no env var dependency). 3) Add session-keyfile pointing to writable run dirs for all instances; disable controls block (or point to a local rndc.key we can create) to stop permission denied errors. 4) Re-run named-checkconf on primary/secondary/resolver. 5) Restart all three and confirm they listen on 5300/5301/5302.",
+  "commands": [
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "TSIG_SECRET=$(python3 - <<'PY'\nimport base64,os\nprint(base64.b64encode(os.urandom(32)).decode())\nPY\n)\necho \"$TSIG_SECRET\" > /tmp/tsig.secret\ncat /tmp/tsig.secret\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i -E \"s/secret \\\"[^\\\"]*\\\";/secret \\\"$(cat /tmp/tsig.secret)\\\";/\" /app/dns/primary/named.conf\nsed -i -E \"s/secret \\\"[^\\\"]*\\\";/secret \\\"$(cat /tmp/tsig.secret)\\\";/\" /app/dns/secondary/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep -n \"secret\" /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "for f in /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf; do \n  if ! grep -q 'session-keyfile' \"$f\"; then\n    sed -i 's#pid-file \"\\([^\"]*\\)\";#pid-file \"\\1\";\\n    session-keyfile \"'\"'\"'\"${f%/named.conf}/run/session.key'\"'\"'\";#' \"$f\";\n  fi;\n  if grep -qE '^controls\\s*\\{' \"$f\"; then :; else echo \"controls { };\" >> \"$f\"; fi;\ndone\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\nnamed -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E '(:5300|:5301|:5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 60 /tmp/named-primary.log\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-secondary.log\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

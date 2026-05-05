@@ -1,0 +1,156 @@
+New Terminal Output:
+
+}root@47a44cdb3aaf:/app# nl -ba /app/analyze_deps.py | sed -n '220,290p'
+   220          if isinstance(node,(ast.FunctionDef, ast.AsyncFunctionDef)):
+   221              args=node.args
+   222              pos=len(args.posonlyargs)+len(args.args)
+   223              mind=pos-len(args.defaults or [])
+   224              maxp=None if args.vararg else pos
+   225              out[node.name]=FuncSig(mind,maxp)
+   226      return out
+   227
+   228  def iter_calls(tree: ast.AST) -> Iterable[ast.Call]:
+   229      for n in ast.walk(tree):
+   230          if isinstance(n, ast.Call):
+   231              yield n
+   232
+   233  def analyze(project_dir: Path) -> Dict:
+   234      rep={"valid_imports":True,"no_circular_deps":True,"no_unused_imports":True,"all_refs_defined":True,"valid_attribute_access":True,"type_consistent":T
+rue,"errors":[]}
+   235      if not project_dir.exists() or not project_dir.is_dir():
+   236          for k in list(rep.keys()):
+   237              if k!="errors": rep[k]=False
+   238          rep["errors"].append({"type":"invalid_import","file":"/app/","message":f"Project directory does not exist: {project_dir}"})
+   239          return rep
+   240      py_files=iter_py_files(project_dir)
+   241      if not py_files: return rep
+   242      modules=build_module_index(project_dir, py_files)
+   243      asts: Dict[str, ast.AST] = {}
+   244      exports: Dict[str, Exports] = {}
+   245      sigs: Dict[str, Dict[str, FuncSig]] = {}
+   246      imports: Dict[str, List[ImportItem]] = {}
+   247      for m,info in modules.items():
+   248          t=parse_ast(info.path)
+   249          if t is None: continue
+   250          asts[m]=t
+   251          exports[m]=extract_exports(t)
+   252          sigs[m]=extract_function_sigs(t)
+   253          imports[m]=collect_imports(t)
+   254      edges={m:set() for m in modules}
+   255      invalid: List[Tuple[Path,str]]=[]
+   256      for m,info in modules.items():
+   257          t=asts.get(m)
+   258          if t is None: continue
+   259          for it in imports.get(m,[]):
+   260              if it.kind=="import":
+   261                  parts=it.name.split(".")
+   262                  for i in range(len(parts),0,-1):
+   263                      cand=".".join(parts[:i])
+   264                      if cand in modules:
+   265                          edges[m].add(cand); break
+   266              else:
+   267                  rm=resolve_import_to_project(modules, info.path, m, it.module, it.level)
+   268                  if rm: edges[m].add(rm)
+   269                  elif it.level>0: invalid.append((info.path, f"{'.'*it.level}{it.module or ''}"))
+   270      if invalid:
+   271          rep["valid_imports"]=False
+   272          for fp,modn in invalid:
+   273              rep["errors"].append({"type":"invalid_import","file":to_app_path(project_dir,fp),"message":f"Unresolvable import module: {modn}"})
+   274      vis=set(); st=set(); par={}; cycles=[]
+   275      def dfs(u:str):
+   276          vis.add(u); st.add(u)
+   277          for v in edges.get(u,set()):
+   278              if v not in vis:
+   279                  par[v]=u; dfs(v)
+   280              elif v in st:
+   281                  cyc=[v]; cur=u
+   282                  while cur!=v and cur in par:
+   283                      cyc.append(cur); cur=par[cur]
+   284                  cyc.append(v); cycles.append(list(reversed(cyc)))
+   285          st.remove(u)
+   286      for m in modules:
+   287          if m not in vis:
+   288              par[m]=""; dfs(m)
+   289      if cycles:
+   290          rep["no_circular_deps"]=False
+root@47a44cdb3aaf:/app# python - <<'PY'
+> from pathlib import Path
+> p=Path('/app/analyze_deps.py')
+> lines=p.read_text(encoding='utf-8').splitlines(True)
+>
+> # find block start at line containing 'edges={m:set() for m in modules}'
+> start=None
+> end=None
+> for i,l in enumerate(lines):
+>     if start is None and l.startswith('    edges={m:set() for m in modules}'):
+>         start=i
+>     if start is not None and end is None and l.startswith('    if invalid:'):
+>         end=i
+>         break
+> if start is None or end is None or end<=start:
+>     raise SystemExit(f'Could not locate block to patch (start={start}, end={end})')
+>
+> new_block = [
+> "    top_levels = {name.split(\".\")[0] for name in modules.keys() if name}\n",
+> "    edges={m:set() for m in modules}\n",
+> "    invalid: List[Tuple[Path,str]]=[]\n",
+> "    for m,info in modules.items():\n",
+> "        t=asts.get(m)\n",
+> "        if t is None: continue\n",
+> "        for it in imports.get(m,[]):\n",
+> "            if it.kind==\"import\":\n",
+> "                parts=it.name.split(\".\")\n",
+> "                if parts and parts[0] in top_levels:\n",
+> "                    found=None\n",
+> "                    for j in range(len(parts),0,-1):\n",
+> "                        cand=\".\".join(parts[:j])\n",
+> "                        if cand in modules:\n",
+> "                            found=cand\n",
+> "                            break\n",
+> "                    if found:\n",
+> "                        edges[m].add(found)\n",
+> "                    else:\n",
+> "                        invalid.append((info.path, it.name))\n",
+> "                else:\n",
+> "                    pass\n",
+> "            else:\n",
+> "                if it.level>0:\n",
+> "                    rm=resolve_import_to_project(modules, info.path, m, it.module, it.level)\n",
+> "                    if rm:\n",
+> "                        edges[m].add(rm)\n",
+> "                    else:\n",
+> "                        invalid.append((info.path, f\"{'.'*it.level}{it.module or ''}\"))\n",
+> "                else:\n",
+> "                    modname = it.module\n",
+> "                    if modname:\n",
+> "                        parts = modname.split(\".\")\n",
+> "                        if parts and parts[0] in top_levels:\n",
+> "                            if modname in modules:\n",
+> "                                edges[m].add(modname)\n",
+> "                            else:\n",
+> "                                invalid.append((info.path, modname))\n",
+> "\n",
+> ]
+>
+> patched = lines[:start] + new_block + lines[end:]
+> p.write_text(''.join(patched), encoding='utf-8')
+> print('patched import validation block', start+1, 'to', end)
+> PY
+patched import validation block 254 to 269
+root@47a44cdb3aaf:/app# python -m py_compile /app/analyze_deps.py
+root@47a44cdb3aaf:/app# python /app/analyze_deps.py --project-dir /tmp/proj2 --out /tmp/r2.json && cat /tmp/r2.json
+{
+  "all_refs_defined": true,
+  "errors": [
+    {
+      "file": "/app/p/a.py",
+      "message": "Unused import: nope",
+      "type": "unused_import"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}root@47a44cdb3aaf:/app#

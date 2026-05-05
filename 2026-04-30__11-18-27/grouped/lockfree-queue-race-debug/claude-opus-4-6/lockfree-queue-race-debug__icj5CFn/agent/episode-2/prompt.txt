@@ -1,0 +1,102 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@43786ee91113:/app# wc -l /app/lockfree_queue.cpp
+121 /app/lockfree_queue.cpp
+root@43786ee91113:/app# sed -n '80,$p' /app/lockfree_queue.cpp
+            }
+        }
+    }
+}
+
+bool LockFreeQueue::dequeue(uint64_t& value) {
+    while (true) {
+        // BUG 1: Using relaxed where acquire is needed
+        Node* head = head_.load(std::memory_order_relaxed);
+        Node* tail = tail_.load(std::memory_order_relaxed);
+
+        // BUG 3: Reading next with wrong ordering
+        // Should synchronize with release store in enqueue
+        Node* next = head->next.load(std::memory_order_relaxed);
+
+        // Consistency check
+        if (head == head_.load(std::memory_order_relaxed)) {
+            if (head == tail) {
+                if (next == nullptr) {
+                    return false;  // Queue is empty
+                }
+                // Tail is behind, advance it
+                tail_.compare_exchange_weak(tail, next,
+                    std::memory_order_relaxed, std::memory_order_relaxed);
+            } else {
+                // BUG 3: Reading value before successful CAS
+                // and with no memory ordering guarantee
+                value = next->value;
+
+                // BUG 1: Using relaxed for dequeue CAS
+                if (head_.compare_exchange_weak(head, next,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    // BUG 4: Immediately freeing the old head
+                    // Race with other threads that might still see this node
+                    free_node(head);
+                    return true;
+                }
+                // CAS failed, value might be stale, retry
+            }
+        }
+    }
+}
+root@43786ee91113:/app# sed -n '1,50p' /app/stress_test.cpp
+#include "lockfree_queue.h"
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <iostream>
+#include <chrono>
+#include <unordered_set>
+#include <mutex>
+#include <cassert>
+#include <csignal>
+#include <cstdlib>
+
+constexpr int NUM_PRODUCERS = 4;
+constexpr int NUM_CONSUMERS = 4;
+constexpr int OPS_PER_THREAD = 1250000;  // 10M total (4 producers * 1.25M each)
+constexpr uint64_t SENTINEL = UINT64_MAX;
+constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+
+std::atomic<bool> start_flag{false};
+std::atomic<int> producers_done{0};
+std::atomic<uint64_t> total_enqueued{0};
+std::atomic<uint64_t> total_dequeued{0};
+std::atomic<bool> timed_out{false};
+
+std::mutex dequeued_mutex;
+std::vector<uint64_t> all_dequeued;
+
+void producer(LockFreeQueue& queue, int id) {
+    while (!start_flag.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+
+    for (int i = 0; i < OPS_PER_THREAD; ++i) {
+        uint64_t value = base + i + 1;  // +1 to avoid 0 values
+        queue.enqueue(value);
+        total_enqueued.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    producers_done.fetch_add(1, std::memory_order_release);
+}
+
+void consumer(LockFreeQueue& queue, std::vector<uint64_t>& local_dequeued) {
+    while (!start_flag.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    int empty_spins = 0;
+    const int MAX_EMPTY_SPINS = 100000;
+root@43786ee91113:/app#

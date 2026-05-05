@@ -1,0 +1,111 @@
+{
+  "analysis": "Controls issue is resolved (no more rndc.key fatal), but named still exits with 'checking logging configuration failed: permission denied' and then 'loading configuration: permission denied'. This indicates BIND cannot write to the configured logging file paths under /var/log/named/*.log (not writable). Since we run with -g, we can remove/disable the logging stanza entirely to avoid file permission checks. Additionally, DNSSEC signing failed with 'failed to find keys at the zone apex' because the zone file likely does not include the DNSKEY records; dnssec-signzone expects keys to be present or needs -S/-K options to load keys and add DNSKEY automatically. We'll sign using dnssec-signzone -S -K . to auto-insert DNSKEY from key files. After fixing logging, restart services. Then test AXFR and queries. Also, resolver max-ncache-ttl 86400 is still high but not fatal; we can reduce to e.g. 300 to avoid intermittent negative caching issues.",
+  "plan": "1) Remove logging blocks from primary/secondary/resolver named.conf (or change file paths to writable /app/dns/*/logs, but simplest: remove since -g logs to stdout). 2) Optionally reduce resolver max-ncache-ttl to 300. 3) Re-sign secure.example.com with dnssec-signzone using -S and -K to include keys at apex and generate secure.example.com.zone.signed. 4) Start all named instances and verify ports listening. 5) Verify zone transfers from primary to secondary succeed for both zones. 6) Run all test queries against resolver and confirm DNSSEC validation (AD flag) for secure.example.com. 7) Generate /app/dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\nlogging\\s*\\{[\\s\\S]*?\\};\\n/\\n/sg' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\nlogging\\s*\\{[\\s\\S]*?\\};\\n/\\n/sg' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\nlogging\\s*\\{[\\s\\S]*?\\};\\n/\\n/sg' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/max-ncache-ttl\\s+86400;/max-ncache-ttl 300;/g' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f secure.example.com.zone.signed secure.example.com.zone.signed.jnl dsset-secure.example.com.\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-signzone -S -K /app/dns/primary/zones -o secure.example.com -N increment -t secure.example.com.zone\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com SOA +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | egrep 'status:|flags:|ANSWER:|secure\\.example\\.com\\.|RRSIG|DNSKEY' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

@@ -1,0 +1,254 @@
+New Terminal Output:
+
+root@5c7f91368d01:/app# nl -ba lockfree_queue.cpp | sed -n '80,200p'
+    80              }
+    81          }
+    82      }
+    83  }
+    84
+    85  bool LockFreeQueue::dequeue(uint64_t& value) {
+    86      while (true) {
+    87          // BUG 1: Using relaxed where acquire is needed
+    88          Node* head = head_.load(std::memory_order_relaxed);
+    89          Node* tail = tail_.load(std::memory_order_relaxed);
+    90
+    91          // BUG 3: Reading next with wrong ordering
+    92          // Should synchronize with release store in enqueue
+    93          Node* next = head->next.load(std::memory_order_relaxed);
+    94
+    95          // Consistency check
+    96          if (head == head_.load(std::memory_order_relaxed)) {
+    97              if (head == tail) {
+    98                  if (next == nullptr) {
+    99                      return false;  // Queue is empty
+   100                  }
+   101                  // Tail is behind, advance it
+   102                  tail_.compare_exchange_weak(tail, next,
+   103                      std::memory_order_relaxed, std::memory_order_relaxed);
+   104              } else {
+   105                  // BUG 3: Reading value before successful CAS
+   106                  // and with no memory ordering guarantee
+   107                  value = next->value;
+   108
+   109                  // BUG 1: Using relaxed for dequeue CAS
+   110                  if (head_.compare_exchange_weak(head, next,
+   111                          std::memory_order_relaxed, std::memory_order_relaxed)) {
+   112                      // BUG 4: Immediately freeing the old head
+   113                      // Race with other threads that might still see this node
+   114                      free_node(head);
+   115                      return true;
+   116                  }
+   117                  // CAS failed, value might be stale, retry
+   118              }
+   119          }
+   120      }
+   121  }
+root@5c7f91368d01:/app# nl -ba lockfree_queue.h | sed -n '1,200p'
+     1  #ifndef LOCKFREE_QUEUE_H
+     2  #define LOCKFREE_QUEUE_H
+     3
+     4  #include <atomic>
+     5  #include <cstdint>
+     6
+     7  class LockFreeQueue {
+     8  public:
+     9      LockFreeQueue();
+    10      ~LockFreeQueue();
+    11
+    12      void enqueue(uint64_t value);
+    13      bool dequeue(uint64_t& value);
+    14
+    15      LockFreeQueue(const LockFreeQueue&) = delete;
+    16      LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+    17
+    18  private:
+    19      struct Node {
+    20          uint64_t value;
+    21          std::atomic<Node*> next;
+    22          Node() : value(0), next(nullptr) {}
+    23          explicit Node(uint64_t val) : value(val), next(nullptr) {}
+    24      };
+    25
+    26      struct TaggedPtr {
+    27          Node* ptr;
+    28          uint64_t tag;
+    29
+    30          TaggedPtr() : ptr(nullptr), tag(0) {}
+    31          TaggedPtr(Node* p, uint64_t t) : ptr(p), tag(t) {}
+    32
+    33          bool operator==(const TaggedPtr& other) const {
+    34              return ptr == other.ptr && tag == other.tag;
+    35          }
+    36      };
+    37
+    38      std::atomic<Node*> head_;
+    39      std::atomic<Node*> tail_;
+    40
+    41      std::atomic<Node*> free_list_;
+    42
+    43      Node* allocate_node(uint64_t value);
+    44      void free_node(Node* node);
+    45  };
+    46
+    47  #endif
+root@5c7f91368d01:/app# apply_patch<<'PATCH'
+> *** Begin Patch
+> *** Update File: lockfree_queue.cpp
+> @@
+>  #include "lockfree_queue.h"
+>  #include <new>
+>
+>  LockFreeQueue::LockFreeQueue() {
+>      Node* dummy = new Node();
+                      std::memory_order_relaxed, std::memory_order_relaxed)) {
++                // Publish the new node with release so consumers that acquire
++                // the next> -    head_.store(dummy, std::memory_order_relaxed);
+> -    tail_.store(dummy, std::memory_order_relaxed);
+> -    free_list_.store(nullptr, std::memory_order_relaxed);
+> +    // Publish initial dummy node.
+> +    head_.store(dummy, std::memory_order_relaxed);
+> +    tail_.store(dummy, std::memory_order_relaxed);
+> +    // We do not reuse nodes during concurrent operation. Reuse without a
+> +    // full safe reclamation scheme (hazard pointers/epochs) leads to ABA and
+> +    // use-after-free under contention.
+> +    free_list_.store(nullptr, std::memory_order_relaxed);
+>  }
+> @@
+>  LockFreeQueue::~LockFreeQueue() {
+>      uint64_t dummy;
+>      while (dequeue(dummy)) {}
+>
+>      Node* head = head_.load(std::memory_order_relaxed);
+>      delete head;
+>
+> -    Node* free_node = free_list_.load(std::memory_order_relaxed);
+> -    while (free_node) {
+> -        Node* next = free_node->next.load(std::memory_order_relaxed);
+> -        delete free_node;
+> -        free_node = next;
+> -    }
+> +    // Delete all retired nodes (including any nodes that were dequeued).
+> +    Node* free_node = free_list_.load(std::memory_order_relaxed);
+> +    while (fre
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+nullptr) {
+> -                // BUG 1 & 3: Using relaxed for the critical CAS
+> -                // The store to next should use release semantics
+> -                if (tail->next.compare_exchange_weak(next, new_node,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+> +                // Publish the new node with release so consumers that acquire
+> +                // the next pointer see the node fully initialized.
+> +                if (tail->next.compare_exchange_weak(
+> +                        next, new_node,
+> +                        std::memory_order_release,
+> +                        std::memory_order_relaxed)) {
+>                      // Try to move tail forward (don't care if it fails)
+> -                    tail_.compare_exchange_weak(tail, new_node,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed);
+> +                    tail_.compare_exchange_weak(
+> +                        tail, new_node,
+> +                        std::memory_order_release,
+> +                        std::memory_order_relaxed);
+>                      return;
+>                  }
+>              } else {
+>                  // Tail is behind, try to advance it
+> -                tail_.compare_exchange_weak(tail, next,
+> -                    std::memory_order_relaxed, std::memory_order_relaxed);
+> +                tail_.compare_exchange_weak(
+> +                    tail, next,
+> +                    std::memory_order_release,
+> +                    std::memory_order_relaxed);
+>              }
+>          }
+>      }
+>  }
+> @@
+>  bool LockFreeQueue::dequeue(uint64_t& value) {
+>      while (true) {
+> -        // BUG 1: Using relaxed where acquire is needed
+> -        Node* head = head_.load(std::memory_order_relaxed);
+> -        Node* tail = tail_.load(std::memory_order_relaxed);
+> -
+> -        // BUG 3: Reading next with wrong ordering
+> -        // Should synchronize with release store in enqueue
+> -        Node* next = head->next.load(std::memory_order_relaxed);
+> +        Node* head = head_.load(std::memory_order_acquire);
+> +        Node* tail = tail_.load(std::memory_order_acquire);
+> +        Node* next = head->next.load(std::memory_order_acquire);
+>
+>          // Consistency check
+> -        if (head == head_.load(std::memory_order_relaxed)) {
+> +        if (head == head_.load(std::memory_order_acquire)) {
+>              if (head == tail) {
+>                  if (next == nullptr) {
+>                      return false;  // Queue is empty
+>                  }
+>                  // Tail is behind, advance it
+> -                tail_.compare_exchange_weak(tail, next,
+> -                    std::memory_order_relaxed, std::memory_order_relaxed);
+> +                tail_.compare_exchange_weak(
+> +                    tail, next,
+> +                    std::memory_order_release,
+> +                    std::memory_order_relaxed);
+>              } else {
+> -                // BUG 3: Reading value before successful CAS
+> -                // Another thread could dequeue and free this node
+> -                value = next->value;
+> -
+> -                // BUG 1: CAS should use release semantics
+> -                if (head_.compare_exchange_weak(head, next,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+> +                // Read the value from the next node (the first real node).
+> +                // With acquire on next, this observes the enqueuer's stores.
+> +                uint64_t next_value = next->value;
+> +
+> +                // Move head forward. On success, 'head' becomes unreachable
+> +                // from the queue and can be retired.
+> +                if (head_.compare_exchange_weak(
+> +                        head, next,
+> +                        std::memory_order_release,
+> +                        std::memory_order_relaxed)) {
+> +                    value = next_value;
+>                      free_node(head);
+>                      return true;
+>                  }
+>              }
+>          }
+>      }
+>  }
+> *** End Patch
+> PATCH
+bash: apply_patch: command not found
+root@5c7f91368d01:/app# apply_patch<<'PATCH'
+> *** Begin Patch
+> *** Update File: stress_test.cpp
+> @@
+> -static constexpr int OPS_PER_THREAD = 1250000;
+> +// 4 producers * 2,500,000 = 10,000,000 total operations.
+> +static constexpr int OPS_PER_THREAD = 2500000;
+> *** End Patch
+> PATCH
+bash: apply_patch: command not found
+root@5c7f91368d01:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+/app/stress_test
+root@5c7f91368d01:/app# /app/stress_test
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+make clean && make tsan
+All producers finished
+/app/stress_test_tsan
+All consumers finished
+Duration: 1600 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+

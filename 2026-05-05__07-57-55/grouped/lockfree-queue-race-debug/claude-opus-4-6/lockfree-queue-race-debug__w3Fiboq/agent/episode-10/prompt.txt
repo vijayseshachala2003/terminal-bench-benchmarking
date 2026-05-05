@@ -1,0 +1,195 @@
+New Terminal Output:
+
+root@3e32ac3b8863:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         uint64_t value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     struct TaggedPtr {
+>         uint64_t packed;
+>
+>         TaggedPtr() : packed(0) {}
+>         TaggedPtr(Node* p, uint16_t t) {
+>             packed = (static_cast<uint64_t>(t) << 48) |
+>                      (reinterpret_cast<uint64_t>(p) & 0x0000FFFFFFFFFFFF);
+>         }
+>
+>         Node* ptr() const {
+>             uint64_t addr = packed & 0x0000FFFFFFFFFFFF;
+>             if (addr & (1ULL << 47)) {
+>                 addr |= 0xFFFF000000000000;
+>             }
+>             return reinterpret_cast<Node*>(addr);
+>         }
+>
+>         uint16_t tag() const {
+>             return static_cast<uint16_t>(packed >> 48);
+>         }
+>     };
+>
+>     std::atomic<uint64_t> head_;
+>     std::atomic<uint64_t> tail_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@3e32ac3b8863:/app# cat > /app/lockfree_queue.cpp << 'CPP_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     TaggedPtr tp(dummy, 0);
+>     head_.store(tp.packed, std::memory_order_relaxed);
+>     tail_.store(tp.packed, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue and delete nodes as we go
+>     // At destruction time, no other threads are accessing the queue
+>     TaggedPtr head_tp;
+>     head_tp.packed = head_.load(std::memory_order_relaxed);
+>     Node* node = head_tp.ptr();
+>     while (node) {
+>         Node* next = node->next.load(std::memory_order_relaxed);
+>         delete node;
+>         node = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Intentionally leak the node to prevent use-after-free.
+>     // Retired nodes cannot be freed because other threads may still
+>     // hold references to them from in-flight dequeue operations.
+>     // In a production system, we'd use hazard pointers or epoch-based
+>     // reclamation. For this stress test, leaking is acceptable.
+>     (void)node;
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         TaggedPtr tail_tp;
+>         tail_tp.packed = tail_.load(std::memory_order_acquire);
+>         Node* tail_node = tail_tp.ptr();
+>
+>         Node* next = tail_node->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail to check consistency
+>         TaggedPtr tail_tp2;
+>         tail_tp2.packed = tail_.load(std::memory_order_acquire);
+>         if (tail_tp.packed != tail_tp2.packed) {
+>             continue;
+>         }
+>
+>         if (next == nullptr) {
+>             if (tail_node->next.compare_exchange_weak(next, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 TaggedPtr new_tail(new_node, static_cast<uint16_t>(tail_tp.tag() + 1));
+>                 tail_.compare_exchange_strong(tail_tp.packed, new_tail.packed,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             TaggedPtr new_tail(next, static_cast<uint16_t>(tail_tp.tag() + 1));
+>             tail_.compare_exchange_strong(tail_tp.packed, new_tail.packed,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         TaggedPtr head_tp;
+>         head_tp.packed = head_.load(std::memory_order_acquire);
+>         Node* head_node = head_tp.ptr();
+>
+>         TaggedPtr tail_tp;
+>         tail_tp.packed = tail_.load(std::memory_order_acquire);
+>         Node* tail_node = tail_tp.ptr();
+>
+>         Node* next = head_node->next.load(std::memory_order_acquire);
+>
+>         // Re-check head consistency
+>         TaggedPtr head_tp2;
+>         head_tp2.packed = head_.load(std::memory_order_acquire);
+>         if (head_tp.packed != head_tp2.packed) {
+>             continue;
+>         }
+>
+>         if (head_node == tail_node) {
+>             if (next == nullptr) {
+>                 return false;
+>             }
+>             TaggedPtr new_tail(next, static_cast<uint16_t>(tail_tp.tag() + 1));
+>             tail_.compare_exchange_strong(tail_tp.packed, new_tail.packed,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             if (next == nullptr) {
+>                 continue;
+>             }
+>             value = next->value;
+>
+>             TaggedPtr new_head(next, static_cast<uint16_t>(head_tp.tag() + 1));
+>             if (head_.compare_exchange_weak(head_tp.packed, new_head.packed,
+>                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+>                 retire_node(head_node);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> CPP_EOF
+root@3e32ac3b8863:/app# make clean && make && /app/stress_test
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 1261 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@3e32ac3b8863:/app#

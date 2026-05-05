@@ -1,0 +1,168 @@
+New Terminal Output:
+
+root@dff6bd1a2c8d:/app# ls -R /app/dns
+/app/dns:
+primary  resolver  secondary
+
+/app/dns/primary:
+keys  named.conf  zones
+
+/app/dns/primary/keys:
+transfer.key
+
+/app/dns/primary/zones:
+example.com.zone  secure.example.com.zone  secure.example.com.zone.signed
+
+/app/dns/resolver:
+named.conf
+
+/app/dns/secondary:
+keys  named.conf  zones
+
+/app/dns/secondary/keys:
+transfer.key
+
+/app/dns/secondary/zones:
+root@dff6bd1a2c8d:/app# sed -n '1,200p' /app/dns/primary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5301 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-transfer { key "transfer-key"; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-primary.pid";
+};
+
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "PrimarySecretKey12345678901234567890ABCD==";
+};
+
+zone "example.com" {
+    type master;
+    file "/app/dns/primary/zones/example.com.zone";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+zone "secure.example.com" {
+    type master;
+    file "/app/dns/primary/zones/secure.example.com.zone.signed";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-primary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@dff6bd1a2c8d:/app# sed -n '1,200p' /app/dns/secondary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5302 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-secondary.pid";
+};
+
+; BUG: TSIG key has DIFFERENT secret than primary
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "SecondaryDifferentKey999888777666555==";
+};
+
+server 127.0.0.1 {
+    keys { transfer-key; };
+};
+
+zone "example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+zone "secure.example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/secure.example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-secondary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@dff6bd1a2c8d:/app# sed -n '1,200p' /app/dns/resolver/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5300 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-recursion { any; };
+    recursion yes;
+    forwarders {
+        127.0.0.1 port 5301;
+    };
+    forward only;
+    dnssec-validation auto;
+    ; BUG: Negative cache TTL way too high
+    max-ncache-ttl 86400;
+    pid-file "/var/run/named/named-resolver.pid";
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-resolver.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@dff6bd1a2c8d:/app# named-checkconf /app/dns/primary/named.conf || true
+/app/dns/primary/named.conf:14: bad secret 'bad base64 encoding'
+root@dff6bd1a2c8d:/app# named-checkconf /app/dns/secondary/named.conf || true
+/app/dns/secondary/named.conf:11: syntax error near ';'
+root@dff6bd1a2c8d:/app# named-checkconf /app/dns/resolver/named.conf || true
+/app/dns/resolver/named.conf:13: '}' expected near ';'
+root@dff6bd1a2c8d:/app# named-checkzone example.com /app/dns/primary/zones/example.com.zone || true
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' has no REQUIRED GLUE address records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' has no REQUIRED GLUE address records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: loaded serial 2024010101
+OK
+root@dff6bd1a2c8d:/app# named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone || true
+zone secure.example.com/IN: loaded serial 2024010101
+OK
+root@dff6bd1a2c8d:/app# named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed || true
+/app/dns/primary/zones/secure.example.com.zone.signed:9: signature has expired
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:15: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:19: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:27: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:31: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:35: near eol: bad base64 encoding
+zone secure.example.com/IN: loading from master file /app/dns/primary/zones/secure.example.com.zone.signed failed: bad base64 encoding
+zone secure.example.com/IN: not loaded due to errors.
+root@dff6bd1a2c8d:/app# pkill named || true
+root@dff6bd1a2c8d:/app# named -c /app/dns/primary/named.conf -g > /tmp/named_primary.log 2>&1 &
+[1] 555
+root@dff6bd1a2c8d:/app# named -c /app/dns/secondary/named.conf -g > /tmp/named_secondary.log 2>&1 &
+[2] 572
+[1]   Exit 1                  named -c /app/dns/primary/named.conf -g > /tmp/named_primary.log 2>&1
+root@dff6bd1a2c8d:/app# named -c /app/dns/resolver/named.conf -g > /tmp/named_resolver.log 2>&1 &
+[3] 590
+[2]   Exit 1                  named -c /app/dns/secondary/named.conf -g > /tmp/named_secondary.log 2>&1
+root@dff6bd1a2c8d:/app# ss -lntup | grep -E '(:5300|:5301|:5302)'
+[3]+  Exit 1                  named -c /app/dns/resolver/named.conf -g > /tmp/named_resolver.log 2>&1
+root@dff6bd1a2c8d:/app#

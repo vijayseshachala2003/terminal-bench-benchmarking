@@ -1,0 +1,244 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+root@59d9dd8bf36d:/app# cat << 'EOF' > fix_queue.py
+> import os
+>
+> header = """#ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+> #include <thread>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node;
+>
+>     struct TaggedPtr {
+>         Node* ptr;
+>         uint64_t tag;
+>
+>         TaggedPtr() : ptr(nullptr), tag(0) {}
+>         TaggedPtr(Node* p, uint64_t t) : ptr(p), tag(t) {}
+>
+ >         bool operator==(const TaggedPtr& other) const {
+>             return ptr == other.ptr && tag == other.tag;
+>         }
+>     };
+>
+>     struct Node {
+>         uint64_t value;
+>         std::atomic<TaggedPtr> next;
+>         Node() : value(0), next(TaggedPtr(nullptr, 0)) {}
+>         explicit Node(uint64_t val) : value(val), next(TaggedPtr(nullptr, 0)) {}
+>     };
+>
+>     std::atomic<TaggedPtr> head_;
+>     std::atomic<TaggedPtr> tail_;
+>
+>     // Simple Hazard Pointers
+>     static constexpr int MAX_THREADS = 8;
+>     std::atomic<Node*> hazard_pointers_[MAX_THREADS];
+>
+>     struct RetiredNode {
+>         Node* node;
+>         RetiredNode* next;
+>     };
+>     std::atomic<RetiredNode*> retired_list_;
+>
+>     void retire_node(Node* node);
+>     void scan_retired();
+>     int get_thread_id();
+> };
+>
+> #endif
+> """
+>
+> cpp = """#include \"lockfree_queue.h\"
+> #include <new>
+> #include <vector>
+> #include <algorithm>
+>
+> static std::atomic<int> thread_counter{0};
+> thread_local int tid = -1;
+>
+> int LockFreeQueue::get_thread_id() {
+>     if (tid == -1) {
+>         tid = thread_counter.fetch_add(1, std::memory_order_relaxed) % MAX_THREADS;
+>     }
+>     return tid;
+> }
+>
+c> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(TaggedPtr(dummy, 0), std::memory_order_relaxed);
+>     tail_.store(TaggedPtr(dummy, 0), std::memory_order_relaxed);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+>     for (int i = 0; i < MAX_THREADS; ++i) {
+>         hazard_pointers_[i].store(nullptr, std::memory_order_relaxed);
+>     }
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     uint64_t dummy_val;
+>     while (dequeue(dummy_val)) {}
+>
+>     TaggedPtr head = head_.load(std::memory_order_relaxed);
+>     delete head.ptr;
+>
+>     RetiredNode* retired = retired_list_.load(std::memory_order_relaxed);
+>     while (retired) {
+>         RetiredNode* next = retired->next;
+>         delete retired->node;
+>         delete retired;
+>         retired = next;
+>     }
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     RetiredNode* rnode = new RetiredNode{node, nullptr};
+>     RetiredNode* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         rnode->next = old_head;
+>     } while (!retired_list_.compare_exchange_weak(old_head, rnode, std::memory_order_release, std::memory_order_relaxed));
+>
+>     scan_retired();
+> }
+>
+> void LockFreeQueue::scan_retired() {
+>     // Simplified scan: just try to free if not hazardous
+>     RetiredNode* current = retired_list_.exchange(nullptr, std::memory_order_acquire);
+>     if (!current) return;
+>
+>     std::vector<Node*> hazards;
+>     for (int i = 0; i < MAX_THREADS; ++i) {
+>         Node* hp = hazard_pointers_[i].load(std::memory_order_acquire);
+>         if (hp) hazards.push_back(hp);
+>     }
+>     std::sort(hazards.begin(), hazards.end());
+>
+>     RetiredNode* keep_head = nullptr;
+>     RetiredNode* keep_tail = nullptr;
+>
+>     while (current) {
+>         RetiredNode* next = current->next;
+>         if (std::binary_search(hazards.begin(), hazards.end(), current->node)) {
+>             current->next = nullptr;
+>             if (!keep_head) keep_head = current;
+>             else keep_tail->next = current;
+>             keep_tail = current;
+>         } else {
+>             delete current->node;
+>             delete current;
+>         }
+>         current = next;
+>     }
+>
+>     if (keep_head) {
+>         RetiredNode* old_head = retired_list_.load(std::memory_order_relaxed);
+>         do {
+>             keep_tail->next = old_head;
+>         } while (!retired_list_.compare_exchange_weak(old_head, keep_head, std::memory_order_release, std::memory_order_relaxed));
+>     }
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = new Node(value);
+>     int t = get_thread_id();
+>
+>     while (true) {
+>         TaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         hazard_pointers_[t].store(tail.ptr, std::memory_order_seq_cst);
+>         if (tail != tail_.load(std::memory_order_acquire)) continue;
+>
+>         TaggedPtr next = tail.ptr->next.load(std::memory_order_acquire);
+>         if (tail != tail_.load(std::memory_order_acquire)) continue;
+>
+>         if (next.ptr == nullptr) {
+>             TaggedPtr new_next(new_node, next.tag + 1);
+>             if (tail.ptr->next.compare_exchange_weak(next, new_next, std::memory_order_release, std::memory_order_relaxed)) {
+>                 TaggedPtr new_tail(new_node, tail.tag + 1);
+>                 tail_.compare_exchange_strong(tail, new_tail, std::memory_order_release, std::memory_order_relaxed);
+>                 hazard_pointers_[t].store(nullptr, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             TaggedPtr new_tail(next.ptr, tail.tag + 1);
+>             tail_.compare_exchange_strong(tail, new_tail, std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     int t = get_thread_id();
+>
+>     while (true) {
+>         TaggedPtr head = head_.load(std::memory_order_acquire);
+>         hazard_pointers_[t].store(head.ptr, std::memory_order_seq_cst);
+>         if (head != head_.load(std::memory_order_acquire)) continue;
+>
+>         TaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         TaggedPtr next = head.ptr->next.load(std::memory_order_acquire);
+>         if (head != head_.load(std::memory_order_acquire)) continue;
+>
+>         if (head.ptr == tail.ptr) {
+>             if (next.ptr == nullptr) {
+>                 hazard_pointers_[t].store(nullptr, std::memory_order_relaxed);
+>                 return false;
+>             }
+>             TaggedPtr new_tail(next.ptr, tail.tag + 1);
+>             tail_.compare_exchange_strong(tail, new_tail, std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             value = next.ptr->value;
+>             TaggedPtr new_head(next.ptr, head.tag + 1);
+>             if (head_.compare_exchange_weak(head, new_head, std::memory_order_release, std::memory_order_relaxed)) {
+>                 hazard_pointers_[t].store(nullptr, std::memory_order_relaxed);
+>                 retire_node(head.ptr);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> """
+>
+> with open('lockfree_queue.h', 'w') as f:
+>     f.write(header)
+>
+> with open('lockfree_queue.cpp', 'w') as f:
+>     f.write(cpp)
+> EOF
+root@59d9dd8bf36d:/app# python3 fix_queue.py
+root@59d9dd8bf36d:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+lockfree_queue.cpp:96:18: error: invalid operands to binary expression ('LockFreeQueue::TaggedPtr' and 'LockFreeQueue::TaggedPtr')
+        if (tail != tail_.load(std::memory_order_acquire)) continue;
+            ~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+lockfree_queue.cpp:99:18: error: invalid operands to binary expression ('LockFreeQueue::TaggedPtr' and 'LockFreeQueue::TaggedPtr')
+        if (tail != tail_.load(std::memory_order_acquire)) continue;
+            ~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+lockfree_queue.cpp:122:18: error: invalid operands to binary expression ('LockFreeQueue::TaggedPtr' and 'LockFreeQueue::TaggedPtr')
+        if (head != head_.load(std::memory_order_acquire)) continue;
+            ~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+lockfree_queue.cpp:126:18: error: invalid operands to binary expression ('LockFreeQueue::TaggedPtr' and 'LockFreeQueue::TaggedPtr')
+        if (head != head_.load(std::memory_order_acquire)) continue;
+            ~~~~ ^  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4 errors generated.
+make: *** [Makefile:13: stress_test] Error 1
+root@59d9dd8bf36d:/app# ./stress_test
+bash: ./stress_test: No such file or directory
+root@59d9dd8bf36d:/app#

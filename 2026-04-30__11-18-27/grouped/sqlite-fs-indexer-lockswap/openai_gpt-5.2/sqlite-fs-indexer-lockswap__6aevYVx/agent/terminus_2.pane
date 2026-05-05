@@ -1,0 +1,348 @@
+[?2004hroot@e4e86a37e8ea:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@e4e86a37e8ea:/app# clear
+[?2004l[H[J[3J[?2004hroot@e4e86a37e8ea:/app# ls -la
+[?2004ltotal 0
+drwxr-xr-x. 1 root root 17 Apr 30 09:49 .
+drwxr-xr-x. 1 root root 74 Apr 30 13:24 ..
+drwxr-xr-x. 2 root root 43 Apr 30 09:49 app
+[?2004hroot@e4e86a37e8ea:/app# find /app -maxdepth 3 -type f -print
+[?2004l/app/app/__init__.py
+/app/app/indexer.py
+[?2004hroot@e4e86a37e8ea:/app# sed -n '1,200p' /app/app/indexer.py
+[?2004l# Implement build_index here.
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    raise NotImplementedError
+[?2004hroot@e4e86a37e8ea:/app# ls -la /app/app
+[?2004ltotal 4
+drwxr-xr-x. 2 root root  43 Apr 30 09:49 .
+drwxr-xr-x. 1 root root  17 Apr 30 09:49 ..
+-rw-r--r--. 1 root root   0 Apr 30 09:49 __init__.py
+-rw-r--r--. 1 root root 203 Apr 30 09:49 indexer.py
+[?2004hroot@e4e86a37e8ea:/app# cat > /app/app/indexer.py <<'PY'
+[?2004l[?2004h> import fnmatch
+[?2004l[?2004h> import hashlib
+[?2004l[?2004h> import os
+[?2004l[?2004h> import re
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> import tempfile
+[?2004l[?2004h> import time
+[?2004l[?2004h> import unicodedata
+[?2004l[?2004h> from typing import Dict, Iterable, List, Optional, Tuple
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _to_posix_relpath(path: str) -> str:
+[?2004l[?2004h>     # Ensure forward slashes regardless of platform.
+[?2004l[?2004h>     return path.replace(os.sep, "/")
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004lr[?2004h> def _nfc(s: str) -> str:
+[?2004l[?2004h>     return unicodedata.normalize("NFC", s)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _compile_pattern(pat: str) -> re.Pattern:
+[?2004l[?2004h>     """Compile a glob-like pattern to a regex.
+[?2004l[?2004h> 
+[?2004l [?2004h>     Rules:
+[?2004l[?2004h>     - '*' matches 0+ chars except '/'
+[?2004l[?2004h>     - '**' is NOT special; it means two literal '*' characters.
+[?2004l[?2004h>     """
+[?2004l[?2004h>     # We cannot use fnmatch.translate directly because it treats '*' as matching '/'.
+[?2004l[?2004h>     # Implement our own minimal glob -> regex.
+[?2004l[?2004h>     out = ["^"]
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(pat):
+[?2004l[?2004h>         c = pat[i]
+[?2004l[?2004h>         if c == "*":
+[?2004l[?2004h>             # '**' is literal two '*' characters.
+[?2004l[?2004h>             if i + 1 < len(pat) and pat[i + 1] == "*":
+[?2004l[?2004h>                 out.append(re.escape("**"))
+[?2004l[?2004h>                 i += 2
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             out.append("[^/]*")
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         out.append(re.escape(c))
+[?2004l[?2004h>         i += 1
+[?2004l[?2004h>     out.append("$")
+[?2004l[?2004h>     return re.compile("".join(out))
+[?2004l[?2004h> 
+[?2004ln[?2004h> 
+[?2004l[?2004h> class _Ignore:
+[?2004l[?2004h>     def __init__(self, patterns: Iterable[str]):
+[?2004l[?2004h>         self._items: List[Tuple[str, bool, bool, re.Pattern]] = []
+[?2004l[?2004h>         # (pattern_nfc, anchored, has_slash, compiled_regex)
+[?2004l[?2004h>         for raw in patterns:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 p = _nfc(raw)
+[?2004l[?2004h>             except Exception:
+[?2004l[?2004h>                 # Malformed unicode should not crash.
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             anchored = p.startswith("/")
+[?2004l[?2004h>             if anchored:
+[?2004l[?2004h>                 p2 = p[1:]
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 p2 = p
+[?2004l[?2004h>             has_slash = "/" in p2
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 rx = _compile_pattern(p2)
+[?2004l[?2004h>             except re.error:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             self._items.append((p2, anchored, has_slash, rx))
+[?2004l[?2004h> 
+[?2004l[?2004h>     def match(self, rel_nfc_posix: str) -> bool:
+[?2004l[?2004h>         # rel_nfc_posix must be NFC and use '/'.
+[?2004l[?2004h>         if rel_nfc_posix == "":
+[?2004l[?2004h>             return False
+[?2004l[?2004h>         components = rel_nfc_posix.split("/")
+[?2004l[?2004h>         for _p2, anchored, has_slash, rx in self._items:
+[?2004l[?2004h>             if anchored:
+[?2004l[?2004h>                 if rx.match(rel_nfc_posix):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             if not has_slash:
+[?2004l[?2004h>                 # Match against each component.
+[?2004l[?2004h>                 for comp in components:
+[?2004l[?2004h>                     if rx.match(comp):
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             # Contains '/' but not anchored: match full path OR any suffix starting at a '/' boundary.
+[?2004l[?2004h>             if rx.match(rel_nfc_posix):
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>             # Try suffixes after each boundary.
+[?2004l[?2004h>             # e.g. a/b/c -> test b/c and c
+[?2004l[?2004h>             for i in range(1, len(components)):
+[?2004l[?2004h>                 suffix = "/".join(components[i:])
+[?2004l[?2004h>                 if rx.match(suffix):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _read_ignore_file(path: str = "/data/ignore.txt") -> List[str]:
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         with open(path, "r", encoding="utf-8", errors="replace") as f:
+[?2004l[?2004h>             lines = f.read().splitlines()
+[?2004l[?2004h>     except FileNotFoundError:
+[?2004l[?2004h>         return []
+[?2004l[?2004h>     except OSError:
+[?2004l[?2004h>         return []
+[?2004l[?2004h> 
+[?2004l[?2004h>     pats: List[str] = []
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         s = line.strip("\n\r")
+[?2004l[?2004h>         if not s.strip():
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         # Comment if first non-whitespace is '#'
+[?2004l[?2004h>         stripped = s.lstrip()
+[?2004l[?2004h>         if stripped.startswith("#"):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         # Use the line as-is (minus trailing newline), but strip only trailing CR if present.
+[?2004l[?2004h>         pats.append(s.rstrip("\r"))
+[?2004l[?2004h>     return pats
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _hash_file(path: str) -> Tuple[str, int]:
+[?2004l[?2004h>     h = hashlib.sha256()
+[?2004l[?2004h>     size = 0
+[?2004l[?2004h>     with open(path, "rb") as f:
+[?2004l[?2004h>         for chunk in iter(lambda: f.read(1024 * 1024), b""):
+[?2004l[?2004h>             size += len(chunk)
+[?2004l[?2004h>             h.update(chunk)
+[?2004l[?2004h>     return h.hexdigest(), size
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def build_index(root_dir: str, db_path: str) -> None:
+[?2004l[?2004h>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+[?2004l[?2004h> 
+[?2004l[?2004h>     root_dir = os.path.abspath(root_dir)
+[?2004l[?2004h>     ignore = _Ignore(_read_ignore_file())
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Map NFC relative path -> (original_rel_posix, abs_path)
+[?2004l[?2004h>     chosen: Dict[str, Tuple[str, str]] = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True, followlinks=False):
+[?2004l[?2004h>         # Deterministic traversal order.
+[?2004l[?2004h>         dirnames.sort()
+[?2004l[?2004h>         filenames.sort()
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Remove symlinked directories from traversal.
+[?2004l[?2004h>         pruned: List[str] = []
+[?2004l[?2004h>         for d in dirnames:
+[?2004l[?2004h>             full = os.path.join(dirpath, d)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 if os.path.islink(full):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             pruned.append(d)
+[?2004l[?2004h>         dirnames[:] = pruned
+[?2004l[?2004h> 
+[?2004l[?2004h>         for name in filenames:
+[?2004l[?2004h>             abs_path = os.path.join(dirpath, name)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 if os.path.islink(abs_path):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 rel = os.path.relpath(abs_path, root_dir)
+[?2004l[?2004h>             except ValueError:
+[?2004l[?2004h>                 # If relpath fails for any reason, skip.
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             rel_posix = _to_posix_relpath(rel)
+[?2004l[?2004h>             rel_nfc = _nfc(rel_posix)
+[?2004l[?2004h> 
+[?2004l[?2004h>             # Ignore rules apply to NFC path.
+[?2004l[?2004h>             if ignore.match(rel_nfc):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h> 
+[?2004l[?2004h>             prev = chosen.get(rel_nfc)
+[?2004l[?2004h>             if prev is None or rel_posix > prev[0]:
+[?2004l[?2004h>                 chosen[rel_nfc] = (rel_posix, abs_path)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Compute hashes and sizes; deterministic order by NFC path.
+[?2004l[?2004h>     rows: List[Tuple[str, str, int]] = []
+[?2004l[?2004h>     for rel_nfc in sorted(chosen.keys()):
+[?2004l[?2004h>         _orig_rel, abs_path = chosen[rel_nfc]
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             sha, size = _hash_file(abs_path)
+[?2004l[?2004h>         except OSError:
+[?2004l[?2004h>             # File disappeared or unreadable; skip.
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         rows.append((rel_nfc, sha, size))
+[?2004l[?2004h> 
+[?2004l[?2004h>     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+[?2004l[?2004h>     os.makedirs(db_dir, exist_ok=True)
+[?2004l[?2004h> 
+[?2004l[?2004h>     # Write to a temp DB in the same directory, then atomically replace.
+[?2004l[?2004h>     tmp_fd: Optional[int] = None
+[?2004l[?2004h>     tmp_path: Optional[str] = None
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         tmp_fd, tmp_path = tempfile.mkstemp(prefix=".indexer-", suffix=".sqlite", dir=db_dir)
+[?2004l[?2004h>         os.close(tmp_fd)
+[?2004l[?2004h>         tmp_fd = None
+[?2004l[?2004h> 
+[?2004l[?2004h>         con = sqlite3.connect(tmp_path, timeout=30.0, isolation_level=None)
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             con.execute("PRAGMA journal_mode=WAL;")
+[?2004l[?2004h>             con.execute("PRAGMA synchronous=NORMAL;")
+[?2004l[?2004h>             con.execute("PRAGMA temp_store=MEMORY;")
+[?2004l[?2004h>             con.execute("PRAGMA foreign_keys=OFF;")
+[?2004l[?2004h> 
+[?2004l[?2004h>             con.execute("BEGIN IMMEDIATE;")
+[?2004l[?2004h>             con.execute(
+[?2004l[?2004h>                 "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL);"
+[?2004l[?2004h>             )
+[?2004l[?2004h>             con.execute("DELETE FROM files;")
+[?2004l[?2004h>             con.executemany("INSERT INTO files(path, sha256, size) VALUES (?, ?, ?);", rows)
+[?2004l[?2004h>             con.execute("COMMIT;")
+[?2004l[?2004h>         finally:
+[?2004l[?2004h>             con.close()
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Atomic replace; retry a bit for transient contention.
+[?2004l[?2004h>         last_exc: Optional[BaseException] = None
+[?2004l[?2004h>         for attempt in range(50):
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 os.replace(tmp_path, db_path)
+[?2004l[?2004h>                 tmp_path = None
+[?2004l[?2004h>                 last_exc = None
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             except OSError as e:
+[?2004l[?2004h>                 last_exc = e
+[?2004l[?2004h>                 time.sleep(0.02 * (attempt + 1))
+[?2004l[?2004h>         if last_exc is not None:
+[?2004l[?2004h>             raise last_exc
+[?2004l[?2004h>     finally:
+[?2004l[?2004h>         if tmp_fd is not None:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 os.close(tmp_fd)
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>         if tmp_path is not None:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 os.unlink(tmp_path)
+[?2004l[?2004h>             except OSError:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@e4e86a37e8ea:/app# python -c "import app.indexer; import inspect; print(app.indexer.build_index);"
+[?2004l<function build_index at 0x7fa4cac7eac0>
+[?2004hroot@e4e86a37e8ea:/app# pytest -q /tests/test_outputs.py
+[?2004lbash: pytest: command not found
+[?2004hroot@e4e86a37e8ea:/app# rm -rf /data/sample_tree /output/index.sqlite
+[?2004l[?2004hroot@e4e86a37e8ea:/app# mkdir -p /data/sample_tree/sub
+[?2004l[?2004hroot@e4e86a37e8ea:/app# printf 'hello' > /data/sample_tree/a.txt
+[?2004l[?2004hroot@e4e86a37e8ea:/app# printf 'world' > /data/sample_tree/sub/b.txt
+[?2004l[?2004hroot@e4e86a37e8ea:/app# ln -s /data/sample_tree/a.txt /data/sample_tree/link_to_a || true
+[?2004l[?2004hroot@e4e86a37e8ea:/app# ln -s /data/sample_tree/sub /data/sample_tree/link_to_sub || true
+[?2004l[?2004hroot@e4e86a37e8ea:/app# python - <<'PY'
+[?2004l[?2004h> from app.indexer import build_index
+[?2004l[?2004h> build_index('/data/sample_tree', '/output/index.sqlite')
+[?2004l[?2004h> print('built')
+[?2004l[?2004h> PY
+[?2004lbuilt
+[?2004hroot@e4e86a37e8ea:/app# python - <<'PY'
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> con = sqlite3.connect('/output/index.sqlite')
+[?2004l[?2004h> print('integrity_check:', con.execute('PRAGMA integrity_check;').fetchone()[0])
+[?2004l[?2004h> print('schema:', con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='files'").fetchone()[0])
+[?2004l[?2004h> print('cols:', con.execute("PRAGMA table_info(files);").fetchall())
+[?2004l[?2004h> print('rows:', con.execute('SELECT path, sha256, size FROM files ORDER BY path').fetchall())
+[?2004l[?2004h> con.close()
+[?2004l[?2004h> PY
+[?2004lintegrity_check: ok
+schema: CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)
+cols: [(0, 'path', 'TEXT', 0, None, 1), (1, 'sha256', 'TEXT', 1, None, 0), (2, 'size', 'INTEGER', 1, None, 0)]
+rows: [('a.txt', '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', 5), ('sub/b.txt', '486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7', 5)]
+[?2004hroot@e4e86a37e8ea:/app# python -m py_compile /app/app/indexer.py
+[?2004l[?2004hroot@e4e86a37e8ea:/app# grep -n "^r>\|^n>" -n /app/app/indexer.py || true
+[?2004l[?2004hroot@e4e86a37e8ea:/app# head -n 40 /app/app/indexer.py
+[?2004limport fnmatch
+import hashlib
+import os
+import re
+import sqlite3
+import tempfile
+import time
+import unicodedata
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+def _to_posix_relpath(path: str) -> str:
+    # Ensure forward slashes regardless of platform.
+    return path.replace(os.sep, "/")
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+def _compile_pattern(pat: str) -> re.Pattern:
+    """Compile a glob-like pattern to a regex.
+
+    Rules:
+    - '*' matches 0+ chars except '/'
+    - '**' is NOT special; it means two literal '*' characters.
+    """
+    # We cannot use fnmatch.translate directly because it treats '*' as matching '/'.
+    # Implement our own minimal glob -> regex.
+    out = ["^"]
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if c == "*":
+            # '**' is literal two '*' characters.
+            if i + 1 < len(pat) and pat[i + 1] == "*":
+                out.append(re.escape("**"))
+                i += 2
+                continue
+            out.append("[^/]*")
+[?2004hroot@e4e86a37e8ea:/app# perl -0777 -i -pe 's/^import fnmatch\n//' /app/app/indexer.py
+[?2004l[?2004hroot@e4e86a37e8ea:/app# python -m py_compile /app/app/indexer.py
+[?2004l[?2004hroot@e4e86a37e8ea:/app# 

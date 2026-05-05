@@ -1,0 +1,47 @@
+{
+  "analysis": "All three named instances are now running and listening on 5300/5301/5302. Secondary is successfully receiving AXFR for secure.example.com (log shows AXFR ended success). Resolver starts with dnssec-validation yes but currently has no custom trust anchor (our KSK extraction failed because awk variable name 'in' conflicted); nevertheless resolver runs. We need to: verify example.com AXFR works, run dig tests, ensure DNSSEC validation for secure.example.com succeeds (AD flag) by properly configuring trust-anchors (or alternative: disable validation would fail requirement). Also fix example.com delegation warning and ensure test_queries all succeed. Finally produce /app/dns_health.json.",
+  "plan": "1) Confirm zone transfers for example.com and secure.example.com from secondary via dig AXFR. 2) Fix resolver trust-anchors properly: extract full KSK DNSKEY rrset using a safe awk variable name, rewrite resolver named.conf to include it, restart resolver, and test that secure.example.com answers have the AD flag. 3) Run all queries in /app/test_queries.txt against resolver and ensure they succeed. 4) If any fail (e.g., due to out-of-zone NS for sub.example.com), adjust example.com zone accordingly and bump serial, then reload by restarting primary/secondary and re-transfer. 5) Write dns_health.json with issues fixed and status.",
+  "commands": [
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head -n 30\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head -n 30\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "awk 'BEGIN{flag=0} $0~/(^|[[:space:]])DNSKEY[[:space:]]+257[[:space:]]+3[[:space:]]+8/{flag=1} flag{print} flag && /\\)/{exit}' /app/dns/primary/zones/secure.example.com.zone.signed > /tmp/secure-ksk-full.rr\nwc -l /tmp/secure-ksk-full.rr\nhead -n 10 /tmp/secure-ksk-full.rr\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<EOF\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation yes;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named-resolver.pid\";\n};\n\ntrust-anchors {\n$(cat /tmp/secure-ksk-full.rr)\n};\n\ncontrols { };\nEOF\nnamed-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read -r t n; do echo \"===== $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1 +noall +answer +comments; done\n",
+      "duration": 6.0
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

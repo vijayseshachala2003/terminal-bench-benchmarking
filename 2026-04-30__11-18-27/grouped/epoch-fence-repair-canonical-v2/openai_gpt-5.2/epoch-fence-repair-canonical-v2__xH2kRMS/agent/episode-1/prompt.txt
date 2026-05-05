@@ -1,0 +1,341 @@
+Current terminal state:
+New Terminal Output:
+
+root@11c624f1cda6:/app# ls -la
+total 0
+drwxr-xr-x. 2 root root  6 Apr 30 09:45 .
+drwxr-xr-x. 1 root root 74 Apr 30 13:57 ..
+root@11c624f1cda6:/app# sed -n '1,200p' solution.py 2>/dev/null || echo 'solution.py missing'
+solution.py missing
+root@11c624f1cda6:/app# cat > solution.py <<'PY'
+> import re
+> from collections import defaultdict
+>
+> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+> STATE_NEW = "NEW"
+> STATE_BEGUN = "BEGUN"
+> STATE_PREPARED = "PREPARED"
+> STATE_DECIDED_COMMIT = "DECIDED_COMMIT"
+> STATE_DECIDED_ABORT = "DECIDED_ABORT"
+> STATE_ENDED = "ENDED"
+>
+>
+> def _parse_line(line: str):
+>     """Return (idx:int, tx:str, op:str, arg:str|None) or raise ValueError."""
+>     parts = line.split(" ")
+>     if any(p == "" for p in parts):
+>         # spec says single spaces; but split(" ") would produce '' on multiple spaces
+>         # treat as malformed
+>         raise ValueError("bad whitespace")
+>     if len(parts) < 3:
+>         raise ValueError("too few fields")
+>     if len(parts) > 4:
+ontinue
+            inf>         raise ValueError("too many fields")
+>
+>     idx_s, tx, op = parts[0], parts[1], parts[2]
+>     arg = parts[3] if len(parts) == 4 else None
+>
+>     if not idx_s.isdigit() or int(idx_s) <= 0:
+>         raise ValueError("bad idx")
+>     idx = int(idx_s)
+>
+R>     if not TX_RE.fullmatch(tx):
+>         raise ValueError("bad tx")
+>
+ >     if op == "BEGIN":
+>         if arg is not None:
+>             raise ValueError("BEGIN arg")
+>     elif op == "PREPARE":
+>         if arg is not None:
+>             raise ValueError("PREPARE arg")
+>     elif op == "VOTE":
+ >         if arg not in ("YES", "NO"):
+>             raise ValueError("VOTE arg")
+>     elif op == "COMMIT":
+>         if arg is not None:
+>             raise ValueError("COMMIT arg")
+>     elif op == "ABORT":
+>         if arg is not None:
+>             raise ValueError("ABORT arg")
+>     elif op == "END":
+>         if arg is not None:
+>             raise ValueError("END arg")
+>     elif op == "FENCE":
+>         if arg is None or not NONCE_RE.fullmatch(arg):
+>             raise ValueError("FENCE arg")
+>     elif op == "EPOCH":
+>         if arg is None or not NONCE_RE.fullmatch(arg):
+>             raise ValueError("EPOCH arg")
+>     else:
+>         raise ValueError("unknown op")
+>
+>     return idx, tx, op, arg
+>
+>
+> class TxInfo:
+>     __slots__ = (
+>         "seen",
+>         "has_begin",
+>         "has_prepare",
+>         "has_commit",
+>         "has_abort",
+>         "has_end",
+>         "votes",  # set of observed vote values
+>         "bad_reason",
+>         "state",
+>         "last_fence",  # int or None
+>     )
+>
+>     def __init__(self):
+>         self.seen = False
+>         self.has_begin = False
+>         self.has_prepare = False
+>         self.has_commit = False
+>         self.has_abort = False
+>         self.has_end = False
+>         self.votes = set()
+>         self.bad_reason = None
+>         self.state = STATE_NEW
+>         self.last_fence = None
+>
+>
+> def solve(lines: list[str]) -> str:
+>     # 1) Parse valid prefix
+>     events = []  # list of (tx, op, arg)
+>     for raw in lines:
+>         if not raw or raw.startswith("#"):
+>             continue
+>         try:
+>             _idx, tx, op, arg = _parse_line(raw)
+>         except ValueError:
+>             break
+>         events.append((tx, op, arg))
+>
+>     # 2) Shard-level EPOCH monotonicity; mark poisoned shards
+>     shard_last_epoch = {}
+>     poisoned_shards = set()
+>     for tx, op, arg in events:
+>         if op != "EPOCH":
+>             continue
+>         shard = tx[0]
+>         val = int(arg, 16)
+>         if shard in poisoned_shards:
+>             continue
+>         if shard in shard_last_epoch and val <= shard_last_epoch[shard]:
+>             poisoned_shards.add(shard)
+>             continue
+>         shard_last_epoch[shard] = val
+>
+>     # 3) Per-tx scan (ignoring EPOCH for state machine)
+>     txs = defaultdict(TxInfo)
+>
+>     def mark_bad(tx: str, reason: str):
+>         info = txs[tx]
+>         if info.bad_reason is None:
+>             info.bad_reason = reason
+>
+>     for tx, op, arg in events:
+>         info = txs[tx]
+>         info.seen = True
+>
+>         shard = tx[0]
+>         if shard in poisoned_shards:
+>             # Still record as seen, but no further processing needed
+>             continue
+>
+>         if info.bad_reason is not None:
+>             continue
+>
+>         if op == "EPOCH":
+>             continue
+>
+>         # FENCE monotonicity (does not change state)
+>         if op == "FENCE":
+>             val = int(arg, 16)
+>             if info.last_fence is not None and val <= info.last_fence:
+>                 mark_bad(tx, "BAD_FENCE")
+>                 continue
+>             info.last_fence = val
+>             continue
+>
+>     
+[... output limited to 10000 bytes; 1413 interior bytes omitted ...]
+        if op == "ABORT":
+>             # allowed from BEGUN or PREPARED or DECIDED_ABORT
+>             if info.state not in (STATE_BEGUN, STATE_PREPARED, STATE_DECIDED_ABORT):
+>                 mark_bad(tx, "BAD_ORDER")
+>                 continue
+>             info.state = STATE_DECIDED_ABORT
+>             info.has_abort = True
+>             continue
+>
+>         if op == "END":
+>             if info.state not in (STATE_DECIDED_COMMIT, STATE_DECIDED_ABORT):
+>                 mark_bad(tx, "BAD_ORDER")
+>                 continue
+>             info.state = STATE_ENDED
+>             info.has_end = True
+>             continue
+>
+>         # unreachable due to parser
+>         mark_bad(tx, "BAD_ORDER")
+>
+>     # 4) Apply shard poisoning
+>     for tx, info in list(txs.items()):
+>         if info.seen and tx[0] in poisoned_shards:
+>             info.bad_reason = "BAD_EPOCH"
+>
+>     # 5) Canonical minimal insertions for non-bad tx
+>     bad_lines = []
+>     ins_lines = []  # tuples (tx, op, arg_or_empty)
+>
+>     for tx in sorted(txs.keys()):
+>         info = txs[tx]
+>         if not info.seen:
+>             continue
+>         if info.bad_reason is not None:
+>             bad_lines.append(f"BAD {tx} {info.bad_reason}")
+>             continue
+>
+>         # Irreparable cases (spec section 6) that depend on presence, not necessarily detected above
+>         has_decision = info.has_commit or info.has_abort
+>         if info.has_end and not has_decision:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>         if info.has_commit and "NO" in info.votes:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>         if has_decision and not info.has_prepare:
+>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+>             continue
+>
+>         # Prerequisites insertions based on observed events
+>         if not info.has_begin:
+>             # if any non-EPOCH event exists, prerequisites require BEGIN
+>             # (also if PREPARE/VOTE existed, but would have made it BAD_ORDER earlier)
+>             ins_lines.append((tx, "BEGIN", None))
+>             info.has_begin = True
+>
+>         if ("YES" in info.votes or "NO" in info.votes) and not info.has_prepare:
+>             ins_lines.append((tx, "PREPARE", None))
+>             info.has_prepare = True
+>
+>         if info.has_prepare is False:
+>             # If transaction had PREPARE in log, it would be True; otherwise only insert if needed for later
+>             pass
+>
+>         # Decision handling
+>         if not has_decision:
+>             # Need a decision; if not prepared but begun only, ABORT is allowed directly by protocol,
+>             # but canonical rules say: if any VOTE but no PREPARE before it, insert BEGIN+PREPARE as needed.
+>             # For no decision by end:
+>             if "NO" in info.votes:
+>                 ins_lines.append((tx, "ABORT", None))
+>                 info.has_abort = True
+>             else:
+>                 # bespoke default commit
+>                 # commit requires PREPARE; if missing, it's not an irreparable case unless decision existed.
+>                 # But to make a valid terminal tx, we must insert PREPARE before COMMIT.
+>                 if not info.has_prepare:
+>                     ins_lines.append((tx, "PREPARE", None))
+>                     info.has_prepare = True
+>                 ins_lines.append((tx, "COMMIT", None))
+>                 info.has_commit = True
+>             has_decision = True
+>
+>         # END handling
+>         if not info.has_end:
+>             ins_lines.append((tx, "END", None))
+>             info.has_end = True
+>
+>     # 6) Sort INS lines canonically
+>     def ins_key(t):
+>         tx, op, arg = t
+>         return (tx, OP_ORDER[op], "" if arg is None else arg)
+>
+>     ins_lines_sorted = sorted(ins_lines, key=ins_key)
+>
+>     out = []
+>     out.extend(bad_lines)
+>     for tx, op, arg in ins_lines_sorted:
+>         if arg is None:
+>             out.append(f"INS {tx} {op}")
+>         else:
+>             out.append(f"INS {tx} {op} {arg}")
+>
+>     if not out:
+>         return "OK"
+>     return "\n".join(out)
+>
+>
+> if __name__ == "__main__":
+>     import sys
+>     print(solve(sys.stdin.read().splitlines()))
+> PY
+root@11c624f1cda6:/app# python - <<'PY'
+> from solution import solve
+>
+> # Example 1
+> lines = [
+> "1 a1 BEGIN",
+> "2 a1 EPOCH 0000000A",
+> "3 a2 BEGIN",
+> "4 a2 EPOCH 00000009",
+> "5 b1 BEGIN",
+> "6 b1 EPOCH 00000001",
+> ]
+> print(solve(lines))
+> print('---')
+> # Example 2
+> lines = [
+> "1 c1 BEGIN",
+> "2 c1 PREPARE",
+> "3 c1 VOTE YES",
+> "4 c1 VOTE NO",
+> ]
+> print(solve(lines))
+> print('---')
+> # Example 3
+> lines = [
+> "1 d1 BEGIN",
+> "2 d1 END",
+> ]
+> print(solve(lines))
+> print('---')
+> # Example 4
+> lines = [
+> "1 a1 BEGIN",
+> "2 a1 PREPARE",
+> ]
+> print(solve(lines))
+> PY
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+---
+BAD c1 BAD_VOTE
+---
+BAD d1 BAD_ORDER
+---
+INS a1 COMMIT
+INS a1 END
+root@11c624f1cda6:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

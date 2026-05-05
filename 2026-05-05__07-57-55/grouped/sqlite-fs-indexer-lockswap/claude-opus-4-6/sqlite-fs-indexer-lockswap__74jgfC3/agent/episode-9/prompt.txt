@@ -1,0 +1,223 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@ece4444ae416:/app# cat /app/app/__init__.py; echo '---END---'
+---END---
+root@ece4444ae416:/app# python3 -c "import app.indexer; print('Module import OK'); print(dir(app.indexer))"
+Module import OK
+['__builtins__', '__cached__', '__doc__', '__file__', '__loader__', '__name__', '__package__', '__spec__', '_do_match', '_hash_file', '_pattern_match', '_read_i
+gnore_patterns', '_should_ignore', 'build_index', 'fcntl', 'hashlib', 'os', 'sqlite3', 'tempfile', 'unicodedata']
+root@ece4444ae416:/app# which pytest 2>/dev/null || python3 -m pytest --version 2>/dev/null
+root@ece4444ae416:/app# cat /app/app/indexer.py
+import os
+import hashlib
+import sqlite3
+import unicodedata
+import tempfile
+import fcntl
+
+
+def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+    """Read and parse ignore patterns from the ignore file."""
+    patterns = []
+    try:
+        with open(ignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n").rstrip("\r")
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pattern = unicodedata.normalize("NFC", line.strip())
+                if pattern:
+                    patterns.append(pattern)
+    except (FileNotFoundError, OSError):
+        pass
+    return patterns
+
+
+def _pattern_match(pattern, text):
+    """
+    Match pattern against text.
+    '*' matches zero or more characters except '/'.
+    '**' is NOT a recursive glob - just two consecutive '*' wildcards
+    (equivalent to a single '*').
+    All other characters are literal.
+    """
+    return _do_match(pattern, 0, text, 0, {})
+
+
+def _do_match(pattern, pi, text, ti, memo):
+    """Recursive pattern matching with memoization."""
+    key = (pi, ti)
+    if key in memo:
+        return memo[key]
+
+    result = False
+    if pi == len(pattern):
+        result = (ti == len(text))
+    elif pattern[pi] == '*':
+        # '*' matches zero or more non-'/' characters
+        for k in range(ti, len(text) + 1):
+            if k > ti and text[k - 1] == '/':
+                break
+            if _do_match(pattern, pi + 1, text, k, memo):
+                result = True
+                break
+    else:
+        if ti < len(text) and pattern[pi] == text[ti]:
+            result = _do_match(pattern, pi + 1, text, ti + 1, memo)
+
+    memo[key] = result
+    return result
+
+
+def _should_ignore(rel_path_nfc, patterns):
+    """
+    Check if a file should be ignored based on patterns.
+    rel_path_nfc is the NFC-normalized relative path using '/' separators.
+    """
+    for pattern in patterns:
+        if pattern.startswith('/'):
+            # Anchored: match against full relative path only
+            anchor_pattern = pattern[1:]
+            if _pattern_match(anchor_pattern, rel_path_nfc):
+                return True
+        elif '/' in pattern:
+            # Contains '/' but no leading '/': match full path or any suffix after '/'
+            if _pattern_match(pattern, rel_path_nfc):
+                return True
+            idx = 0
+            while True:
+                idx = rel_path_nfc.find('/', idx)
+                if idx == -1:
+                    break
+                suffix = rel_path_nfc[idx + 1:]
+                if _pattern_match(pattern, suffix):
+                    return True
+                idx += 1
+        else:
+            # No '/': match against each path component
+            components = rel_path_nfc.split('/')
+            for comp in components:
+                if _pattern_match(pattern, comp):
+                    return True
+    return False
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash of a file, return (hex_digest, size)."""
+    h = hashlib.sha256()
+    size = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    ignore_patterns = _read_ignore_patterns()
+
+    # Dict: nfc_path -> (original_rel_path, full_path)
+    file_map = {}
+    root_dir = os.path.abspath(root_dir)
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Filter out symlinked directories; sort for determinism
+        dirnames[:] = [
+            d for d in sorted(dirnames)
+            if not os.path.islink(os.path.join(dirpath, d))
+        ]
+
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+
+            # Skip symlinks
+            if os.path.islink(full_path):
+                continue
+
+            # Relative path with forward slashes
+            rel_path = os.path.relpath(full_path, root_dir)
+            rel_path = rel_path.replace(os.sep, '/')
+
+            # NFC normalize
+            rel_path_nfc = unicodedata.normalize('NFC', rel_path)
+
+            # Check ignore patterns
+            if _should_ignore(rel_path_nfc, ignore_patterns):
+                continue
+
+            # Handle Unicode collisions: keep lexicographically largest original
+            if rel_path_nfc in file_map:
+                existing_orig = file_map[rel_path_nfc][0]
+                if rel_path > existing_orig:
+                    file_map[rel_path_nfc] = (rel_path, full_path)
+            else:
+                file_map[rel_path_nfc] = (rel_path, full_path)
+
+    # Build rows sorted by NFC path for determinism
+    rows = []
+    for nfc_path in sorted(file_map.keys()):
+        orig_rel, full_path = file_map[nfc_path]
+        try:
+            hex_digest, size = _hash_file(full_path)
+            rows.append((nfc_path, hex_digest, size))
+        except (OSError, IOError):
+            continue
+
+    # Write to database with concurrency safety
+    # Use a lock file + temp file + atomic rename
+    db_abs = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_abs)
+    os.makedirs(db_dir, exist_ok=True)
+
+    lock_path = db_abs + ".lock"
+    lock_fd = open(lock_path, 'w')
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+
+        fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db', prefix='.indexer_tmp_')
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(tmp_path)
+            try:
+                # Use DELETE journal mode to avoid WAL/SHM sidecar files
+                conn.execute('PRAGMA journal_mode=DELETE')
+                conn.execute('PRAGMA synchronous=FULL')
+                conn.execute(
+                    'CREATE TABLE files ('
+                    '  path TEXT PRIMARY KEY,'
+                    '  sha256 TEXT NOT NULL,'
+                    '  size INTEGER NOT NULL'
+                    ')'
+                )
+                conn.executemany(
+                    'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+                    rows
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            os.replace(tmp_path, db_abs)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    finally:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        lock_fd.close()
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+root@ece4444ae416:/app#

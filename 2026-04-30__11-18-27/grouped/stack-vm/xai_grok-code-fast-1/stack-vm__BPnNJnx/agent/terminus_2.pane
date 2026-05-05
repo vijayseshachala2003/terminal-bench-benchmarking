@@ -1,0 +1,462 @@
+[?2004hroot@c08d5dcf8301:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@c08d5dcf8301:/app# clear
+[?2004l[H[J[3J[?2004hroot@c08d5dcf8301:/app# chmod +x svm.py
+[?2004lchmod: cannot access 'svm.py': No such file or directory
+[?2004hroot@c08d5dcf8301:/app# cp svm.py svm
+[?2004lcp: cannot stat 'svm.py': No such file or directory
+[?2004hroot@c08d5dcf8301:/app# cat > svm.py << 'EOF'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> 
+[?2004l[?2004h> import sys
+[?2004l[?2004h> 
+[?2004l[?2004h> class Value:
+[?2004l[?2004h>     def __init__(self, type_, val):
+[?2004l[?2004h>         self.type = type_
+[?2004l[?2004h>         self.val = val
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __str__(self):
+[?2004l[?2004h>         return str(self.val)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __eq__(self, other):
+[?2004l[?2004h>         return isinstance(other, Value) and self.type == other.type and self.val == other.val
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c08d5dcf8301:/app# cat >> svm.py << 'EOF'
+[?2004l[?2004h> def parse_program(filename):
+[?2004l[?2004h>     program = []
+[?2004l[?2004h>     labels = {}
+[?2004l[?2004h>     procedures = {}
+[?2004l[?2004h>     current_proc = None
+[?2004l[?2004h>     proc_code = []
+[?2004l[?2004h>     with open(filename) as f:
+[?2004l[?2004h>         for line in f:
+[?2004l[?2004h>             line = line.strip()
+[?2004l[?2004h>             if not line or line.startswith('#'):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             parts = line.split()
+[?2004l[?2004h>             instr = parts[0].upper()
+[?2004l[?2004h>             args = parts[1:]
+[?2004l[?2004h>             if instr == 'LABEL':
+[?2004l[?2004h>                 if current_proc:
+[?2004l[?2004h>                     labels[args[0]] = len(proc_code)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     labels[args[0]] = len(program)
+[?2004l[?2004h>             elif instr == 'PROC':
+[?2004l[?2004h>                 name = args[0]
+[?2004l[?2004h>                 nargs = int(args[1])
+[?2004l[?2004h>                 nlocals = int(args[2])
+[?2004l[?2004h>                 procedures[name] = {'nargs': nargs, 'nlocals': nlocals, 'code': []}
+[?2004l[?2004h>                 current_proc = name
+[?2004l[?2004h>                 proc_code = []
+[?2004l[?2004h>             elif instr == 'ENDPROC':
+[?2004l[?2004h>                 procedures[current_proc]['code'] = proc_code
+[?2004l[?2004h>                 current_proc = None
+[?2004l[?2004h>                 proc_code = []
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 if current_proc:
+[?2004l[?2004h>                     proc_code.append((instr, args))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     program.append((instr, args))
+[?2004l[?2004h>     def resolve(code):
+[?2004l[?2004h>         for i in range(len(code)):
+[?2004l[?2004h>             instr, args = code[i]
+[?2004l[?2004h>             if instr in ('JMP', 'JZ', 'JNZ', 'TRY') and args[0] in labels:
+[?2004l[?2004h>                 args[0] = labels[args[0]]
+[?2004l[?2004h>         return code
+[?2004l[?2004h>     program = resolve(program)
+[?2004l[?2004h>     for proc in procedures.values():
+[?2004l[?2004h>         proc['code'] = resolve(proc['code'])
+[?2004l[?2004h>     return program, procedures
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c08d5dcf8301:/app# cat >> svm.py << 'EOF'
+[?2004l[?2004h> def execute(program, procedures):
+[?2004l[?2004h>     stack = []
+[?2004l[?2004h>     heap = {}
+[?2004l[?2004h>     free_list = set()
+[?2004l[?2004h>     allocations = {}
+[?2004l[?2004h>     current_addr = 0
+[?2004l[?2004h>     local_stack = []
+[?2004l[?2004h>     call_stack = []
+[?2004l[?2004h>     exception_handlers = []
+[?2004l[?2004h>     current_closure = None
+[?2004l[?2004h>     current_code = program
+[?2004l[?2004h>     pc = 0
+[?2004l[?2004h>     def pop_stack():
+[?2004l[?2004h>         if not stack:
+[?2004l[?2004h>             print("ERROR: stack underflow", file=sys.stderr)
+[?2004l[?2004h>             sys.exit(1)
+[?2004l[?2004h>         return stack.pop()
+[?2004l[?2004h>     def push_stack(v):
+[?2004l[?2004h>         stack.append(v)
+[?2004l[?2004h>     def throw(val):
+[?2004l[?2004h>         if exception_handlers:
+[?2004l[?2004h>             nonlocal pc
+[?2004l[?2004h>             pc = exception_handlers[-1]
+[?2004l[?2004h>             push_stack(val)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             print("EXCEPTION: " + str(val), file=sys.stderr)
+[?2004l[?2004h>             sys.exit(1)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c08d5dcf8301:/app# cat >> svm.py << 'EOF'
+[?2004l[?2004h>     while pc < len(current_code):
+[?2004l[?2004h>         instr, args = current_code[pc]
+[?2004l[?2004h>         pc += 1
+[?2004l[?2004h>         if instr == 'PUSH':
+[?2004l[?2004h>             val_str = ' '.join(args)
+[?2004l[?2004h>             if val_str.startswith('"') and val_str.endswith('"'):
+[?2004l[?2004h>                 val = val_str[1:-1]
+[?2004l[?2004h>                 val = val.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+[?2004l[?2004h>                 push_stack(Value('string', val))
+[?2004l[?2004h>             elif '.' in val_str:
+[?2004l[?2004h>                 push_stack(Value('float', float(val_str)))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 push_stack(Value('int', int(val_str)))
+[?2004l[?2004h>         elif instr == 'POP':
+[?2004l[?2004h>             pop_stack()
+[?2004l[?2004h>         elif instr == 'DUP':
+[?2004l[?2004h>             v = pop_stack()
+[?2004l[?2004h>             push_stack(v)
+[?2004l[?2004h>             push_stack(v)
+[?2004l[?2004h>         elif instr == 'SWAP':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(b)
+[?2004l[?2004h>             push_stack(a)
+[?2004l[?2004h>         elif instr == 'ROT':
+[?2004l[?2004h>             c = pop_stack()
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(b)
+[?2004l[?2004h>             push_stack(c)
+[?2004l[?2004h>             push_stack(a)
+[?2004l[?2004h>         elif instr == 'ADD':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == b.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', a.val + b.val))
+[?2004l[?2004h>             elif a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 push_stack(Value('float', float(a.val) + float(b.val)))
+[?2004l[?2004h>             elif a.type == b.type == 'string':
+[?2004l[?2004h>                 push_stack(Value('string', a.val + b.val))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot ADD {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'SUB':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 res = float(a.val) - float(b.val)
+[?2004l[?2004h>                 push_stack(Value('int' if a.type == b.type == 'int' else 'float', res))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot SUB {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'MUL':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 res = float(a.val) * float(b.val)
+[?2004l[?2004h>                 push_stack(Value('int' if a.type == b.type == 'int' else 'float', res))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot MUL {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'DIV':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if b.val == 0:
+[?2004l[?2004h>                 throw(Value('string', 'division by zero'))
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 if a.type == b.type == 'int':
+[?2004l[?2004h>                     push_stack(Value('int', a.val // b.val))
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     push_stack(Value('float', float(a.val) / float(b.val)))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot DIV {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'MOD':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if b.val == 0:
+[?2004l[?2004h>                 throw(Value('string', 'division by zero'))
+[?2004l[?2004h>             if a.type == b.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', a.val % b.val))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot MOD {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'NEG':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', -a.val))
+[?2004l[?2004h>             elif a.type == 'float':
+[?2004l[?2004h>                 push_stack(Value('float', -a.val))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot NEG {a.type}'))
+[?2004l[?2004h>         elif instr == 'EQ':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(Value('int', 1 if a == b else 0))
+[?2004l[?2004h>         elif instr == 'NE':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(Value('int', 1 if a != b else 0))
+[?2004l[?2004h>         elif instr == 'LT':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 push_stack(Value('int', 1 if float(a.val) < float(b.val) else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot LT {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'GT':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 push_stack(Value('int', 1 if float(a.val) > float(b.val) else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot GT {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'LE':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 push_stack(Value('int', 1 if float(a.val) <= float(b.val) else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot LE {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'GE':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('int', 'float') and b.type in ('int', 'float'):
+[?2004l[?2004h>                 push_stack(Value('int', 1 if float(a.val) >= float(b.val) else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot GE {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'AND':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == b.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', 1 if a.val and b.val else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot AND {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'OR':
+[?2004l[?2004h>             b = pop_stack()
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == b.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', 1 if a.val or b.val else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot OR {a.type} and {b.type}'))
+[?2004l[?2004h>         elif instr == 'NOT':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('int', 1 if not a.val else 0))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot NOT {a.type}'))
+[?2004l[?2004h>         elif instr == 'TYPE':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(Value('string', a.type))
+[?2004l[?2004h>         elif instr == 'TOINT':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == 'int':
+[?2004l[?2004h>                 push_stack(a)
+[?2004l[?2004h>             elif a.type == 'float':
+[?2004l[?2004h>                 push_stack(Value('int', int(a.val)))
+[?2004l[?2004h>             elif a.type == 'string':
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     push_stack(Value('int', int(a.val)))
+[?2004l[?2004h>                 except:
+[?2004l[?2004h>                     throw(Value('string', f'type error: cannot TOINT {a.type}'))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot TOINT {a.type}'))
+[?2004l[?2004h>         elif instr == 'TOFLOAT':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type == 'float':
+[?2004l[?2004h>                 push_stack(a)
+[?2004l[?2004h>             elif a.type == 'int':
+[?2004l[?2004h>                 push_stack(Value('float', float(a.val)))
+[?2004l[?2004h>             elif a.type == 'string':
+[?2004l[?2004h>                 try:
+[?2004l[?2004h>                     push_stack(Value('float', float(a.val)))
+[?2004l[?2004h>                 except:
+[?2004l[?2004h>                     throw(Value('string', f'type error: cannot TOFLOAT {a.type}'))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot TOFLOAT {a.type}'))
+[?2004l[?2004h>         elif instr == 'TOSTR':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             push_stack(Value('string', str(a.val)))
+[?2004l[?2004h>         elif instr == 'LEN':
+[?2004l[?2004h>             a = pop_stack()
+[?2004l[?2004h>             if a.type in ('string', 'array'):
+[?2004l[?2004h>                 push_stack(Value('int', len(a.val)))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot LEN {a.type}'))
+[?2004l[?2004h>         elif instr == 'NEWARRAY':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             push_stack(Value('array', [Value('int', 0) for _ in range(n)]))
+[?2004l[?2004h>         elif instr == 'ALOAD':
+[?2004l[?2004h>             idx = pop_stack()
+[?2004l[?2004h>             arr = pop_stack()
+[?2004l[?2004h>             if arr.type == 'array' and idx.type == 'int':
+[?2004l[?2004h>                 if 0 <= idx.val < len(arr.val):
+[?2004l[?2004h>                     push_stack(arr.val[idx.val])
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     throw(Value('string', 'index out of bounds'))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot ALOAD {arr.type} {idx.type}'))
+[?2004l[?2004h>         elif instr == 'ASTORE':
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             idx = pop_stack()
+[?2004l[?2004h>             arr = pop_stack()
+[?2004l[?2004h>             if arr.type == 'array' and idx.type == 'int':
+[?2004l[?2004h>                 if 0 <= idx.val < len(arr.val):
+[?2004l[?2004h>                     arr.val[idx.val] = val
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     throw(Value('string', 'index out of bounds'))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'type error: cannot ASTORE {arr.type} {idx.type}'))
+[?2004l[?2004h>         elif instr == 'ALLOC':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             addr = current_addr
+[?2004l[?2004h>             allocations[addr] = n
+[?2004l[?2004h>             for i in range(n):
+[?2004l[?2004h>                 heap[addr + i] = Value('int', 0)
+[?2004l[?2004h>             current_addr += n
+[?2004l[?2004h>             push_stack(Value('int', addr))
+[?2004l[?2004h>         elif instr == 'LOAD':
+[?2004l[?2004h>             addr = pop_stack()
+[?2004l[?2004h>             if addr.type == 'int' and addr.val in free_list:
+[?2004l[?2004h>                 print("ERROR: use after free", file=sys.stderr)
+[?2004l[?2004h>                 sys.exit(1)
+[?2004l[?2004h>             if addr.type == 'int' and addr.val in heap:
+[?2004l[?2004h>                 push_stack(heap[addr.val])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'invalid address'))
+[?2004l[?2004h>         elif instr == 'STORE':
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             addr = pop_stack()
+[?2004l[?2004h>             if addr.type == 'int' and addr.val in free_list:
+[?2004l[?2004h>                 print("ERROR: use after free", file=sys.stderr)
+[?2004l[?2004h>                 sys.exit(1)
+[?2004l[?2004h>             if addr.type == 'int' and addr.val in heap:
+[?2004l[?2004h>                 heap[addr.val] = val
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'invalid address'))
+[?2004l[?2004h>         elif instr == 'FREE':
+[?2004l[?2004h>             addr = pop_stack()
+[?2004l[?2004h>             if addr.type == 'int' and addr.val not in allocations:
+[?2004l[?2004h>                 print("ERROR: use after free", file=sys.stderr)
+[?2004l[?2004h>                 sys.exit(1)
+[?2004l[?2004h>             n = allocations[addr.val]
+[?2004l[?2004h>             for i in range(n):
+[?2004l[?2004h>                 if addr.val + i in free_list:
+[?2004l[?2004h>                     print("ERROR: use after free", file=sys.stderr)
+[?2004l[?2004h>                     sys.exit(1)
+[?2004l[?2004h>                 free_list.add(addr.val + i)
+[?2004l[?2004h>             del allocations[addr.val]
+[?2004l[?2004h>         elif instr == 'LLOAD':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             if local_stack and n < len(local_stack[-1]):
+[?2004l[?2004h>                 push_stack(local_stack[-1][n])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'invalid local'))
+[?2004l[?2004h>         elif instr == 'LSTORE':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             if local_stack and n < len(local_stack[-1]):
+[?2004l[?2004h>                 local_stack[-1][n] = val
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'invalid local'))
+[?2004l[?2004h>         elif instr == 'CALL':
+[?2004l[?2004h>             name = args[0]
+[?2004l[?2004h>             if name in procedures:
+[?2004l[?2004h>                 proc = procedures[name]
+[?2004l[?2004h>                 nargs = proc['nargs']
+[?2004l[?2004h>                 nlocals = proc['nlocals']
+[?2004l[?2004h>                 args_vals = [pop_stack() for _ in range(nargs)]
+[?2004l[?2004h>                 args_vals.reverse()
+[?2004l[?2004h>                 local_vars = args_vals + [None] * nlocals
+[?2004l[?2004h>                 local_stack.append(local_vars)
+[?2004l[?2004h>                 call_stack.append((current_code, pc))
+[?2004l[?2004h>                 current_code = proc['code']
+[?2004l[?2004h>                 pc = 0
+[?2004l[?2004h>                 current_closure = None
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', f'unknown procedure {name}'))
+[?2004l[?2004h>         elif instr == 'RET':
+[?2004l[?2004h>             if call_stack:
+[?2004l[?2004h>                 return_val = pop_stack()
+[?2004l[?2004h>                 local_stack.pop()
+[?2004l[?2004h>                 current_code, pc = call_stack.pop()
+[?2004l[?2004h>                 push_stack(return_val)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'ret without call'))
+[?2004l[?2004h>         elif instr == 'CLOSURE':
+[?2004l[?2004h>             proc = args[0]
+[?2004l[?2004h>             ncaptures = int(args[1])
+[?2004l[?2004h>             captured = [pop_stack() for _ in range(ncaptures)]
+[?2004l[?2004h>             captured.reverse()
+[?2004l[?2004h>             closure = {'proc': proc, 'captured': captured}
+[?2004l[?2004h>             push_stack(Value('closure', closure))
+[?2004l[?2004h>         elif instr == 'CALLCLOSURE':
+[?2004l[?2004h>             closure_val = pop_stack()
+[?2004l[?2004h>             if closure_val.type == 'closure':
+[?2004l[?2004h>                 closure = closure_val.val
+[?2004l[?2004h>                 proc_name = closure['proc']
+[?2004l[?2004h>                 if proc_name in procedures:
+[?2004l[?2004h>                     proc = procedures[proc_name]
+[?2004l[?2004h>                     nargs = proc['nargs']
+[?2004l[?2004h>                     nlocals = proc['nlocals']
+[?2004l[?2004h>                     args_vals = [pop_stack() for _ in range(nargs)]
+[?2004l[?2004h>                     args_vals.reverse()
+[?2004l[?2004h>                     local_vars = args_vals + [None] * nlocals
+[?2004l[?2004h>                     local_stack.append(local_vars)
+[?2004l[?2004h>                     call_stack.append((current_code, pc))
+[?2004l[?2004h>                     current_code = proc['code']
+[?2004l[?2004h>                     pc = 0
+[?2004l[?2004h>                     current_closure = closure
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     throw(Value('string', f'unknown procedure {proc_name}'))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'not a closure'))
+[?2004l[?2004h>         elif instr == 'GETCAPTURED':
+[?2004l[?2004h>             n = int(args[0])
+[?2004l[?2004h>             if current_closure and n < len(current_closure['captured']):
+[?2004l[?2004h>                 push_stack(current_closure['captured'][n])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 throw(Value('string', 'invalid captured'))
+[?2004l[?2004h>         elif instr == 'JMP':
+[?2004l[?2004h>             pc = int(args[0])
+[?2004l[?2004h>         elif instr == 'JZ':
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             if (val.type in ('int', 'float') and val.val == 0) or (val.type == 'string' and val.val == '') or (val.type == 'array' and len(val.val) == 0):
+[?2004l[?2004h>                 pc = int(args[0])
+[?2004l[?2004h>         elif instr == 'JNZ':
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             if not ((val.type in ('int', 'float') and val.val == 0) or (val.type == 'string' and val.val == '') or (val.type == 'array' and len(val.val) == 0)):
+[?2004l[?2004h>                 pc = int(args[0])
+[?2004l[?2004h>         elif instr == 'TRY':
+[?2004l[?2004h>             exception_handlers.append(int(args[0]))
+[?2004l[?2004h>         elif instr == 'THROW':
+[?2004l[?2004h>             val = pop_stack()
+[?2004l[?2004h>             throw(val)
+[?2004l[?2004h>         elif instr == 'ENDTRY':
+[?2004l[?2004h>             exception_handlers.pop()
+[?2004l[?2004h>         elif instr == 'PRINT':
+[?2004l[?2004h>             if stack:
+[?2004l[?2004h>                 print(stack[-1], end='')
+[?2004l[?2004h>         elif instr == 'PRINTLN':
+[?2004l[?2004h>             if stack:
+[?2004l[?2004h>                 print(stack[-1])
+[?2004l[?2004h>         elif instr == 'READ':
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 line = input()
+[?2004l[?2004h>             except EOFError:
+[?2004l[?2004h>                 line = ''
+[?2004l[?2004h>             push_stack(Value('string', line))
+[?2004l[?2004h>         elif instr == 'HALT':
+[?2004l[?2004h>             break
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             print(f"ERROR: unknown instruction: {instr}", file=sys.stderr)
+[?2004l[?2004h>             sys.exit(1)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c08d5dcf8301:/app# cat >> svm.py << 'EOF'
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     if len(sys.argv) != 2:
+[?2004l[?2004h>         print("Usage: python3 svm.py <program.svm>", file=sys.stderr)
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h>     program, procedures = parse_program(sys.argv[1])
+[?2004l[?2004h>     execute(program, procedures)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@c08d5dcf8301:/app# chmod +x svm.py
+[?2004l[?2004hroot@c08d5dcf8301:/app# cp svm.py svm
+[?2004l[?2004hroot@c08d5dcf8301:/app# 

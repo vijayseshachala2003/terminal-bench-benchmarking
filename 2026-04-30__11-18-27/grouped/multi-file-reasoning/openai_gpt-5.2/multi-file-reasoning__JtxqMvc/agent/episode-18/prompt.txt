@@ -1,0 +1,124 @@
+New Terminal Output:
+
+root@1b1a90e96d3e:/app# python - <<'PY'
+> from pathlib import Path
+> p = Path('/app/analyze_deps.py')
+> orig = p.read_text(encoding='utf-8').splitlines(True)
+>
+> # Infer indentation for the invalid_attribute_access append (one level inside the attr-check if)
+> indent_attr = None
+> for ln in orig:
+>     if 'if resolved and node.attr not in module_exports.get(resolved, set()):' in ln:
+>         indent_attr = ln[:len(ln) - len(ln.lstrip(' '))] + '    '
+>         break
+> if indent_attr is None:
+>     indent_attr = ' ' * 28
+>
+> # Infer indentation for the type_error append (one level inside the argcount if)
+> indent_type = None
+> for ln in orig:
+>     if 'exp = f"{sig.min_pos}..{sig.max_pos}"' in ln:
+>         indent_type = ln[:len(ln) - len(ln.lstrip(' '))] + '    '
+>         break
+> if indent_type is None:
+>     indent_type = ' ' * 28
+>
+> # First pass: replace invalid_attribute_access append with multiline-safe statement
+> mid = []
+> replaced_attr = False
+> skip_next_cont = False
+> for ln in orig:
+>     if ('errors.append(Error("invalid_attribute_access"' in ln or 'errors.append(Error("invalid_attribute_access",' in ln) and not replaced_attr:
+>         mid.append(indent_attr + 'errors.append(Error("invalid_attribute_access",\n')
+>         mid.append(indent_attr + '    _to_app_path(project_dir, f),\n')
+>         mid.append(indent_attr + '    (\n')
+>         mid.append(indent_attr + '        f"Invalid attribute access: module {resolved} "\n')
+>         mid.append(indent_attr + '        f"has no attribute {node.attr}"\n')
+>         mid.append(indent_attr + '    ),\n')
+>         mid.append(indent_attr + '))\n')
+>         replaced_attr = True
+>         skip_next_cont = True
+>         continue
+>     if skip_next_cont:
+>         # drop wrapped continuation line if present
+>         if 'has no attribute' in ln and 'errors.append' not in ln:
+>             skip_next_cont = False
+>             continue
+>         skip_next_cont = False
+>     mid.append(ln)
+>
+> # Second pass: replace type_error append(s) with a single multiline-safe statement
+> out = []
+> inserted_type = False
+> skip_wrapped = False
+> for ln in mid:
+>     if 'errors.append(Error("type_error"' in ln or 'errors.append(Error("type_error",' in ln:
+>         if not inserted_type:
+>             out.append(indent_type + 'errors.append(Error("type_error",\n')
+>             out.append(indent_type + '    _to_app_path(project_dir, f),\n')
+>             out.append(indent_type + '    (\n')
+>             out.append(indent_type + '        f"Type error: call to {fn} has {pos} "\n')
+>             out.append(indent_type + '        f"positional args; expected {exp}"\n')
+>             out.append(indent_type + '    ),\n')
+>             out.append(indent_type + '))\n')
+>             inserted_type = True
+>         skip_wrapped = True
+>         continue
+>     if skip_wrapped:
+>         # drop likely wrapped continuation fragments from the previous broken line
+>         if ('positional args; expe' in ln) or ('cted {exp}' in ln) or (ln.strip() in {'ed {exp}"))', 'ed {exp}"))\r'}):
+>             continue
+>         # stop skipping once we pass the immediate continuation
+>         skip_wrapped = False
+>     out.append(ln)
+>
+> p.write_text(''.join(out), encoding='utf-8')
+> print('patched; indent_attr=%r indent_type=%r' % (indent_attr, indent_type))
+> PY
+patched; indent_attr='                            ' indent_type='                                '
+root@1b1a90e96d3e:/app# python -m py_compile /app/analyze_deps.py
+Sorry: IndentationError: unexpected indent (analyze_deps.py, line 472)root@1b1a90e96d3e:/app# nl -ba /app/analyze_deps.py | sed -n '448,490p'
+   448                      while s is not None:
+   449                          if base in s.imported:
+   450                              found = s.imported[base]
+   451                              break
+   452                          s = s.parent
+   453                      if found and found.kind == "import":
+   454                          resolved = resolve_import_to_module(f, project_dir, module_index, found.module, 0)
+   455                          if resolved and node.attr not in module_exports.get(resolved, set()):
+   456                              errors.append(Error("invalid_attribute_access",
+   457                                  _to_app_path(project_dir, f),
+   458                                  (
+   459                                      f"Invalid attribute access: module {resolved} "
+   460                                      f"has no attribute {node.attr}"
+   461                                  ),
+   462                              ))
+   463
+   464              def visit_Call(self, node: ast.Call) -> Any:
+   465                  if isinstance(node.func, ast.Name):
+   466                      fn = node.func.id
+   467                      sig = function_sigs.get(fn)
+   468                      if sig:
+   469                          pos = len(node.args)
+   470                          if pos < sig.min_pos or (sig.max_pos is not None and pos > sig.max_pos):
+   471                              exp = f"{sig.min_pos}..{sig.max_pos}" if sig.max_pos is not None else f"{sig.min_pos}+"
+   472                                  errors.append(Error("type_error",
+   473                                      _to_app_path(project_dir, f),
+   474                                      (
+   475                                          f"Type error: call to {fn} has {pos} "
+   476                                          f"positional args; expected {exp}"
+   477                                      ),
+   478                                  ))
+   479          V().visit(t)
+   480
+   481          for it, used in import_usage.items():
+   482              if used:
+   483                  continue
+   484              if it.kind == "from" and it.name == "*":
+   485                  modname = ("." * it.level) + (it.module or "")
+   486                  errors.append(Error("unused_import", _to_app_path(project_dir, f), f"Unused import: wildcard from {modname}"))
+   487              else:
+   488                  local = it.asname or (it.name.split(".")[0] if it.kind == "import" else it.name)
+   489                  errors.append(Error("unused_import", _to_app_path(project_dir, f), f"Unused import: {local}"))
+   490
+root@1b1a90e96d3e:/app#

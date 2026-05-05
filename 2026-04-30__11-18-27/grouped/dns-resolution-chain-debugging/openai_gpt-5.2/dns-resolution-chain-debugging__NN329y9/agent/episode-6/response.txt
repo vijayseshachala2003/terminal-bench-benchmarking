@@ -1,0 +1,55 @@
+{
+  "analysis": "secure.example.com has a valid unsigned zone, but the signed zone file is intentionally bogus: expired signatures and fake base64 blobs; and there are no DNSSEC key files available to re-sign (only transfer.key exists). Therefore the practical fix is to stop serving the broken .signed file and instead serve the unsigned secure.example.com.zone (DNSSEC validation will then be false). example.com.zone contains multiple issues that can cause intermittent failures: very high negative TTL, a CNAME loop (a<->b), and missing glue A records for ns1.sub/ns2.sub (in-bailiwick nameservers for the delegated sub zone). These should be fixed. Also resolver max-ncache-ttl is very high. Next: edit zone files and primary named.conf to use the unsigned secure zone; adjust TTLs; fix CNAME loop; add glue; bump serials; reload/restart; ensure secondary transfers succeed; run test queries.",
+  "plan": "1) Edit /app/dns/primary/named.conf to serve /app/dns/primary/zones/secure.example.com.zone (unsigned) instead of the broken .signed file. 2) Fix example.com.zone: lower SOA minimum (negative TTL) from 86400 to 300, remove the CNAME loop by making a and b A records (or one CNAME to a real name), and add A records for ns1.sub.example.com and ns2.sub.example.com as glue (127.0.0.1). Bump serial. 3) Optionally lower resolver max-ncache-ttl to something reasonable (e.g. 300) to prevent long-lived NXDOMAIN caching. 4) Restart primary/secondary/resolver and verify: dig to primary for both zones, AXFR from secondary for both zones, and run /app/test_queries.txt through resolver. 5) Check DNSSEC validation status for secure.example.com (should be not validated).",
+  "commands": [
+    {
+      "keystrokes": "perl -0777 -i -pe 's#file \"/app/dns/primary/zones/secure\\.example\\.com\\.zone\\.signed\";#file \"/app/dns/primary/zones/secure.example.com.zone\";#g' /app/dns/primary/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/max-ncache-ttl\\s+86400;/max-ncache-ttl 300;/g' /app/dns/resolver/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('/app/dns/primary/zones/example.com.zone')\ntext=p.read_text().splitlines()\nout=[]\nfor line in text:\n    if 'Negative Cache TTL' in line and '86400' in line:\n        out.append('                        300 )           ; Negative Cache TTL')\n    elif line.strip().startswith('a') and 'CNAME' in line:\n        continue\n    elif line.strip().startswith('b') and 'CNAME' in line:\n        continue\n    else:\n        out.append(line)\n# bump serial\nfor i,l in enumerate(out):\n    if 'Serial' in l and '2024010101' in l:\n        out[i]=l.replace('2024010101','2024010102')\n        break\n# ensure glue records exist (append after ns2 A if not present)\njoined='\\n'.join(out)\nif 'ns1.sub.example.com.' not in joined:\n    insert_at=0\n    for i,l in enumerate(out):\n        if l.strip().startswith('ns2') and 'A' in l:\n            insert_at=i+1\n    out.insert(insert_at,'ns1.sub IN A 127.0.0.1')\n    out.insert(insert_at+1,'ns2.sub IN A 127.0.0.1')\n# add sane records for a and b\nout.append('')\nout.append('; Fixed: remove CNAME loop')\nout.append('a       IN      A       192.168.1.30')\nout.append('b       IN      A       192.168.1.31')\np.write_text('\\n'.join(out)+\"\\n\")\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\nnamed -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\nnamed -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com SOA +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"== $t $n ==\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 10.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

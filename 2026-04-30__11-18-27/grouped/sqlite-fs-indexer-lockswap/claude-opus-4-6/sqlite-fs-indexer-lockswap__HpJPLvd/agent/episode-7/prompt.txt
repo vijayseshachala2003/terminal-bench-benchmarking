@@ -1,0 +1,177 @@
+New Terminal Output:
+
+root@9cd3d765fab3:/app# sed -n '80,170p' /app/app/indexer.py
+def _should_ignore(rel_path_nfc, patterns_compiled):
+    """Check if a NFC-normalized relative path should be ignored.
+
+    patterns_compiled is a list of (pattern_str, pattern_type, compiled_regex) tuples.
+    pattern_type is one of:
+      'anchored' - pattern started with /, match against full path
+      'basename' - pattern has no /, match against each component
+      'relative' - pattern has / but doesn't start with /, match against full path or any suffix after /
+    """
+    components = rel_path_nfc.split("/")
+
+    for pat_str, pat_type, compiled_re in patterns_compiled:
+        if pat_type == "anchored":
+            # Match against full relative path
+            if compiled_re.fullmatch(rel_path_nfc):
+                return True
+        elif pat_type == "basename":
+            # Match against each path component
+            for comp in components:
+                if compiled_re.fullmatch(comp):
+                    return True
+        elif pat_type == "relative":
+            # Match against full path or any suffix starting after /
+            if compiled_re.fullmatch(rel_path_nfc):
+                return True
+            for i in range(len(components)):
+                if i > 0:
+                    suffix = "/".join(components[i:])
+                    if compiled_re.fullmatch(suffix):
+                        return True
+    return False
+
+
+def _compile_patterns(patterns):
+    """Compile ignore patterns into (pattern_str, type, compiled_regex) tuples."""
+    compiled = []
+    for pat in patterns:
+        try:
+            if pat.startswith("/"):
+                # Anchored pattern - strip leading /
+                stripped = pat[1:]
+                regex = _pattern_to_regex(stripped)
+                compiled.append((pat, "anchored", re.compile(regex)))
+            elif "/" in pat:
+                # Relative pattern with /
+                regex = _pattern_to_regex(pat)
+                compiled.append((pat, "relative", re.compile(regex)))
+            else:
+                # Basename pattern
+                regex = _pattern_to_regex(pat)
+                compiled.append((pat, "basename", re.compile(regex)))
+        except re.error:
+            # Malformed pattern - skip it
+            pass
+    return compiled
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash of a file, return (hex_digest, size)."""
+    h = hashlib.sha256()
+    size = 0
+    with open(filepath, "rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+
+    # Read and compile ignore patterns
+    patterns = _read_ignore_patterns("/data/ignore.txt")
+    compiled_patterns = _compile_patterns(patterns)
+
+    # Collect all files: {nfc_path: (original_rel_path, nfc_path)}
+    # For Unicode collision handling, we keep track of the largest original path
+    # that maps to each NFC path
+    nfc_to_original = {}  # nfc_path -> largest original_rel_path
+
+    root_dir = os.path.abspath(root_dir)
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Remove symlinked directories from dirnames to prevent traversal
+        dirnames[:] = sorted([
+            d for d in dirnames
+            if not os.path.islink(os.path.join(dirpath, d))
+        ])
+root@9cd3d765fab3:/app# sed -n '170,250p' /app/app/indexer.py
+        ])
+        # Sort filenames for determinism
+        filenames = sorted(filenames)
+
+        for fname in filenames:
+            full_path = os.path.join(dirpath, fname)
+
+            # Skip symlinks
+            if os.path.islink(full_path):
+                continue
+
+            # Compute relative path with forward slashes
+            rel_path = os.path.relpath(full_path, root_dir)
+            rel_path = rel_path.replace(os.sep, "/")
+
+            # NFC normalize
+            nfc_path = unicodedata.normalize("NFC", rel_path)
+
+            # Check ignore rules against NFC path
+            if _should_ignore(nfc_path, compiled_patterns):
+                continue
+
+            # Handle Unicode collisions: keep lexicographically largest original path
+            if nfc_path in nfc_to_original:
+                existing_orig = nfc_to_original[nfc_path]
+                if rel_path > existing_orig:
+                    nfc_to_original[nfc_path] = rel_path
+            else:
+                nfc_to_original[nfc_path] = rel_path
+
+    # Now hash all the files we're keeping
+    rows = []
+    for nfc_path in sorted(nfc_to_original.keys()):
+        original_rel = nfc_to_original[nfc_path]
+        full_path = os.path.join(root_dir, original_rel.replace("/", os.sep))
+        try:
+            hex_digest, size = _hash_file(full_path)
+            rows.append((nfc_path, hex_digest, size))
+        except (OSError, IOError):
+            # File may have disappeared or be unreadable; skip it
+            continue
+
+    # Write to SQLite database atomically
+    # Strategy: write to a temp file, then rename to target path
+    # This ensures concurrent writers don't corrupt the database
+
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    os.makedirs(db_dir, exist_ok=True)
+
+    # Create temp file in same directory for atomic rename
+    fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+    os.close(fd)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                "CREATE TABLE files ("
+                "path TEXT PRIMARY KEY, "
+                "sha256 TEXT NOT NULL, "
+                "size INTEGER NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO rows VALUES (?, ?, ?)",
+                rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Atomic rename
+        os.replace(tmp_path, os.path.abspath(db_path))
+    except:
+        # Clean up temp file on error
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+root@9cd3d765fab3:/app#

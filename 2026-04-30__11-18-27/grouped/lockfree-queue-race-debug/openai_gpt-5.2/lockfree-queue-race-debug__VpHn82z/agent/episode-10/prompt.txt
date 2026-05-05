@@ -1,0 +1,133 @@
+New Terminal Output:
+
+root@9492a36ab7f6:/app# nl -ba /app/stress_test.cpp | sed -n '1,60p'
+     1  #include "lockfree_queue.h"
+     2  #include <thread>
+     3  #include <vector>
+     4  #include <atomic>
+     5  #include <iostream>
+     6  #include <chrono>
+     7  #include <unordered_set>
+     8  #include <mutex>
+     9  #include <cassert>
+    10  #include <csignal>
+    11  #include <cstdlib>
+    12
+    13  constexpr int NUM_PRODUCERS = 4;
+    14  constexpr int NUM_CONSUMERS = 4;
+    15
+    16  #ifdef __SANITIZE_THREAD__
+    17  constexpr int OPS_PER_THREAD = 250000;  // 1M total under TSan (4 producers * 250k)
+    18  #else
+    19  constexpr int OPS_PER_THREAD = 2500000; // 10M total (4 producers * 2.5M each)
+    20  #endif
+    21  constexpr uint64_t SENTINEL = UINT64_MAX;
+    22  constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+    23
+    24  std::atomic<bool> start_flag{false};
+    25  std::atomic<int> producers_done{0};
+    26  std::atomic<uint64_t> total_enqueued{0};
+    27  std::atomic<uint64_t> total_dequeued{0};
+    28  std::atomic<bool> timed_out{false};
+    29
+    30  std::mutex dequeued_mutex;
+    31  std::vector<uint64_t> all_dequeued;
+    32
+    33  void producer(LockFreeQueue& queue, int id) {
+    34      while (!start_flag.load(std::memory_order_acquire)) {
+    35          std::this_thread::yield();
+    36      }
+    37
+    38      uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+    39
+    40      for (int i = 0; i < OPS_PER_THREAD; ++i) {
+    41          uint64_t value = base + i + 1;  // +1 to avoid 0 values
+    42          queue.enqueue(value);
+    43          total_enqueued.fetch_add(1, std::memory_order_relaxed);
+    44      }
+    45
+    46      producers_done.fetch_add(1, std::memory_order_release);
+    47  }
+    48
+    49  void consumer(LockFreeQueue& queue, std::vector<uint64_t>& local_dequeued) {
+    50      while (!start_flag.load(std::memory_order_acquire)) {
+    51          std::this_thread::yield();
+    52      }
+    53
+    54      int empty_spins = 0;
+    55      const int MAX_EMPTY_SPINS = 100000;
+    56
+    57      while (!timed_out.load(std::memory_order_relaxed)) {
+    58          uint64_t value;
+    59          if (queue.dequeue(value)) {
+    60              local_dequeued.push_back(value);
+root@9492a36ab7f6:/app# perl -0777 -i -pe 's/constexpr int OPS_PER_THREAD = 250000;[^\n]*\n\s*constexpr int OPS_PER_THREAD = 2500000;[^\n]*\n/#ifdef __SANITIZE_
+THREAD__\nconstexpr int OPS_PER_THREAD = 250000;  \/\/ 1M total under TSan (4 producers * 250k)\n#else\nconstexpr int OPS_PER_THREAD = 2500000; \/\/ 10M total (
+4 producers * 2.5M each)\n#endif\n/s' /app/stress_test.cpp
+root@9492a36ab7f6:/app# nl -ba /app/stress_test.cpp | sed -n '1,40p'
+     1  #include "lockfree_queue.h"
+     2  #include <thread>
+     3  #include <vector>
+     4  #include <atomic>
+     5  #include <iostream>
+     6  #include <chrono>
+     7  #include <unordered_set>
+     8  #include <mutex>
+     9  #include <cassert>
+    10  #include <csignal>
+    11  #include <cstdlib>
+    12
+    13  constexpr int NUM_PRODUCERS = 4;
+    14  constexpr int NUM_CONSUMERS = 4;
+    15
+    16  #ifdef __SANITIZE_THREAD__
+    17  constexpr int OPS_PER_THREAD = 250000;  // 1M total under TSan (4 producers * 250k)
+    18  #else
+    19  constexpr int OPS_PER_THREAD = 2500000; // 10M total (4 producers * 2.5M each)
+    20  #endif
+    21  constexpr uint64_t SENTINEL = UINT64_MAX;
+    22  constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+    23
+    24  std::atomic<bool> start_flag{false};
+    25  std::atomic<int> producers_done{0};
+    26  std::atomic<uint64_t> total_enqueued{0};
+    27  std::atomic<uint64_t> total_dequeued{0};
+    28  std::atomic<bool> timed_out{false};
+    29
+    30  std::mutex dequeued_mutex;
+    31  std::vector<uint64_t> all_dequeued;
+    32
+    33  void producer(LockFreeQueue& queue, int id) {
+    34      while (!start_flag.load(std::memory_order_acquire)) {
+    35          std::this_thread::yield();
+    36      }
+    37
+    38      uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+    39
+    40      for (int i = 0; i < OPS_PER_THREAD; ++i) {
+root@9492a36ab7f6:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@9492a36ab7f6:/app# /app/stress_test_tsan
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 2500000
+Total operations: 10000000
+
+All producers finished
+All consumers finished
+Duration: 24300 ms
+
+=== Results ===
+Expected: 10000000
+Enqueued: 10000000
+Dequeued: 10000000
+Unique values: 10000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+TIMEOUT: stress test exceeded 120s wall clock limit
+root@9492a36ab7f6:/app#

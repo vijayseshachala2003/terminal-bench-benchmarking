@@ -1,0 +1,241 @@
+New Terminal Output:
+
+root@51ba998fb591:/app# cat > analyze_fixed.py << 'EOF'
+> import json
+> import re
+> import sys
+> from collections import defaultdict, Counter
+> from datetime import datetime, timedelta
+> import math
+>
+> # Load metadata
+> def load_metadata():
+>     with open('/app/query_metadata.json', 'r') as f:
+>         return json.load(f)
+>
+> # Parse slow log
+> def parse_logs():
+>     logs = []
+>     for log_file in ['mysql_slow_07g1w9.log', 'mysql_slow_4mvpet.log', 'mysql_slow_4x92y2.log', 'mysql_slow_rymn3u.log']:
+>         with open(f'/app/{log_file}', 'r') as f:
+>             content = f.read()
+>         # Split by # Time:
+>         entries = re.split(r'# Time:', content)
+>         for entry in entries[1:]:
+>             lines = entry.strip().split('\n')
+>             time_line = lines[0].strip()
+>             dt = datetime.strptime(time_line, '%Y-%m-%d %H:%M:%S.%f%z')
+>             query_time = None
+>             query = ''
+>             for line in lines[1:]:
+>                 if line.startswith('# Query_time:'):
+>                     query_time = float(re.search(r'# Query_time: ([0-9.]+)', line).group(1))
+>                 elif not line.startswith('#') and not line.startswith('use ') and not line.startswith('SET '):
+>                     if line.strip():
+>                         query = line.strip()
+>                         break  # Assume single query line
+>             if query_time and query_time > 1.0 and query:
+>                 logs.append((dt, query_time, query))
+>     return logs
+>
+> # Normalize query
+> def normalize_query(query):
+>     query = query.upper()
+>     # Replace strings
+['columns']>     query = re.sub(r"'[^']*'", '?', query)
+>     # Replace IN lists
+>     query = re.sub(r'\bIN\s*\([^)]+\)', 'IN (?)', query)
+>     # Replace numbers
+>     query = re.sub(r'\b\d+\.?\d*\b', '?', query)
+>     return query.strip()
+>
+> # Extract indexable columns
+> def extract_columns(query):
+>     tables = []
+>     columns = set()
+>     # Simple extraction
+>     from_match = re.search(r'FROM\s+(\w+)', query)
+>     if from_match:
+>         table = from_match.group(1)
+>         tables.append(table)
+>         # WHERE
+>         where_part = re.search(r'WHERE\s+(.*?)(\bORDER\s+BY|\bGROUP\s+BY|\bLIMIT|$)', query, re.IGNORECASE)
+>         if where_part:
+>             conds = re.findall(r'\b(\w+)\s*[=<>!]+', where_part.group(1))
+>             columns.update(conds)
+>         # JOIN
+>         join_matches = re.findall(r'JOIN\s+\w+\s+ON\s+(.*?)(?=\bJOIN|\bWHERE|\bORDER|$)', query, re.IGNORECASE)
+>         for join in join_matches:
+>             cols = re.findall(r'\b(\w+)\s*[=<>!]+', join)
+>             columns.update(cols)
+>         # ORDER BY
+>         order_match = re.search(r'ORDER\s+BY\s+(.*?)(?=\bLIMIT|$)', query, re.IGNORECASE)
+>         if order_match:
+>             cols = re.findall(r'\b(\w+)', order_match.group(1))
+>             columns.update(cols)
+>     return tables, list(columns)
+>
+> # Main
+> def main():
+>     metadata = load_metadata()
+>     budget = metadata['budget']
+>     tables_meta = metadata['tables']
+>     logs = parse_logs()
+>     # Group by pattern
+>     patterns = defaultdict(list)
+>     for dt, time, query in logs:
+>         norm = normalize_query(query)
+>         patterns[norm].append((dt, time))
+>     # Process patterns
+>     norm_patterns = []
+>     for pat, entries in patterns.items():
+>         freq = len(entries)
+>         avg_time = sum(t for _, t in entries) / freq
+>         total_time = freq * avg_time
+>         norm_patterns.append({
+>             'pattern': pat,
+>             'frequency': freq,
+>             'avg_execution_time': round(avg_time, 1),
+>             'total_time': round(total_time, 1)
+>         })
+>     norm_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+>     # Index candidates
+>     candidates = []
+>     table_columns = defaultdict(set)
+>     pattern_selectivities = {}
+>     for pat_data in norm_patterns:
+>         pat = pat_data['pattern']
+>         tables, cols = extract_columns(pat)
+>         if tables:
+>             table = tables[0]  # Assume one table
+>             table_columns[table].update(cols)
+>             max_sel = 0.1
+>             for col in cols:
+>                 if table in tables_meta and col in tables_meta[table]['columns']:
+>                     dv = tables_meta[table]['columns'][col]['distinct_values']
+>                     tr = tables_meta[table]['total_rows']
+>                     sel = dv / tr
+>                     max_sel = max(max_sel, sel)
+>             pattern_selectivities[pat] = max_sel
+>             for col in cols:
+>                 if table in tables_meta and col in tables_meta[table]['columns']:
+>                     dv = tables_meta[table]['columns'][col]['distinct_values']
+>                     tr = tables_meta[table]['total_rows']
+>                     sel = round(dv / tr, 2)
+>                     impact = round(pat_data['frequency'] * pat_data['avg_execution_time'] * max(sel, 0.1), 1)
+>               
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+pattern2': p2,
+>                 'correlation_strength': strength,
+>                 'avg_time_delta': round(avg_delta, 1)
+>             })
+>     temp_corr.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+>     temp_corr = temp_corr[:3]
+>     # Recommendations
+>     recommended = []
+>     total_cost = 0
+>     table_count = defaultdict(int)
+>     for c in candidates:
+>         if len(recommended) < 5 and total_cost + c['cost'] <= budget and table_count[c['table']] < 2:
+>             recommended.append(c)
+>             total_cost += c['cost']
+>             table_count[c['table']] += 1
+>     total_impact = sum(c['impact_score'] for c in recommended)
+>     # JSON output
+>     output = {
+>         'normalized_patterns': norm_patterns,
+>         'index_candidates': candidates,
+>         'temporal_correlations': temp_corr,
+>         'recommended_indexes': recommended,
+>         'total_budget_used': round(total_cost, 1),
+>         'total_impact': round(total_impact, 1)
+>     }
+>     with open('/app/optimization.json', 'w') as f:
+>         json.dump(output, f, indent=2)
+>     # Text output
+>     total_slow = sum(p['frequency'] for p in norm_patterns)
+>     unique_patterns = len(norm_patterns)
+>     with open('/app/recommendations.txt', 'w') as f:
+>         f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+>         f.write('='*37 + '\n')
+>         f.write(f'Total Slow Queries: {total_slow}\n')
+>         f.write(f'Unique Query Patterns: {unique_patterns}\n')
+>         f.write(f'Total Budget: {budget} points\n')
+>         f.write(f'Budget Used: {round(total_cost, 1)} points\n\n')
+>         f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+>         for i, p in enumerate(norm_patterns[:5], 1):
+>             pat = p['pattern'][:60] + ('...' if len(p['pattern']) > 60 else '')
+>             impact = round(p['frequency'] * p['avg_execution_time'] * pattern_selectivities.get(p['pattern'], 0.1), 1)
+>             f.write(f'{i}. {pat} (Impact: {impact}, Freq: {p["frequency"]}, Avg: {p["avg_execution_time"]}s, Total: {p["total_time"]}s)\n')
+>         f.write('\nTEMPORAL CORRELATIONS:\n')
+>         for i, c in enumerate(temp_corr, 1):
+>             f.write(f'{i}. Pattern Pair (Strength: {c["correlation_strength"]}):\n')
+>             f.write(f'   - {c["pattern1"]}\n')
+>             f.write(f'   - {c["pattern2"]}\n')
+>         f.write('\nRECOMMENDED INDEXES (5 max):\n')
+>         for i, r in enumerate(recommended, 1):
+>             cols = ','.join(r['columns'])
+>             f.write(f'{i}. {r["table"]}({cols}) - Impact: {r["impact_score"]}, Cost: {r["cost"]} [high_impact]\n')
+>         f.write('\nOPTIMIZATION SUMMARY:\n')
+>         f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+>         f.write(f'- Remaining budget: {round(budget - total_cost, 1)} points\n')
+>         f.write(f'- Tables optimized: {len(table_count)}\n')
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@51ba998fb591:/app# chmod +x analyze_fixed.py
+root@51ba998fb591:/app# python3 analyze_fixed.py
+root@51ba998fb591:/app# head -20 /app/optimization.json
+{
+  "normalized_patterns": [
+    {
+      "pattern": "SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?;",
+      "frequency": 14,
+      "avg_execution_time": 5.0,
+      "total_time": 69.5
+    },
+    {
+      "pattern": "SELECT * FROM USERS WHERE EMAIL = ?;",
+      "frequency": 10,
+      "avg_execution_time": 6.1,
+      "total_time": 60.9
+    },
+    {
+      "pattern": "SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID;",
+      "frequency": 10,
+      "avg_execution_time": 5.8,
+      "total_time": 57.5
+    },
+root@51ba998fb591:/app# head -30 /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 0 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?; (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ?; (Impact: 6.1, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID; (Impact: 5.8, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 5.6, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?); (Impact: 5.5, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 12):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID;
+   - SELECT * FROM ORDERS WHERE STATUS = ?;
+2. Pattern Pair (Strength: 12):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?);
+   - SELECT * FROM USERS WHERE COUNTRY = ?;
+3. Pattern Pair (Strength: 11):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?);
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?;
+
+RECOMMENDED INDEXES (5 max):
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 0
+- Remaining budget: 1000 points
+root@51ba998fb591:/app#

@@ -1,0 +1,101 @@
+New Terminal Output:
+
+root@cffa7beb3964:/app# python3 << 'PYEOF'
+> import ast
+>
+> # Read the current file
+> with open('/app/analyze_deps.py', 'r') as f:
+>     content = f.read()
+>
+> # Fix the build_import_graph function to handle 'from . import X' properly
+> # The issue: when we have 'from . import mod_a' in pkg/__init__.py,
+> # the resolved module is 'pkg' (the package itself), and 'mod_a' is a submodule
+> # We should NOT add pkg/__init__.py -> pkg/__init__.py edge
+> # Instead we should add pkg/__init__.py -> pkg/mod_a.py edge
+>
+> old_graph = '''def build_import_graph(file_asts, file_imports, project_dir):
+>     graph = defaultdict(set)
+>     for filepath, imports in file_imports.items():
+>         for imp in imports:
+>             module_name = imp["module"]
+>             if not module_name:
+>                 continue
+>             if imp["level"] == 0 and is_stdlib_module(module_name):
+>                 continue
+>             target = resolve_module_file(module_name, project_dir)
+>             if target:
+>                 graph[str(filepath)].add(str(target))
+>             if imp["type"] == "from" and imp["name"] and imp["name"] != "*":
+>                 submod = module_name + "." + imp["name"] if module_name else imp["name"]
+>                 target2 = resolve_module_file(submod, project_dir)
+>                 if target2:
+>                     graph[str(filepath)].add(str(target2))
+>     return graph'''
+>
+> new_graph = '''def build_import_graph(file_asts, file_imports, project_dir):
+>     graph = defaultdict(set)
+>     for filepath, imports in file_imports.items():
+>         for imp in imports:
+>             module_name = imp["module"]
+>             if not module_name:
+>                 # from . import X - try to resolve X as submodule
+>                 if imp["type"] == "from" and imp["name"] and imp["name"] != "*" and imp["level"] > 0:
+>                     # Resolve relative to current file's package
+>                     project_path = Path(project_dir).resolve()
+>                     file_path = Path(filepath).resolve()
+>                     try:
+>                         rel = file_path.relative_to(project_path)
+>                     except ValueError:
+>                         continue
+>                     parts = list(rel.parts)
+>                     if parts[-1].endswith(".py"):
+>                         parts = parts[:-1]
+>                     up = imp["level"] - 1
+>                     if up > 0:
+>                         parts = parts[:-up] if up < len(parts) else []
+>                     submod = ".".join(parts + [imp["name"]]) if parts else imp["name"]
+>                     target2 = resolve_module_file(submod, project_dir)
+>                     if target2:
+>                         graph[str(filepath)].add(str(target2))
+>                 continue
+>             if imp["level"] == 0 and is_stdlib_module(module_name):
+>                 continue
+>             target = resolve_module_file(module_name, project_dir)
+>             if target:
+>                 # Don't add self-edges for __init__.py importing from its own package
+>                 if str(target) != str(filepath):
+>                     graph[str(filepath)].add(str(target))
+>             if imp["type"] == "from" and imp["name"] and imp["name"] != "*":
+>                 submod = module_name + "." + imp["name"] if module_name else imp["name"]
+>                 target2 = resolve_module_file(submod, project_dir)
+>                 if target2:
+>                     if str(target2) != str(filepath):
+>                         graph[str(filepath)].add(str(target2))
+>     return graph'''
+>
+> content = content.replace(old_graph, new_graph)
+>
+> with open('/app/analyze_deps.py', 'w') as f:
+>     f.write(content)
+> print('DONE')
+> PYEOF
+DONE
+root@cffa7beb3964:/app# python3 -c "import py_compile; py_compile.compile('/app/analyze_deps.py', doraise=True); print('OK')"
+OK
+root@cffa7beb3964:/app# python3 /app/analyze_deps.py --project-dir /tmp/test_rel2 --out /tmp/test_rel2b.json && python3 -m json.tool /tmp/test_rel2b.json
+{
+    "valid_imports": true,
+    "no_circular_deps": true,
+    "no_unused_imports": false,
+    "all_refs_defined": true,
+    "valid_attribute_access": true,
+    "type_consistent": true,
+    "errors": [
+        {
+            "type": "unused_import",
+            "file": "/app/pkg/__init__.py",
+            "message": "Unused import: 'mod_a'"
+        }
+    ]
+}
+root@cffa7beb3964:/app#

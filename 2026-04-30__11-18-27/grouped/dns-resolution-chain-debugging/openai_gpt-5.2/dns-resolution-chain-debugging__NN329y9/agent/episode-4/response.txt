@@ -1,0 +1,55 @@
+{
+  "analysis": "Our attempted sed replacement failed because the TSIG secret contains '/' which broke the sed s/// delimiter, leaving the placeholder secret \"{TSIG_SECRET}\" in both configs. Also, our session-keyfile insertion sed command expanded ${f%/named.conf} literally into the config, producing a '$' token and breaking parsing (named-checkconf reports missing ';' before '$'). We need to restore from backups and apply safer edits: use a delimiter that won't conflict (e.g. |) and avoid injecting shell variables into sed scripts that end up in the file. We'll explicitly set fixed paths per role.",
+  "plan": "1) Restore named.conf files from the .bak copies to undo the broken edits. 2) Re-apply only the known-good changes with explicit static strings: directory/pid-file/log paths, session-keyfile path, and correct comment syntax. 3) Set TSIG secret to a valid base64 using a sed delimiter that tolerates '/' (use |). Use the same secret in both primary and secondary. 4) Add 'controls { };' to disable reading /etc/bind/rndc.key. 5) Validate with named-checkconf and restart services.",
+  "commands": [
+    {
+      "keystrokes": "cp -a /app/dns/primary/named.conf.bak /app/dns/primary/named.conf\ncp -a /app/dns/secondary/named.conf.bak /app/dns/secondary/named.conf\ncp -a /app/dns/resolver/named.conf.bak /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "TSIG_SECRET=$(python3 - <<'PY'\nimport base64,os\nprint(base64.b64encode(os.urandom(32)).decode())\nPY\n)\necho \"TSIG=$TSIG_SECRET\"\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i \\\n  -e 's#directory \"/var/cache/bind\";#directory \"/app/dns/primary/run\";#' \\\n  -e 's#pid-file \"/var/run/named/named-primary.pid\";#pid-file \"/app/dns/primary/run/named.pid\";\\n    session-keyfile \"/app/dns/primary/run/session.key\";#' \\\n  -e 's#file \"/var/log/named/named-primary.log\"#file \"/app/dns/primary/run/named.log\"#' \\\n  /app/dns/primary/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i \\\n  -e 's#directory \"/var/cache/bind\";#directory \"/app/dns/secondary/run\";#' \\\n  -e 's#pid-file \"/var/run/named/named-secondary.pid\";#pid-file \"/app/dns/secondary/run/named.pid\";\\n    session-keyfile \"/app/dns/secondary/run/session.key\";#' \\\n  -e 's#file \"/var/log/named/named-secondary.log\"#file \"/app/dns/secondary/run/named.log\"#' \\\n  -e 's#^\\s*; BUG:#// BUG:#' \\\n  /app/dns/secondary/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i \\\n  -e 's#directory \"/var/cache/bind\";#directory \"/app/dns/resolver/run\";#' \\\n  -e 's#pid-file \"/var/run/named/named-resolver.pid\";#pid-file \"/app/dns/resolver/run/named.pid\";\\n    session-keyfile \"/app/dns/resolver/run/session.key\";#' \\\n  -e 's#file \"/var/log/named/named-resolver.log\"#file \"/app/dns/resolver/run/named.log\"#' \\\n  -e 's#^\\s*; BUG:#// BUG:#' \\\n  /app/dns/resolver/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i \"s|secret \\\"[^\\\"]*\\\";|secret \\\"$TSIG_SECRET\\\";|\" /app/dns/primary/named.conf\nsed -i \"s|secret \\\"[^\\\"]*\\\";|secret \\\"$TSIG_SECRET\\\";|\" /app/dns/secondary/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "printf '\\ncontrols { };\\n' >> /app/dns/primary/named.conf\nprintf '\\ncontrols { };\\n' >> /app/dns/secondary/named.conf\nprintf '\\ncontrols { };\\n' >> /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf -z /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\nnamed -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\nnamed -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E '(:5300|:5301|:5302)\\b' || true\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

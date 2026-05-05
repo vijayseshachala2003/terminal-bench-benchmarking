@@ -1,0 +1,234 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@df37ecc7e082:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+> #include <vector>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         uint64_t value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Tagged pointer to solve ABA problem
+>     // Pack a monotonic tag + pointer into a single 64-bit value
+>     // Use upper 16 bits for tag, lower 48 bits for pointer
+>     // (x86_64 uses at most 48-bit virtual addresses in userspace)
+>     struct TaggedPtr {
+>         static constexpr int TAG_BITS = 16;
+>         static constexpr uint64_t PTR_MASK = (1ULL << 48) - 1;
+>         static constexpr uint64_t TAG_SHIFT = 48;
+>
+>         uint64_t packed;
+>
+>         TaggedPtr() : packed(0) {}
+>         TaggedPtr(Node* p, uint64_t tag) {
+>             packed = (reinterpret_cast<uint64_t>(p) & PTR_MASK) | (tag << TAG_SHIFT);
+>         }
+>
+>         Node* ptr() const {
+>             // Sign-extend if needed for canonical addresses
+>             uint64_t raw = packed & PTR_MASK;
+>             // On Linux userspace, addresses < 2^47, so no sign extension needed
+>             return reinterpret_cast<Node*>(raw);
+>         }
+>
+>         uint64_t tag() const {
+>             return packed >> TAG_SHIFT;
+>         }
+>
+>         bool operator==(const TaggedPtr& other) const {
+>             return packed == other.packed;
+>         }
+>         bool operator!=(const TaggedPtr& other) const {
+>             return packed != other.packed;
+>         }
+>     };
+>
+>     std::atomic<uint64_t> head_;  // packed TaggedPtr
+>     std::atomic<uint64_t> tail_;  // packed TaggedPtr
+>
+>     // Retired nodes - freed only in destructor to prevent use-after-free
+>     std::atomic<Node*> retired_list_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@df37ecc7e082:/app# cat > /app/lockfree_queue.cpp << 'IMPL_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     TaggedPtr tp(dummy, 0);
+>     head_.store(tp.packed, std::memory_order_relaxed);
+>     tail_.store(tp.packed, std::memory_order_relaxed);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     TaggedPtr head;
+>     head.packed = head_.load(std::memory_order_relaxed);
+>     delete head.ptr();
+>
+>     // Delete all retired nodes
+>     Node* retired = retired_list_.load(std::memory_order_relaxed);
+>     while (retired) {
+>         Node* next = retired->next.load(std::memory_order_relaxed);
+>         delete retired;
+>         retired = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Push onto retired list using lock-free stack push
+>     // These nodes won't be reused - just kept alive until destructor
+>     Node* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old_head, std::memory_order_relaxed);
+>     } while (!retired_list_.compare_exchange_weak(old_head, node,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         TaggedPtr tail;
+>         tail.packed = tail_.load(std::memory_order_acquire);
+>         Node* tail_ptr = tail.ptr();
+>
+>         Node* next = tail_ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail to check consistency
+>         TaggedPtr tail2;
+>         tail2.packed = tail_.load(std::memory_order_acquire);
+>         if (tail.packed != tail2.packed) {
+>             continue;  // tail changed, retry
+>         }
+>
+>         if (next == nullptr) {
+>             // Try to link new node at the end
+>             if (tail_ptr->next.compare_exchange_weak(next, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 // Successfully linked, try to advance tail
+>                 TaggedPtr new_tail(new_node, tail.tag() + 1);
+>                 tail_.compare_exchange_strong(tail.packed, new_tail.packed,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             // Tail is behind, help advance it
+>             TaggedPtr new_tail(next, tail.tag() + 1);
+>             tail_.compare_exchange_strong(tail.packed, new_tail.packed,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         TaggedPtr head;
+>         head.packed = head_.load(std::memory_order_acquire);
+>         Node* head_ptr = head.ptr();
+>
+>         TaggedPtr tail;
+>         tail.packed = tail_.load(std::memory_order_acquire);
+>         Node* tail_ptr = tail.ptr();
+>
+>         Node* next = head_ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read head to check consistency
+>         TaggedPtr head2;
+>         head2.packed = head_.load(std::memory_order_acquire);
+>         if (head.packed != head2.packed) {
+>             continue;  // head changed, retry
+>         }
+>
+>         if (head_ptr == tail_ptr) {
+>             if (next == nullptr) {
+>                 return false;  // Queue is empty
+>             }
+>             // Tail is behind, help advance it
+>             TaggedPtr new_tail(next, tail.tag() + 1);
+>             tail_.compare_exchange_strong(tail.packed, new_tail.packed,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             if (next == nullptr) {
+>                 // Inconsistent state, retry
+>                 continue;
+>             }
+>             // Read value before CAS, because after CAS another dequeuer
+>             // could free the next node
+>             value = next->value;
+>
+>             // Try to swing head to next node
+>             TaggedPtr new_head(next, head.tag() + 1);
+>             if (head_.compare_exchange_strong(head.packed, new_head.packed,
+>                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+>                 // Successfully dequeued - retire the old dummy node
+>                 // Don't delete it; other threads may still be reading it
+>                 retire_node(head_ptr);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> IMPL_EOF
+root@df37ecc7e082:/app# make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@df37ecc7e082:/app# /app/stress_test 2>&1
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 1107 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@df37ecc7e082:/app#

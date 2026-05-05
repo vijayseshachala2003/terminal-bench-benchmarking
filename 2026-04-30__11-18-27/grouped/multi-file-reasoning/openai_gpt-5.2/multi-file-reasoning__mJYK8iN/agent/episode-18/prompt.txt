@@ -1,0 +1,179 @@
+New Terminal Output:
+
+root@b36aefe5be54:/app# grep -n "top_level" -n /app/analyze_deps.py | head -n 20
+433:    top_level: Set[str] = set()
+436:            top_level.add(mn.split(".")[0])
+454:                    if first in top_level:
+486:                        if first in top_level:
+root@b36aefe5be54:/app# grep -n "if item.kind == \"import\"" -n /app/analyze_deps.py | head -n 5
+448:            if item.kind == "import":
+root@b36aefe5be54:/app# nl -ba /app/analyze_deps.py | sed -n '250,360p'
+   250              return True
+   251          if name in self.globals:
+   252              s = self
+   253              while s.parent is not None:
+   254                  s = s.parent
+   255              return name in s.defined
+   256          if name in self.nonlocals:
+   257              s = self.parent
+   258              while s is not None and s.parent is not None:
+   259                  if name in s.defined:
+   260                      return True
+   261                  s = s.parent
+   262              return False
+   263          return self.parent.is_defined(name) if self.parent is not None else False
+   264
+   265
+   266  class UsageCollector(ast.NodeVisitor):
+   267      def __init__(self) -> None:
+   268          self.used_names: Set[str] = set()
+   269          self.attr_uses: List[Tuple[str, str]] = []
+   270
+   271      def visit_Name(self, node: ast.Name) -> None:
+   272          if isinstance(node.ctx, ast.Load):
+   273              self.used_names.add(node.id)
+   274
+   275      def visit_Attribute(self, node: ast.Attribute) -> None:
+   276          if isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Name):
+   277              self.attr_uses.append((node.value.id, node.attr))
+   278          self.generic_visit(node)
+   279
+   280
+   281  class RefChecker(ast.NodeVisitor):
+   282      def __init__(
+   283          self,
+   284          modinfo: ModuleInfo,
+   285          project_modules: Dict[str, ModuleInfo],
+   286          wildcard_exports: Dict[str, Set[str]],
+   287          errors: List[Error],
+   288          project_dir: Path,
+   289      ) -> None:
+   290          self.modinfo = modinfo
+   291          self.project_modules = project_modules
+   292          self.wildcard_exports = wildcard_exports
+   293          self.errors = errors
+   294          self.project_dir = project_dir
+   295
+   296          self.module_scope = Scope(parent=None)
+   297          self.module_scope.defined |= set(modinfo.assigns) | set(modinfo.functions.keys()) | set(modinfo.classes)
+   298          self.module_scope.defined |= set(modinfo.imported_bindings.keys())
+   299          for sym in wildcard_exports.get(modinfo.modname, set()):
+   300              self.module_scope.defined.add(sym)
+   301          self.scope = self.module_scope
+   302
+   303          # visible functions for arg-count checking
+   304          self.visible_functions: Dict[str, FunctionSig] = dict(modinfo.functions)
+   305          for binding, (origin_mod, orig_name, is_module_binding) in modinfo.imported_bindings.items():
+   306              if is_module_binding or not orig_name:
+   307                  continue
+   308              dep = project_modules.get(origin_mod)
+   309              if dep and orig_name in dep.functions:
+   310                  self.visible_functions[binding] = dep.functions[orig_name]
+   311
+   312          # add wildcard-imported functions if resolvable
+   313          for sym in wildcard_exports.get(modinfo.modname, set()):
+   314              for dep_mn in project_modules.keys():
+   315                  # not tracked per-source; best effort: if any module exports that sym and defines function
+   316                  dep = project_modules[dep_mn]
+   317                  if sym in dep.functions:
+   318                      self.visible_functions.setdefault(sym, dep.functions[sym])
+   319
+   320      def push_scope(self) -> None:
+   321          self.scope = Scope(parent=self.scope)
+   322
+   323      def pop_scope(self) -> None:
+   324          assert self.scope.parent is not None
+   325          self.scope = self.scope.parent
+   326
+   327      def visit_Global(self, node: ast.Global) -> None:
+   328          self.scope.globals |= set(node.names)
+   329
+   330      def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+   331          self.scope.nonlocals |= set(node.names)
+   332
+   333      def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+   334          self.scope.defined.add(node.name)
+   335          self.push_scope()
+   336          for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+   337              self.scope.defined.add(a.arg)
+   338          if node.args.vararg:
+   339              self.scope.defined.add(node.args.vararg.arg)
+   340          if node.args.kwarg:
+   341              self.scope.defined.add(node.args.kwarg.arg)
+   342          for st in node.body:
+   343              self.visit(st)
+   344          self.pop_scope()
+   345
+   346      def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+   347          self.visit_FunctionDef(node)  # type: ignore[arg-type]
+   348
+   349      def visit_ClassDef(self, node: ast.ClassDef) -> None:
+   350          self.scope.defined.add(node.name)
+   351          self.push_scope()
+   352          for st in node.body:
+   353              self.visit(st)
+   354          self.pop_scope()
+   355
+   356      def visit_Assign(self, node: ast.Assign) -> None:
+   357          self.visit(node.value)
+   358          for t in node.targets:
+   359              for n in extract_assigned_names(t):
+   360                  self.scope.defined.add(n)
+root@b36aefe5be54:/app# perl -i -pe 'if($.== (grep {$_} ())){}' /app/analyze_deps.py
+root@b36aefe5be54:/app# perl -0777 -i -pe 's/(top_level: Set\[str\] = set\(\)\n    for mn in modules\.keys\(\):\n        if mn:\n            top_level\.add\(mn\
+.split\("\."\)\[0\]\)\n)/$1\n    stdlib: Set[str] = set(getattr(sys, "stdlib_module_names", ()))\n    stdlib |= {"builtins"}\n/s' /app/analyze_deps.py
+root@b36aefe5be54:/app# perl -0777 -i -pe 's/resolved = module_to_path\(project_dir, mod\)\n                if resolved is None:\n                    first = mo
+d\.split\("\\\."\)\[0\]\n                    \# if unresolved and not stdlib, invalid\n                    if first not in stdlib:\n                        vali
+d_imports = False\n                        errors\.append\(Error\("invalid_import", to_app_path\(project_dir, mi\.file_path\), f"Invalid import: \{mod\}"\)\)\n
+                   continue/resolved = module_to_path(project_dir, mod)\n                if resolved is None:\n                    first = mod.split(".")[0]\n
+                  if first not in stdlib:\n                        valid_imports = False\n                        errors.append(Error("invalid_import", to_app_p
+ath(project_dir, mi.file_path), f"Invalid import: {mod}"))\n                    continue/s' /app/analyze_deps.py
+root@b36aefe5be54:/app# python -m py_compile /app/analyze_deps.py
+root@b36aefe5be54:/app# python /app/analyze_deps.py --project-dir /tmp/proj2 --out /tmp/proj2_report_check2.json
+root@b36aefe5be54:/app# cat /tmp/proj2_report_check2.json
+{
+  "all_refs_defined": false,
+  "errors": [
+    {
+      "file": "/app/b.py",
+      "message": "Circular dependency: /app/b.py -> /app/c.py -> /app/b.py",
+      "type": "circular_dependency"
+    },
+    {
+      "file": "/app/a.py",
+      "message": "Invalid attribute access: module pkg has no attribute mod",
+      "type": "invalid_attribute_access"
+    },
+    {
+      "file": "/app/b.py",
+      "message": "Unused import: c",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/c.py",
+      "message": "Unused import: b",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/pkg/__init__.py",
+      "message": "Unused import: api",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/a.py",
+      "message": "Type error: api expects at most 2 positional args, got 3",
+      "type": "type_error"
+    },
+    {
+      "file": "/app/a.py",
+      "message": "Undefined reference: value2",
+      "type": "undefined_reference"
+    }
+  ],
+  "no_circular_deps": false,
+  "no_unused_imports": false,
+  "type_consistent": false,
+  "valid_attribute_access": false,
+  "valid_imports": true
+}
+root@b36aefe5be54:/app#

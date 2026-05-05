@@ -1,0 +1,232 @@
+New Terminal Output:
+
+root@69302d75fd9b:/app# rm /app/optimize_mysql.py
+root@69302d75fd9b:/app# cat > /app/optimize_mysql.py << 'EOF'
+> import json
+> import os
+> import re
+> from collections import defaultdict, Counter
+> from datetime import datetime
+> from math import log as ln
+>
+> def parse_slow_log(file_path):
+>     queries = []
+>     with open(file_path, 'r') as f:
+>         lines = f.readlines()
+>     i = 0
+>     while i < len(lines):
+>         line = lines[i].strip()
+>         if line.startswith('# Time: '):
+>             timestamp_str = line.split('Time: ')[1]
+>             timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S.%f%z')
+>             # Find Query_time
+>             while i < len(lines) and not lines[i].strip().startswith('# Query_time: '):
+>                 i += 1
+>             if i < len(lines):
+>                 query_time_line = lines[i].strip()
+>                 query_time = float(query_time_line.split()[2])
+>                 if query_time > 1.0:
+>                     # Find the query
+>                     i += 1
+>                     query_lines = []
+>                     while i < len(lines) and not lines[i].strip().startswith('#'):
+>                         query_lines.append(lines[i].strip())
+>                         i += 1
+>                     query = ' '.join(query_lines).strip().rstrip(';')
+>                     queries.append({'timestamp': timestamp, 'query': query, 'time': query_time})
+>                 else:
+>                     i += 1
+>             else:
+>                 i += 1
+>         else:
+>             i += 1
+>     return queries
+>
+> def normalize_query(query):
+>     # Uppercase
+>     query = query.upper()
+>     # Replace numbers
+>     query = re.sub(r'\b\d+\b', '?', query)
+>     # Replace strings
+>     query = re.sub(r"'[^']*'", '?', query)
+>     # Replace IN lists
+>     query = re.sub(r'IN\s*\([^)]+\)', 'IN (?)', query)
+>     return query
+>
+> def extract_indexable_columns(query):
+>     # Simple extraction: from WHERE, JOIN ON, ORDER BY
+>     cols = set()
+>     # WHERE
+>     where_match = re.search(r'WHERE\s+(.*)', query)
+>     if where_match:
+>         clause = where_match.group(1)
+>         cols.update(re.findall(r'\b([A-Z_]+)\b\s*[=<>!]+', clause))
+>     # JOIN ON
+>     join_match = re.search(r'JOIN\s+\w+\s+ON\s+(.*)', query)
+>     if join_match:
+>         clause = join_match.group(1)
+>         cols.update(re.findall(r'\b([A-Z_]+)\b\s*[=<>!]+', clause))
+>     # ORDER BY
+>     order_match = re.search(r'ORDER BY\s+(.*)', query)
+>     if order_match:
+>         clause = order_match.group(1)
+>         cols.update(re.findall(r'\b([A-Z_]+)\b', clause))
+>     return cols
+>
+> def load_metadata():
+>     with open('/app/query_metadata.json', 'r') as f:
+>         return json.load(f)
+>
+> def main():
+>     metadata = load_metadata()
+>     budget = metadata['budget']
+>     tables = metadata['tables']
+>     all_queries = []
+>     for log_file in os.listdir('/app'):
+>         if log_file.startswith('mysql_slow_') and log_file.endswith('.log'):
+>             all_queries.extend(parse_slow_log(os.path.join('/app', log_file)))
+>
+>     # Phase 1: Normalize and group
+>     pattern_groups = defaultdict(list)
+>     for q in all_queries:
+>         norm = normalize_query(q['query'])
+>         pattern_groups[norm].append({'time': q['time'], 'timestamp': q['timestamp'], 'query': q['query']})
+>
+>     normalized_patterns = []
+>     for pattern, queries in pattern_groups.items():
+>         freq = len(queries)
+>         avg_time = sum(q['time'] for q in queries) / freq
+>         total_time = sum(q['time'] for q in queries)
+>         normalized_patterns.append({
+>             'pattern': pattern,
+>             'frequency': freq,
+>             'avg_execution_time': round(avg_time, 1),
+>             'total_time': round(total_time, 1)
+>         })
+>     normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+>
+>     # Phase 2: Index candidates
+>     index_candidates = []
+>     pattern_to_cols = {}
+>     for pat in normalized_patterns:
+>         cols = extract_indexable_columns(pat['pattern'])
+>         pattern_to_cols[pat['pattern']] = cols
+>         # For each col, assume table from pattern (simplified: find table in pattern)
+>         table_match = re.search(r'FROM\s+(\w+)', pat['pattern'])
+>         if table_match:
+>             table = table_match.group(1)
+>             if table in tables:
+>                 for col in cols:
+>                     if col in tables[table]['columns']:
+>                         selectivity = tables[table]['columns'][col]['distinct_values'] / tables[table]['total_rows']
+>                         selectivity = round(selectivity, 2)
+>                         impact = pat['frequency'] * pat['avg_execution_time'] * max(selectivity, 0.1)
+>                         impact = round(impact, 1)
+>                         index_candidates.append({
+>                             'table': table,
+>                             'columns': [col],
+>          
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+or cand['impact_score'] > seen[key]['impact_score']:
+>             seen[key] = cand
+>     index_candidates = list(seen.values())
+>     index_candidates.sort(key=lambda x: (-x['impact_score'], x['table'] + str(x['columns'])))
+>
+>     # Phase 3: Temporal correlations
+>     # Sort queries by timestamp
+>     all_ts_queries = sorted(all_queries, key=lambda x: x['timestamp'])
+>     correlations = defaultdict(int)
+>     for i in range(len(all_ts_queries)):
+>         for j in range(i+1, len(all_ts_queries)):
+>             if (all_ts_queries[j]['timestamp'] - all_ts_queries[i]['timestamp']).total_seconds() > 60:
+>                 break
+>             pat1 = normalize_query(all_ts_queries[i]['query'])
+>             pat2 = normalize_query(all_ts_queries[j]['query'])
+>             if pat1 != pat2:
+>                 pair = tuple(sorted([pat1, pat2]))
+>                 correlations[pair] += 1
+>
+>     temporal_correlations = []
+>     for pair, strength in correlations.items():
+>         if strength >= 3:
+>             deltas = []  # Simplified, assume avg 0 for now
+>             temporal_correlations.append({
+>                 'pattern1': pair[0],
+>                 'pattern2': pair[1],
+>                 'correlation_strength': strength,
+>                 'avg_time_delta': 0.0  # Placeholder
+>             })
+>     temporal_correlations.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+>     temporal_correlations = temporal_correlations[:3]
+>
+>     # Phase 4: Recommendations
+>     recommended_indexes = []
+>     total_cost = 0
+>     table_count = defaultdict(int)
+>     for cand in index_candidates:
+>         if len(recommended_indexes) >= 5:
+>             break
+>         if table_count[cand['table']] >= 2:
+>             continue
+>         if total_cost + cand['cost'] <= budget:
+>             recommended_indexes.append(cand)
+>             total_cost += cand['cost']
+>             table_count[cand['table']] += 1
+>
+>     total_impact = sum(c['impact_score'] for c in recommended_indexes)
+>
+>     # Output JSON
+>     output = {
+>         'normalized_patterns': normalized_patterns,
+>         'index_candidates': index_candidates,
+>         'temporal_correlations': temporal_correlations,
+>         'recommended_indexes': recommended_indexes,
+>         'total_budget_used': round(total_cost, 1),
+>         'total_impact': round(total_impact, 1)
+>     }
+>     with open('/app/optimization.json', 'w') as f:
+>         json.dump(output, f, indent=2)
+>
+>     # Text output
+>     total_slow = len(all_queries)
+>     unique_patterns = len(normalized_patterns)
+>     with open('/app/recommendations.txt', 'w') as f:
+>         f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+>         f.write('=====================================\n')
+>         f.write(f'Total Slow Queries: {total_slow}\n')
+>         f.write(f'Unique Query Patterns: {unique_patterns}\n')
+>         f.write(f'Total Budget: {budget} points\n')
+>         f.write(f'Budget Used: {round(total_cost, 1)} points\n\n')
+>         f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+>         for i, pat in enumerate(normalized_patterns[:5], 1):
+>             # Impact: freq * avg * max(S, 0.1)
+>             cols = extract_indexable_columns(pat['pattern'])
+>             table_match = re.search(r'FROM\s+(\w+)', pat['pattern'])
+>             if table_match:
+>                 table = table_match.group(1)
+>                 sels = [tables[table]['columns'][c]['distinct_values'] / tables[table]['total_rows'] for c in cols if c in tables[table]['columns']]
+>                 s_max = max(sels) if sels else 0.1
+>             else:
+>                 s_max = 0.1
+>             impact = round(pat['frequency'] * pat['avg_execution_time'] * max(s_max, 0.1), 1)
+>             pat_str = pat['pattern'][:60] + ('...' if len(pat['pattern']) > 60 else '')
+>             f.write(f'{i}. {pat_str} (Impact: {impact}, Freq: {pat["frequency"]}, Avg: {pat["avg_execution_time"]}s, Total: {pat["total_time"]}s)\n')
+>         f.write('\nTEMPORAL CORRELATIONS:\n')
+>         for i, corr in enumerate(temporal_correlations, 1):
+>             f.write(f'{i}. Pattern Pair (Strength: {corr["correlation_strength"]}):\n')
+>             f.write(f'   - {corr["pattern1"]}\n')
+>             f.write(f'   - {corr["pattern2"]}\n')
+>         f.write('\nRECOMMENDED INDEXES (5 max):\n')
+>         for i, rec in enumerate(recommended_indexes, 1):
+>             cols_str = ','.join(rec['columns'])
+>             f.write(f'{i}. {rec["table"]}({cols_str}) - Impact: {rec["impact_score"]}, Cost: {rec["cost"]} [high_impact]\n')
+>         f.write('\nOPTIMIZATION SUMMARY:\n')
+>         f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+>         f.write(f'- Remaining budget: {round(budget - total_cost, 1)} points\n')
+>         f.write(f'- Tables optimized: {len(table_count)}\n')
+>
+> if __name__ == '__main__':
+>     main()
+> EOF
+root@69302d75fd9b:/app# python3 /app/optimize_mysql.py
+root@69302d75fd9b:/app#

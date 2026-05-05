@@ -1,0 +1,115 @@
+{
+  "analysis": "TSIG is now valid (generated via tsig-keygen) and pid/session paths are writable. Services still exit because BIND tries to configure the command channel using /etc/bind/rndc.key (permission denied) and then treats it as fatal ('couldn't install keys for command channel ... permission denied'). Adding a controls stanza without keys didn’t stop it from trying /etc/bind/rndc.key. Also secure.example.com DNSSEC signing failed because the key files were removed earlier and not regenerated in this run; secure.example.com.zone.signed is currently missing. Next: explicitly disable controls (or provide an accessible rndc key file and reference it), regenerate DNSSEC keys and sign zone, then restart services and test.",
+  "plan": "1) Disable the control channel entirely by adding 'controls { };' to each config (or remove the custom controls stanza and set controls to empty). This should prevent attempts to read /etc/bind/rndc.key. 2) Ensure resolver/primary/secondary configs no longer reference controls with keys. 3) Regenerate DNSSEC keys for secure.example.com and sign the zone to recreate secure.example.com.zone.signed. 4) Start all named instances and verify they stay running and are listening on ports. 5) Test AXFR from secondary, run /app/test_queries.txt via resolver, and check DNSSEC validation (AD flag).",
+  "commands": [
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[^}]*\\};\\n/\\ncontrols { };\\n/sg' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[^}]*\\};\\n/\\ncontrols { };\\n/sg' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[^}]*\\};\\n/\\ncontrols { };\\n/sg' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f Ksecure.example.com.*.key Ksecure.example.com.*.private dsset-secure.example.com. keyset-secure.example.com. secure.example.com.zone.signed secure.example.com.zone.signed.jnl\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-keygen -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dnssec-keygen -f KSK -a RSASHA256 -b 2048 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "KSK=$(ls Ksecure.example.com.*KSK*.key | sed 's/\\.key$//' | head -n1); ZSK=$(ls Ksecure.example.com.*.key | grep -v KSK | sed 's/\\.key$//' | head -n1); echo \"KSK=$KSK\"; echo \"ZSK=$ZSK\"; dnssec-signzone -o secure.example.com -N increment -t -k \"$KSK\" secure.example.com.zone \"$ZSK\"\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com SOA +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | egrep 'status:|flags:|secure\\.example\\.com\\.|RRSIG|DNSKEY' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

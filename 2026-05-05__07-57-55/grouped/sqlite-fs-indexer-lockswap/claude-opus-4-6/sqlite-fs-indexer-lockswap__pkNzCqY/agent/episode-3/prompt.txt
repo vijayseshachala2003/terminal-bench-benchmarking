@@ -1,0 +1,233 @@
+New Terminal Output:
+
+root@a0d10faa1291:/app# python3 --version
+Python 3.13.1
+root@a0d10faa1291:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import fnmatch
+> import tempfile
+> import shutil
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read and parse ignore patterns from file. Returns list of (pattern_nfc, match_type) tuples.
+>     match_type: 'rooted' (leading /), 'basename' (no / in pattern), 'path' (contains / but no leading /)
+>     """
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 # Normalize pattern to NFC
+>                 pat = unicodedata.normalize("NFC", line.strip())
+>                 if not pat:
+>                     continue
+>                 if pat.startswith("/"):
+>                     # Rooted pattern: match against full relative path
+>                     pat = pat[1:]  # strip leading /
+>                     patterns.append((pat, "rooted"))
+>                 elif "/" in pat:
+>                     # Contains / but doesn't start with /: match full path or any suffix after /
+>                     patterns.append((pat, "path"))
+>                 else:
+>                     # No /: match against each path component
+>                     patterns.append((pat, "basename"))
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _match_pattern(pat, text):
+>     """Match pattern against text where * matches zero or more non-/ characters.
+>     ** is treated as two literal * characters (matching nothing since * doesn't match /).
+>     We use fnmatch-style matching but ensure * doesn't match /.
+>     """
+>     # We implement our own matching since fnmatch.fnmatch uses os.path conventions
+>     # and we need * to not match /
+>     return _glob_match(pat, text)
+>
+>
+> def _glob_match(pattern, text):
+>     """Match pattern against text. * matches zero or more chars except /.
+>     All other characters are literal.
+>     """
+>     # Convert pattern to a regex-free state machine approach
+>     # Use dynamic programming / backtracking
+>     p = 0
+>     t = 0
+>     star_p = -1
+>     star_t = -1
+>     plen = len(pattern)
+>     tlen = len(text)
+>
+>     while t < tlen:
+>         if p < plen and pattern[p] == '*':
+>             star_p = p
+>             star_t = t
+>             p += 1
+>         elif p < plen and (pattern[p] == text[t]):
+>             p += 1
+>             t += 1
+>         elif star_p != -1:
+>             # Backtrack: try matching one more char with the star
+>             p = star_p + 1
+>             star_t += 1
+>             # * must not match /
+>             if text[star_t - 1] == '/':
+>                 return False
+>             t = star_t
+>         else:
+>             return False
+>
+>     # Check remaining pattern chars are all *
+>     while p < plen and pattern[p] == '*':
+>         p += 1
+>
+>     return p == plen
+>
+>
+> def _is_ignored(rel_path_nfc, patterns):
+>     """Check if a NFC-normalized relative path should be ignored based on patterns.
+>     rel_path_nfc uses / as separator.
+>     """
+>     for pat, match_type in patterns:
+>         if match_type == "rooted":
+>             # Match against full relative path only
+>             if _match_pattern(pat, rel_path_nfc):
+>                 return True
+>         elif match_type == "basename":
+>             # Match against each path component
+>             components = rel_path_nfc.split("/")
+>             for comp in components:
+>                 if _match_pattern(pat, comp):
+>                     return True
+>         elif match_type == "path":
+>             # Match against full path or any suffix starting after /
+>             if _match_pattern(pat, rel_path_nfc):
+>                 return True
+>             # Try each suffix that starts after a /
+>             idx = 0
+>             while True:
+>                 idx = rel_path_nfc.find("/", idx)
+>                 if idx == -1:
+>                     break
+>                 suffix = rel_path_nfc[idx + 1:]
+>                 if _match_pattern(pat, suffix):
+>                     return True
+>                 idx += 1
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of file contents. Returns lowercase hex string."""
+>     h = hashlib.sha256()
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>     return h.hexdigest()
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     patterns = _read_ignore_patterns()
+>
+>     # Collect all files: map from nfc_rel_path -> (original_rel_path, abs_path)
+>     # For Unicode collisions, keep the entry with lexicographically largest original rel path
+>     file_map = {}  # nfc_path -> (original_rel_path, absolute_path)
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories from dirnames (in-place) to prevent traversal
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         # Sort dirnames for deterministic traversal
+>         dirnames.sort()
+>
+>         for filename in sorted(filenames):
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Compute relative path with forward slashes
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, "/")
+>
+>             # NFC normalize
+>             nfc_path = unicodedata.normalize("NFC", rel_path)
+>
+>             # Check ignore patterns against NFC path
+>             if _is_ignored(nfc_path, patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original path
+>             if nfc_path in file_map:
+>                 existing_orig = file_map[nfc_path][0]
+>                 if rel_path > existing_orig:
+>                     file_map[nfc_path] = (rel_path, full_path)
+>             else:
+>                 file_map[nfc_path] = (rel_path, full_path)
+>
+>     # Build rows sorted by nfc_path for determinism
+>     rows = []
+>     for nfc_path in sorted(file_map.keys()):
+>         orig_rel, abs_path = file_map[nfc_path]
+>         try:
+>             size = os.path.getsize(abs_path)
+>             sha = _hash_file(abs_path)
+>             rows.append((nfc_path, sha, size))
+>         except (OSError, IOError):
+>             # Skip files we can't read
+>             continue
+>
+>     # Write to a temporary database, then atomically replace the target.
+>     # This avoids concurrent writers corrupting the same db file.
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=FULL")
+>             conn.execute(
+>                 "CREATE TABLE files ("
+>                 "path TEXT PRIMARY KEY, "
+>                 "sha256 TEXT NOT NULL, "
+>                 "size INTEGER NOT NULL)"
+>             )
+>             conn.executemany(
+>                 "INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)",
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         # Atomic replace
+>         shutil.move(tmp_path, os.path.abspath(db_path))
+>     except BaseException:
+>         # Clean up temp file on failure
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> PYTHON_EOF
+root@a0d10faa1291:/app#

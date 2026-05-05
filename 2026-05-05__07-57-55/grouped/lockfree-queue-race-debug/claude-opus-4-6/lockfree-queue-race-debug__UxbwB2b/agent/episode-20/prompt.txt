@@ -1,0 +1,172 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@b22e726280e5:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         std::atomic<uint64_t> value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Pack pointer + tag into a single 64-bit value
+>     static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFF;
+>     static constexpr int TAG_SHIFT = 48;
+>
+>     static uint64_t pack(Node* ptr, uint64_t tag) {
+>         return (reinterpret_cast<uint64_t>(ptr) & PTR_MASK) | (tag << TAG_SHIFT);
+>     }
+>     static Node* ptr_of(uint64_t tagged) {
+>         return reinterpret_cast<Node*>(tagged & PTR_MASK);
+>     }
+>     static uint64_t tag_of(uint64_t tagged) {
+>         return tagged >> TAG_SHIFT;
+>     }
+>
+>     std::atomic<uint64_t> head_;
+>     std::atomic<uint64_t> tail_;
+>     std::atomic<uint64_t> free_list_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void free_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@b22e726280e5:/app# cat > /app/lockfree_queue.cpp << 'IMPL_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(pack(dummy, 0), std::memory_order_relaxed);
+>     tail_.store(pack(dummy, 0), std::memory_order_relaxed);
+>     free_list_.store(pack(nullptr, 0), std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel
+>     delete ptr_of(head_.load(std::memory_order_relaxed));
+>
+>     // Delete free list nodes
+>     Node* n = ptr_of(free_list_.load(std::memory_order_relaxed));
+>     while (n) {
+>         Node* next = n->next.load(std::memory_order_relaxed);
+>         delete n;
+>         n = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     uint64_t old_fl = free_list_.load(std::memory_order_acquire);
+>     while (ptr_of(old_fl) != nullptr) {
+>         Node* node = ptr_of(old_fl);
+>         Node* next = node->next.load(std::memory_order_relaxed);
+>         uint64_t new_fl = pack(next, tag_of(old_fl) + 1);
+>         if (free_list_.compare_exchange_weak(old_fl, new_fl,
+>                 std::memory_order_acq_rel, std::memory_order_acquire)) {
+>             node->value.store(value, std::memory_order_relaxed);
+>             node->next.store(nullptr, std::memory_order_relaxed);
+>             return node;
+>         }
+>     }
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::free_node(Node* node) {
+>     uint64_t old_fl = free_list_.load(std::memory_order_relaxed);
+>     uint64_t new_fl;
+>     do {
+>         node->next.store(ptr_of(old_fl), std::memory_order_relaxed);
+>         new_fl = pack(node, tag_of(old_fl) + 1);
+>     } while (!free_list_.compare_exchange_weak(old_fl, new_fl,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         uint64_t tail = tail_.load(std::memory_order_acquire);
+>         Node* tail_ptr = ptr_of(tail);
+>         Node* next = tail_ptr->next.load(std::memory_order_acquire);
+>
+>         if (tail != tail_.load(std::memory_order_acquire))
+>             continue;
+>
+>         if (next == nullptr) {
+>             Node* expected = nullptr;
+>             if (tail_ptr->next.compare_exchange_weak(expected, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 tail_.compare_exchange_strong(tail,
+>                     pack(new_node, tag_of(tail) + 1),
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             tail_.compare_exchange_strong(tail,
+>                 pack(next, tag_of(tail) + 1),
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         uint64_t head = head_.load(std::memory_order_acquire);
+>         uint64_t tail = tail_.load(std::memory_order_acquire);
+>         Node* head_ptr = ptr_of(head);
+>         Node* tail_ptr = ptr_of(tail);
+>         Node* next = head_ptr->next.load(std::memory_order_acquire);
+>
+>         if (head != head_.load(std::memory_order_acquire))
+>             continue;
+>
+>         if (head_ptr == tail_ptr) {
+>             if (next == nullptr)
+>                 return false;
+>             tail_.compare_exchange_strong(tail,
+>                 pack(next, tag_of(tail) + 1),
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             if (next == nullptr)
+>                 continue;
+>             uint64_t val = next->value.load(std::memory_order_relaxed);
+>             if (head_.compare_exchange_strong(head,
+>                     pack(next, tag_of(head) + 1),
+>                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+>                 value = val;
+>                 free_node(head_ptr);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> IMPL_EOF
+root@b22e726280e5:/app# cd /app && make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp -latomic
+root@b22e726280e5:/app#

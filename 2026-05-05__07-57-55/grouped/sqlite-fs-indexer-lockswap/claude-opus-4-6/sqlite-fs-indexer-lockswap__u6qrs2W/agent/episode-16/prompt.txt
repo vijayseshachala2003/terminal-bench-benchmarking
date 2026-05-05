@@ -1,0 +1,267 @@
+New Terminal Output:
+
+root@4faec24f3685:/app# python3 > /app/app/indexer.py << 'PYEOF'
+> import os
+> import re
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+>
+>
+> def _pattern_to_regex(pattern):
+>     """
+>     Convert a glob pattern to a regex string.
+>
+>     Rules:
+>     - '**' matches literal '**' in the path (two asterisk characters)
+>     - A lone '*' matches zero or more characters except '/'
+>     - '?' matches exactly one character except '/'
+>     - Other special regex chars are escaped
+>     """
+>     i = 0
+>     n = len(pattern)
+>     result = []
+>     while i < n:
+>         c = pattern[i]
+>         if c == '*' and i + 1 < n and pattern[i + 1] == '*':
+>             # '**' -> literal two asterisks
+>             result.append(re.escape('**'))
+>             i += 2
+>         elif c == '*':
+>             # '*' -> match zero or more non-'/' characters
+>             result.append('[^/]*')
+>             i += 1
+>         elif c == '?':
+>             # '?' -> match exactly one non-'/' character
+>             result.append('[^/]')
+>             i += 1
+>         elif c == '[':
+>             # Character class - pass through but find the closing ']'
+>             j = i + 1
+>             if j < n and pattern[j] == '!':
+>                 j += 1
+>             if j < n and pattern[j] == ']':
+>                 j += 1
+>             while j < n and pattern[j] != ']':
+>                 j += 1
+>             if j >= n:
+>                 # No closing bracket, treat as literal
+>                 result.append(re.escape(c))
+>                 i += 1
+>             else:
+>                 # Include the character class
+>                 cls = pattern[i:j+1]
+>                 # Replace '!' with '^' for negation
+>                 if cls[1:2] == '!':
+>                     cls = '[^' + cls[2:]
+>                 result.append(cls)
+>                 i = j + 1
+>         else:
+>             result.append(re.escape(c))
+>             i += 1
+>     return ''.join(result)
+>
+>
+> def _glob_match(text, pattern):
+>     """Match text against a glob pattern where * doesn't match /."""
+>     regex = _pattern_to_regex(pattern)
+>     return re.fullmatch(regex, text) is not None
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read ignore patterns from file, return list of NFC-normalized patterns."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 try:
+>                     line = line.rstrip("\n").rstrip("\r")
+>                     stripped = line.strip()
+>                     if not stripped or stripped.startswith("#"):
+>                         continue
+>                     # Normalize pattern to NFC
+>                     pat = unicodedata.normalize("NFC", stripped)
+>                     patterns.append(pat)
+>                 except Exception:
+>                     # Malformed lines must not crash the indexer
+>                     continue
+>     except (OSError, IOError):
+>         pass
+>     return patterns
+>
+>
+> def _match_pattern(rel_path, pattern):
+>     """
+>     Check if rel_path matches the given ignore pattern.
+>
+>     Rules:
+>     1. Leading '/' on pattern: match against full relative path only (strip leading '/').
+>     2. Pattern with no '/': match against each path component.
+>     3. Pattern with '/' but not starting with '/': match full path or any suffix after '/'.
+>     4. '*' matches zero or more chars but NOT '/'. '**' means two literal '*' chars.
+>     """
+>     try:
+>         if pattern.startswith("/"):
+>             # Rule 1: anchored pattern
+>             pat = pattern[1:]
+>             return _glob_match(rel_path, pat)
+>         elif "/" not in pattern:
+>             # Rule 2: no '/' - match against each path component
+th)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                "CREATE T>             components = rel_path.split("/")
+>             for comp in components:
+>                 if _glob_match(comp, pattern):
+>                     return True
+>             return False
+>         else:
+>             # Rule 3: contains '/' but doesn't start with '/'
+>             if _glob_match(rel_path, pattern):
+>                 return True
+>             idx = 0
+>             while True:
+>                 idx = rel_path.find("/", idx)
+>                 if idx == -1:
+>                     break
+>                 suffix = rel_path[idx + 1:]
+>                 if _glob_match(suffix, pattern):
+>                     return True
+>                 idx += 1
+>             return False
+>     except Exception:
+>         # Malformed patterns must not crash
+>         return False
+>
+>
+> def _should_ignore(rel_path, patterns):
+>     """Check if a relative path should be ignored based on patterns."""
+>     for pattern in patterns:
+>         if _match_pattern(rel_path, pattern):
+>             return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of a file, return lowercase hex string and size."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest().lower(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     ignore_patterns = _read_ignore_patterns()
+>
+>     # Normalize root_dir to absolute path
+>     root_dir = os.path.abspath(root_dir)
+>
+>     # Collect all files: dict mapping NFC rel_path -> (original_rel_path, abs_path)
+>     # For Unicode collisions, keep the entry with lexicographically largest original rel_path
+>     files = {}  # nfc_path -> (original_rel_path, abs_path)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories from dirnames (in-place)
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         # Sort dirnames for deterministic traversal
+>         dirnames.sort()
+>
+>         for filename in filenames:
+>             abs_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(abs_path):
+>                 continue
+>
+>             # Compute relative path with forward slashes
+>             rel_path = os.path.relpath(abs_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, "/")
+>
+>             # NFC normalize
+>             nfc_path = unicodedata.normalize("NFC", rel_path)
+>
+>             # Check ignore patterns (use NFC path)
+>             if _should_ignore(nfc_path, ignore_patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original rel_path
+>             if nfc_path in files:
+>                 existing_orig = files[nfc_path][0]
+>                 if rel_path > existing_orig:
+>                     files[nfc_path] = (rel_path, abs_path)
+>             else:
+>                 files[nfc_path] = (rel_path, abs_path)
+>
+>     # Sort by NFC path for deterministic order
+>     sorted_paths = sorted(files.keys())
+>
+>     # Build rows: (nfc_path, sha256, size)
+>     rows = []
+>     for nfc_path in sorted_paths:
+>         orig_rel, abs_path = files[nfc_path]
+>         try:
+>             sha256_hex, size = _hash_file(abs_path)
+>         except (OSError, IOError):
+>             continue
+>         rows.append((nfc_path, sha256_hex, size))
+>
+>     # Write to database using a temp file + rename for concurrency safety
+>     # Use a temp file in the same directory so os.replace works atomically
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=NORMAL")
+>             conn.execute(
+>                 "CREATE TABLE files ("
+>                 "path TEXT PRIMARY KEY, "
+>                 "sha256 TEXT NOT NULL, "
+>                 "size INTEGER NOT NULL)"
+>             )
+>             conn.executemany(
+>                 "INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)",
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         # Atomic replace
+>         os.replace(tmp_path, os.path.abspath(db_path))
+>     except:
+>         # Clean up temp file on error
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> PYEOF
+root@4faec24f3685:/app# python3 -c "import ast; ast.parse(open('/app/app/indexer.py').read()); print('SYNTAX OK')"
+SYNTAX OK
+root@4faec24f3685:/app# python3 -c "from app.indexer import build_index; print('IMPORT OK')"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    from app.indexer import build_index; print('IMPORT OK')
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ImportError: cannot import name 'build_index' from 'app.indexer' (/app/app/indexer.py)
+root@4faec24f3685:/app#

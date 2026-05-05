@@ -1,0 +1,243 @@
+Current terminal state:
+New Terminal Output:
+
+root@11eeb3eb8fab:/app# cd /app
+root@11eeb3eb8fab:/app# ls -la
+total 44
+drwxr-xr-x. 1 root root 16384 Apr 30 09:48 .
+drwxr-xr-x. 1 root root    74 Apr 30 11:21 ..
+-rwxr-xr-x. 1 root root  2454 Apr 30 09:48 generate_sensor_data.sh
+-rw-r--r--. 1 root root  2208 Apr 30 09:48 sensor_001.json
+-rw-r--r--. 1 root root  1810 Apr 30 09:48 sensor_002.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_003.json
+-rw-r--r--. 1 root root  1703 Apr 30 09:48 sensor_004.json
+-rw-r--r--. 1 root root     0 Apr 30 09:48 sensor_empty.json
+-rw-r--r--. 1 root root   181 Apr 30 09:48 sensor_issues_only.json
+-rw-r--r--. 1 root root    79 Apr 30 09:48 sensor_malformed.json
+root@11eeb3eb8fab:/app# ls -1 sensor_*.json 2>/dev/null || true
+sensor_001.json
+sensor_002.json
+sensor_003.json
+sensor_004.json
+sensor_empty.json
+sensor_issues_only.json
+sensor_malformed.json
+root@11eeb3eb8fab:/app# python3 - <<'PY'
+> import json, glob, os, math
+> from collections import defaultdict
+>
+> def is_missing(v):
+>     return v is None or (isinstance(v,str) and v.strip()=="")
+>
+> def to_float(v):
+>     if is_missing(v):
+>         return None
+>     if isinstance(v,(int,float)):
+>         return float(v)
+None),
+    "max_temperature": (round(gmax,1) if gmax is not None e>     if isinstance(v,str):
+>         try:
+>             return float(v.strip())
+>         except Exception:
+>             return None
+>     return None
+>
+> def to_int(v):
+>     if is_missing(v):
+>         return None
+>     if isinstance(v,bool):
+>         return None
+>     if isinstance(v,int):
+>         return int(v)
+>     if isinstance(v,float):
+>         if math.isfinite(v):
+>             return int(v)
+>         return None
+>     if isinstance(v,str):
+>         try:
+>             # allow "123" or "123.0"
+>             f=float(v.strip())
+>             if math.isfinite(f):
+>                 return int(f)
+>         except Exception:
+>             return None
+>     return None
+>
+> def read_json_file(path):
+>     try:
+>         with open(path,'r',encoding='utf-8') as f:
+>             data=f.read()
+>     except Exception:
+>         return None, 'unreadable'
+>     if data.strip()=="":
+>         return None, 'empty'
+>     try:
+>         return json.loads(data), None
+>     except Exception:
+>         return None, 'malformed'
+>
+> def iter_rows(obj):
+>     # Accept list of rows, or dict with common keys
+>     if obj is None:
+>         return
+>     if isinstance(obj,list):
+>         for r in obj:
+>             if isinstance(r,dict):
+>                 yield r
+>         return
+>     if isinstance(obj,dict):
+>         for key in ("readings","data","rows"):
+>             v=obj.get(key)
+>             if isinstance(v,list):
+>                 for r in v:
+>                     if isinstance(r,dict):
+>                         yield r
+>                 return
+>         # single row dict fallback
+>         if all(k in obj for k in ("device_id","timestamp","temperature")):
+>             yield obj
+>         return
+>
+> input_files=sorted([p for p in glob.glob('/app/sensor_*.json') if os.path.basename(p) not in ('sensor_analysis.json',)])
+>
+> all_devices=set()
+> all_valid_temps=[]
+> all_valid_readings=[]  # tuples (device_id, timestamp_int, temp_float)
+> connectivity_issues=[]
+>
+> device_temps=defaultdict(list)
+>
+> total_rows_parsed=0
+>
+> for path in input_files:
+>     obj, err = read_json_file(path)
+>     if err in ('empty','malformed','unreadable'):
+>         # skip entirely but do not crash
+>         continue
+>     for row in iter_rows(obj):
+>         total_rows_parsed += 1
+>         device_id = row.get('device_id')
+>         if is_missing(device_id):
+>             device_id = "unknown"
+>         else:
+>             device_id = str(device_id)
+>         all_devices.add(device_id)
+>
+>         ts = to_int(row.get('timestamp'))
+>         temp = to_float(row.get('temperature'))
+>
+>         if ts is None or temp is None:
+>             connectivity_issues.append({"device_id": device_id, "issue_type": "missing_data"})
+>             continue
+>
+>         all_valid_temps.append(temp)
+>         all_valid_readings.append((device_id, ts, temp))
+>         device_temps[device_id].append(temp)
+>
+> # global stats
+> if all_valid_temps:
+>     gmin=min(all_valid_temps)
+>     gmax=max(all_valid_temps)
+>     gavg=sum(all_valid_temps)/len(all_valid_temps)
+>     # population stddev
+>     var=sum((t-gavg)**2 for t in all_valid_temps)/len(all_valid_temps)
+>     gstd=math.sqrt(var)
+> else:
+>     gmin=gmax=gavg=gstd=None
+>
+> # anomalies: outside 2 stddev of global mean
+> anomalies=[]
+> if all_valid_temps and gstd is not None:
+>     lo=gavg-2*gstd
+>     hi=gavg+2*gstd
+>     for device_id, ts, temp in all_valid_readings:
+>         if temp < lo or temp > hi:
+>             anomalies.append({
+>                 "device_id": device_id,
+>                 "timestamp": int(ts),
+>                 "temperature": round(temp,1)
+>             })
+>
+> anomalies.sort(key=lambda x: x["timestamp"])
+>
+> # device stats
+> device_stats=[]
+> for device_id in sorted(device_temps.keys()):
+>     temps=device_temps[device_id]
+>     if not temps:
+>         continue
+>     device_stats.append({
+>         "device_id": device_id,
+>         "min_temp": round(min(temps),1),
+>         "max_temp": round(max(temps),1),
+>         "avg_temp": round(sum(temps)/len(temps),1),
+>         "reading_count": int(len(temps))
+>     })
+>
+> # summary
+> summary={
+>     "total_devices": int(len(all_devices)),
+>     "total_readings": int(len(all_valid_temps)),
+>     "min_temperature": (round(gmin,1) if gmin is not None else None),
+>     "max_temperature": (round(gmax,1) if gmax is not None else None),
+>     "avg_temperature": (round(gavg,1) if gavg is not None else None),
+>     "anomaly_count": int(len(anomalies)),
+>     "connectivity_issues_count": int(len(connectivity_issues)),
+> }
+>
+> out={
+>     "device_stats": device_stats,
+>     "anomalies": anomalies,
+>     "connectivity_issues": connectivity_issues,
+>     "summary": summary
+> }
+>
+> with open('/app/sensor_analysis.json','w',encoding='utf-8') as f:
+>     json.dump(out,f,indent=2,sort_keys=False)
+>     f.write("\n")
+>
+> # text report
+> min_s = (f"{summary['min_temperature']:.1f}" if summary['min_temperature'] is not None else "N/A")
+> max_s = (f"{summary['max_temperature']:.1f}" if summary['max_temperature'] is not None else "N/A")
+> avg_s = (f"{summary['avg_temperature']:.1f}" if summary['avg_temperature'] is not None else "N/A")
+>
+> report = (
+> "IOT SENSOR ANALYSIS REPORT\n"
+> "==========================\n"
+> f"Total Devices: {summary['total_devices']}\n"
+> f"Total Readings: {summary['total_readings']}\n"
+> f"Temperature Range: {min_s}°C to {max_s}°C\n"
+> f"Average Temperature: {avg_s}°C\n"
+> f"Anomalies Detected: {summary['anomaly_count']}\n"
+> f"Connectivity Issues: {summary['connectivity_issues_count']}\n"
+> "==========================\n"
+> )
+>
+> with open('/app/sensor_report.txt','w',encoding='utf-8') as f:
+>     f.write(report)
+>
+> print("Wrote /app/sensor_analysis.json and /app/sensor_report.txt")
+> print("Inputs:", len(input_files), "files; parsed rows:", total_rows_parsed)
+> PY
+Wrote /app/sensor_analysis.json and /app/sensor_report.txt
+Inputs: 7 files; parsed rows: 76
+root@11eeb3eb8fab:/app# ls -la /app/sensor_analysis.json /app/sensor_report.txt
+-rw-r--r--. 1 root root 1886 Apr 30 11:22 /app/sensor_analysis.json
+-rw-r--r--. 1 root root  232 Apr 30 11:22 /app/sensor_report.txt
+root@11eeb3eb8fab:/app# python3 -c "import json; d=json.load(open('/app/sensor_analysis.json')); print('devices',d['summary']['total_devices'],'readings',d['sum
+mary']['total_readings'],'anomalies',d['summary']['anomaly_count'],'issues',d['summary']['connectivity_issues_count'])"
+devices 5 readings 70 anomalies 5 issues 6
+root@11eeb3eb8fab:/app# sed -n '1,120p' /app/sensor_report.txt
+IOT SENSOR ANALYSIS REPORT
+==========================
+Total Devices: 5
+Total Readings: 70
+Temperature Range: -20.0°C to 971.0°C
+Average Temperature: 101.3°C
+Anomalies Detected: 5
+Connectivity Issues: 6
+==========================
+root@11eeb3eb8fab:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

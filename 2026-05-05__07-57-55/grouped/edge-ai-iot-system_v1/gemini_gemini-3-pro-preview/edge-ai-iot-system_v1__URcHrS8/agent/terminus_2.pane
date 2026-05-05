@@ -1,0 +1,155 @@
+[?2004hroot@f08509cd3bf1:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@f08509cd3bf1:/app# clear
+[?2004l[H[J[3J[?2004hroot@f08509cd3bf1:/app# cat << 'EOF' > /app/solve.py
+[?2004l[?2004h> import json
+[?2004l[?2004h> import glob
+[?2004l[?2004h> import math
+[?2004l[?2004h> import os
+[?2004l[?2004h> 
+[?2004l[?2004h> def process_devices():
+[?2004l[?2004h>     files = sorted(glob.glob('/app/device_*.json'))
+[?2004l[?2004h>     devices = []
+[?2004l[?2004h>     
+[?2004l[?2004h>     for f in files:
+[?2004l[?2004h>         with open(f, 'r') as file:
+[?2004l[?2004h>             data = json.load(file)
+[?2004l[?2004h>             
+[?2004l[?2004h>         device_id = data['device_id']
+[?2004l[?2004h>         hw_type = data['hardware_type']
+[?2004l[?2004h>         caps = data['capabilities']
+[?2004l[?2004h>         storage_mb = caps['storage_mb']
+[?2004l[?2004h>         memory_mb = caps['memory_mb']
+[?2004l[?2004h>         compute_tflops = caps['compute_tflops']
+[?2004l[?2004h>         
+[?2004l[?2004h>         net = data['network']
+[?2004l[?2004h>         bandwidth_mbps = net['bandwidth_mbps']
+[?2004l[?2004h>         latency_ms = net['latency_ms']
+[?2004l[?2004h>         
+[?2004l[?2004h>         req = data['model_requirements']
+[?2004l[?2004h>         model_size_mb = req['model_size_mb']
+[?2004l[?2004h>         inf_target = req['inference_time_target_ms']
+[?2004l[?2004h>         acc_thresh = req['accuracy_threshold']
+[?2004l[?2004h>         
+[?2004l[?2004h>         # 1. Compression
+[?2004l[?2004h>         comp_ratio = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+[?2004l[?2004h>         comp_needed = comp_ratio > 0.3
+[?2004l[?2004h>         target_comp_size = storage_mb * 0.25
+[?2004l[?2004h>         
+[?2004l[?2004h>         # 2. Quantization
+[?2004l[?2004h>         if acc_thresh >= 0.95:
+[?2004l[?2004h>             q_level = "FP32"
+[?2004l[?2004h>             bits = 32
+[?2004l[?2004h>         elif acc_thresh >= 0.90:
+[?2004l[?2004h>             q_level = "FP16"
+[?2004l[?2004h>             bits = 16
+[?2004l[?2004h>         elif acc_thresh >= 0.80:
+[?2004l[?2004h>             q_level = "INT8"
+[?2004l[?2004h>             bits = 8
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             q_level = "INT4"
+[?2004l[?2004h>             bits = 4
+[?2004l[?2004h>             
+[?2004l[?2004h>         q_eff = (32 / bits) * acc_thresh
+[?2004l[?2004h>         
+[?2004l[?2004h>         # 3. FL Score
+[?2004l[?2004h>         net_qual = (bandwidth_mbps / 100.0) * (1.0 - latency_ms / 1000.0)
+[?2004l[?2004h>         comp_fac = min(compute_tflops / 5.0, 1.0)
+[?2004l[?2004h>         mem_fac = min(memory_mb / 4096.0, 1.0)
+[?2004l[?2004h>         fl_score = (net_qual * 0.4) + (comp_fac * 0.3) + (mem_fac * 0.3)
+[?2004l[?2004h>         fl_score = max(0.0, min(fl_score, 1.0))
+[?2004l[?2004h>         fl_ready = fl_score >= 0.6
+[?2004l[?2004h>         
+[?2004l[?2004h>         # 4. Inference Score
+[?2004l[?2004h>         storage_util = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+[?2004l[?2004h>         mem_adeq = memory_mb / (model_size_mb * 2.0) if model_size_mb != 0 else 0.0
+[?2004l[?2004h>         mem_adeq = min(mem_adeq, 1.0)
+[?2004l[?2004h>         comp_adeq = compute_tflops / (model_size_mb * 0.001) if model_size_mb != 0 else 0.0
+[?2004l[?2004h>         comp_adeq = min(comp_adeq, 1.0)
+[?2004l[?2004h>         
+[?2004l[?2004h>         inf_score = (1.0 - storage_util) * 0.3 + mem_adeq * 0.4 + comp_adeq * 0.3
+[?2004l[?2004h>         inf_score = max(0.0, min(inf_score, 1.0))
+[?2004l[?2004h>         
+[?2004l[?2004h>         devices.append({
+[?2004l[?2004h>             'device_id': device_id,
+[?2004l[?2004h>             'hardware_type': hw_type,
+[?2004l[?2004h>             'comp_ratio': comp_ratio,
+[?2004l[?2004h>             'compression_needed': comp_needed,
+[?2004l[?2004h>             'target_compressed_size_mb': round(target_comp_size, 2),
+[?2004l[?2004h>             'quantization_level': q_level,
+[?2004l[?2004h>             'quantization_efficiency': round(q_eff, 4),
+[?2004l[?2004h>             'fl_score': round(fl_score, 4),
+[?2004l[?2004h>             'fl_ready': fl_ready,
+[?2004l[?2004h>             'inference_score': round(inf_score, 4)
+[?2004l[?2004h>         })
+[?2004l[?2004h>         
+[?2004l[?2004h>     # Sort devices by inference score desc
+[?2004l[?2004h>     devices.sort(key=lambda x: x['inference_score'], reverse=True)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Stats
+[?2004l[?2004h>     total_devices = len(devices)
+[?2004l[?2004h>     mean_comp_ratio = sum(d['comp_ratio'] for d in devices) / total_devices if total_devices > 0 else 0.0
+[?2004l[?2004h>     
+[?2004l[?2004h>     if total_devices > 0:
+[?2004l[?2004h>         mean_fl = sum(d['fl_score'] for d in devices) / total_devices
+[?2004l[?2004h>         var_fl = sum((d['fl_score'] - mean_fl)**2 for d in devices) / total_devices
+[?2004l[?2004h>         std_dev_fl = math.sqrt(var_fl)
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         std_dev_fl = 0.0
+[?2004l[?2004h>         
+[?2004l[?2004h>     fl_ready_count = sum(1 for d in devices if d['fl_ready'])
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Generate JSON
+[?2004l[?2004h>     output_devices = []
+[?2004l[?2004h>     for i, d in enumerate(devices):
+[?2004l[?2004h>         output_devices.append({
+[?2004l[?2004h>             "rank": i + 1,
+[?2004l[?2004h>             "device_id": d['device_id'],
+[?2004l[?2004h>             "hardware_type": d['hardware_type'],
+[?2004l[?2004h>             "compression_needed": d['compression_needed'],
+[?2004l[?2004h>             "target_compressed_size_mb": float(f"{d['target_compressed_size_mb']:.2f}"),
+[?2004l[?2004h>             "quantization_level": d['quantization_level'],
+[?2004l[?2004h>             "quantization_efficiency": float(f"{d['quantization_efficiency']:.4f}"),
+[?2004l[?2004h>             "fl_score": float(f"{d['fl_score']:.4f}"),
+[?2004l[?2004h>             "fl_ready": d['fl_ready'],
+[?2004l[?2004h>             "inference_score": float(f"{d['inference_score']:.4f}")
+[?2004l[?2004h>         })
+[?2004l[?2004h>         
+[?2004l[?2004h>     out_json = {
+[?2004l[?2004h>         "summary": {
+[?2004l[?2004h>             "total_devices": total_devices,
+[?2004l[?2004h>             "mean_compression_ratio": float(f"{mean_comp_ratio:.3f}"),
+[?2004l[?2004h>             "std_dev_fl_score": float(f"{std_dev_fl:.4f}"),
+[?2004l[?2004h>             "fl_ready_devices": fl_ready_count
+[?2004l[?2004h>         },
+[?2004l[?2004h>         "devices": output_devices
+[?2004l[?2004h>     }
+[?2004l[?2004h>     
+[?2004l[?2004h>     with open('/app/deployment_analysis.json', 'w') as f:
+[?2004l[?2004h>         json.dump(out_json, f, indent=2)
+[?2004l[?2004h>         
+[?2004l[?2004h>     # Generate Report
+[?2004l[?2004h>     with open('/app/deployment_report.txt', 'w') as f:
+[?2004l[?2004h>         f.write("EDGE AI DEPLOYMENT ANALYSIS\n")
+[?2004l[?2004h>         f.write("============================\n\n")
+[?2004l[?2004h>         f.write("Summary Statistics:\n")
+[?2004l[?2004h>         f.write(f"- Total Devices: {total_devices}\n")
+[?2004l[?2004h>         f.write(f"- Mean Compression Ratio: {mean_comp_ratio:.3f}\n")
+[?2004l[?2004h>         f.write(f"- Std Dev FL Score: {std_dev_fl:.4f}\n")
+[?2004l[?2004h>         f.write(f"- FL-Ready Devices: {fl_ready_count}\n\n")
+[?2004l[?2004h>         f.write("Device Rankings (by Inference Score):\n")
+[?2004l[?2004h>         
+[?2004l[?2004h>         for d in output_devices:
+[?2004l[?2004h>             comp_str = "needed" if d['compression_needed'] else "not needed"
+[?2004l[?2004h>             ready_str = "ready" if d['fl_ready'] else "not ready"
+[?2004l[?2004h>             f.write(f"{d['rank']}. {d['device_id']} ({d['hardware_type']})\n")
+[?2004l[?2004h>             f.write(f"   Compression: {comp_str}, Target Size: {d['target_compressed_size_mb']:.2f} MB\n")
+[?2004l[?2004h>             f.write(f"   Quantization: {d['quantization_level']}, Efficiency: {d['quantization_efficiency']:.4f}\n")
+[?2004l[?2004h>             f.write(f"   FL Score: {d['fl_score']:.4f}, Status: {ready_str}\n")
+[?2004l[?2004h>             f.write(f"   Inference Score: {d['inference_score']:.4f}\n")
+[?2004l[?2004h> 
+[?2004l[?2004h> process_devices()
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@f08509cd3bf1:/app# python3 /app/solve.py
+[?2004l[?2004hroot@f08509cd3bf1:/app# 

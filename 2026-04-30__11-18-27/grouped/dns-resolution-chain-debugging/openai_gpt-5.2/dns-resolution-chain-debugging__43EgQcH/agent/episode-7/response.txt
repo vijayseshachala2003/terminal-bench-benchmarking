@@ -1,0 +1,59 @@
+{
+  "analysis": "named-checkconf passed, but ss shows nothing listening on 5300/5301/5302. Logs shown are actually from resolver (managed-keys-zone etc.) and indicate it is running, yet ss shows no listener—likely because named is running but immediately exits for primary/secondary, and resolver might be running without TCP listener? However dig gets connection refused, implying no TCP/UDP bound on those ports. Also earlier primary log had category error, but now tail shows 'running' which suggests we tailed the wrong file segment; we need to re-check pgrep and verify each instance is running with correct config. Also, the primary/secondary named.conf display commands produced no output, suggesting the files may have been accidentally emptied by the perl filter redirection (because perl -n with redirection on same file can truncate before read). We must inspect file sizes; likely primary/secondary/resolver named.conf are now empty, causing named to run with defaults or fail. Need to check ls -l and cat the configs, restore them if truncated (recreate minimal working configs).",
+  "plan": "1) Check file sizes and contents of all three named.conf to confirm whether they were truncated. 2) Kill any running named. 3) Recreate named.conf files from scratch with minimal required options, correct ports, writable directory, pid-file, session-keyfile, disable controls, define TSIG key, zones, and resolver forwarder. 4) Re-run named-checkconf. 5) Start all three and confirm listeners with ss. 6) Run dig SOA/AXFR and test queries.",
+  "commands": [
+    {
+      "keystrokes": "ls -l /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "wc -l /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/primary/named.conf; echo '---'; sed -n '1,160p' /app/dns/secondary/named.conf; echo '---'; sed -n '1,200p' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "cat > /app/dns/primary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/primary/cache\";\n    listen-on port 5301 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation auto;\n    pid-file \"/app/dns/primary/cache/named.pid\";\n    session-keyfile \"/app/dns/primary/cache/session.key\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"dHJhbnNmZXIta2V5LXNlY3JldC0wMDEyMzQ1Njc4OWFiY2RlZg==\";\n};\n\nzone \"example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/example.com.zone\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\nzone \"secure.example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/secure.example.com.zone.signed\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\ncontrols { inet 127.0.0.1 port 953 allow { none; }; };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/secondary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/secondary/cache\";\n    listen-on port 5302 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation auto;\n    pid-file \"/app/dns/secondary/cache/named.pid\";\n    session-keyfile \"/app/dns/secondary/cache/session.key\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"dHJhbnNmZXIta2V5LXNlY3JldC0wMDEyMzQ1Njc4OWFiY2RlZg==\";\n};\n\nserver 127.0.0.1 {\n    keys { transfer-key; };\n};\n\nzone \"example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nzone \"secure.example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/secure.example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\ncontrols { inet 127.0.0.1 port 953 allow { none; }; };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation auto;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n};\n\ncontrols { inet 127.0.0.1 port 953 allow { none; }; };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf && named-checkconf /app/dns/secondary/named.conf && named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 40 /tmp/named-primary.log; echo '---'; tail -n 40 /tmp/named-secondary.log; echo '---'; tail -n 40 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

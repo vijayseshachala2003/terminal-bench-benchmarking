@@ -1,0 +1,214 @@
+New Terminal Output:
+
+root@767fb16c16ca:/app/dns/primary# sed -n '1,120p' /app/dns/resolver/named.conf
+options {
+    directory "/app/dns/resolver/cache";
+    listen-on port 5300 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-recursion { any; };
+    recursion yes;
+    forwarders {
+        127.0.0.1 port 5301;
+    };
+    forward only;
+    dnssec-validation auto;
+// BUG: Negative cache TTL way too high
+max-ncache-ttl 60;
+    pid-file "/var/run/named/named-resolver.pid";
+
+
+trusted-keys {
+
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-resolver.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@767fb16c16ca:/app/dns/primary# sed -n '1,120p' /app/dns/primary/named.conf
+options {
+    directory "/app/dns/primary/cache";
+    listen-on port 5301 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-transfer { key "transfer-key"; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-primary.pid";
+};
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=";
+};
+
+zone "example.com" {
+    type master;
+    file "/app/dns/primary/zones/example.com.zone";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+zone "secure.example.com" {
+    type master;
+    file "/app/dns/primary/zones/secure.example.com.zone.signed";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-primary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@767fb16c16ca:/app/dns/primary# sed -n '1,160p' /app/dns/secondary/named.conf
+options {
+    directory "/app/dns/secondary/cache";
+    listen-on port 5302 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-secondary.pid";
+};
+
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=";
+};
+
+server 127.0.0.1 {
+    keys { transfer-key; };
+};
+
+zone "example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+zone "secure.example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/secure.example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-secondary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@767fb16c16ca:/app/dns/primary# KSKLINE=$(awk '$4=="DNSKEY" && $5=="257"{print; exit}' /app/dns/primary/zones/secure.example.com.zone.signed); echo "$KSKLIN
+E" > /tmp/kskline.txt; cat /tmp/kskline.txt
+
+root@767fb16c16ca:/app/dns/primary# cat > /app/dns/resolver/named.conf <<EOF
+> options {
+>     directory "/app/dns/resolver/cache";
+>     listen-on port 5300 { 127.0.0.1; };
+>     listen-on-v6 { none; };
+>     allow-query { any; };
+>     allow-recursion { any; };
+>     recursion yes;
+>     forwarders { 127.0.0.1 port 5301; };
+>     forward only;
+>     dnssec-validation yes;
+>     max-ncache-ttl 60;
+>     pid-file "/app/dns/resolver/named-resolver.pid";
+> };
+>
+> trust-anchors {
+>     $KSKLINE
+> };
+>
+> controls { };
+> EOF
+root@767fb16c16ca:/app/dns/primary# named-checkconf /app/dns/resolver/named.conf
+root@767fb16c16ca:/app/dns/primary# perl -0777 -i -pe 's#logging\s*\{.*?\};\s*##s' /app/dns/primary/named.conf /app/dns/secondary/named.conf
+root@767fb16c16ca:/app/dns/primary# perl -i -pe 's#pid-file "/var/run/named/named-primary.pid";#pid-file "/app/dns/primary/named-primary.pid";#; s#pid-file "/va
+r/run/named/named-secondary.pid";#pid-file "/app/dns/secondary/named-secondary.pid";#' /app/dns/primary/named.conf /app/dns/secondary/named.conf
+root@767fb16c16ca:/app/dns/primary# grep -q '^controls' /app/dns/primary/named.conf || echo -e '
+> controls { };
+> ' >> /app/dns/primary/named.conf
+root@767fb16c16ca:/app/dns/primary# grep -q '^controls' /app/dns/secondary/named.conf || echo -e '
+> controls { };
+> ' >> /app/dns/secondary/named.conf
+root@767fb16c16ca:/app/dns/primary# named-checkconf /app/dns/primary/named.conf
+/app/dns/primary/named.conf:30: unknown option 'category'
+root@767fb16c16ca:/app/dns/primary# named-checkconf /app/dns/secondary/named.conf
+/app/dns/secondary/named.conf:32: unknown option 'category'
+root@767fb16c16ca:/app/dns/primary# grep -n 'ns[12]\.sub' /app/dns/primary/zones/example.com.zone
+26:sub     IN      NS      ns1.sub.example.com.
+27:sub     IN      NS      ns2.sub.example.com.
+30:ns1.sub IN      A       192.168.1.40
+31:ns2.sub IN      A       192.168.1.41
+root@767fb16c16ca:/app/dns/primary# perl -i -pe 's/2024010102\s*; Serial/2024010103      ; Serial/' /app/dns/primary/zones/example.com.zone
+root@767fb16c16ca:/app/dns/primary# grep -q '^ns1\.sub\.example\.com\.' /app/dns/primary/zones/example.com.zone || cat >> /app/dns/primary/zones/example.com.zon
+e <<'EOF'
+> ns1.sub.example.com. IN A 192.168.1.40
+> ns2.sub.example.com. IN A 192.168.1.41
+> EOF
+root@767fb16c16ca:/app/dns/primary# named-checkzone example.com /app/dns/primary/zones/example.com.zone
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: loaded serial 2024010103
+OK
+root@767fb16c16ca:/app/dns/primary# pkill named || true
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &
+[1] 1753
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &
+[2] 1771
+[1]   Exit 1                  named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1
+root@767fb16c16ca:/app/dns/primary# named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &
+[3] 1789
+[2]   Exit 1                  named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1
+root@767fb16c16ca:/app/dns/primary# ss -lntup | grep -E ':(5300|5301|5302)\b' || true
+udp   UNCONN 0      0          127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=41))
+udp   UNCONN 0      0          127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=39))
+udp   UNCONN 0      0          127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=40))
+udp   UNCONN 0      0          127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=42))
+tcp   LISTEN 0      10         127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=45))
+tcp   LISTEN 0      10         127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=43))
+tcp   LISTEN 0      10         127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=44))
+tcp   LISTEN 0      10         127.0.0.1:5300      0.0.0.0:*    users:(("named",pid=1789,fd=46))
+root@767fb16c16ca:/app/dns/primary# dig @127.0.0.1 -p 5301 example.com SOA +noall +answer
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+
+; <<>> DiG 9.18.39-0ubuntu0.22.04.3-Ubuntu <<>> @127.0.0.1 -p 5301 example.com SOA +noall +answer
+; (1 server found)
+;; global options: +cmd
+;; no servers could be reached
+root@767fb16c16ca:/app/dns/primary# dig @127.0.0.1 -p 5302 example.com AXFR | head -n 20
+;; Connection to 127.0.0.1#5302(127.0.0.1) for example.com failed: connection refused.
+;; no servers could be reached
+;; Connection to 127.0.0.1#5302(127.0.0.1) for example.com failed: connection refused.
+;; no servers could be reached
+;; Connection to 127.0.0.1#5302(127.0.0.1) for example.com failed: connection refused.
+;; no servers could be reached
+root@767fb16c16ca:/app/dns/primary# dig @127.0.0.1 -p 5302 secure.example.com AXFR | head -n 20
+;; Connection to 127.0.0.1#5302(127.0.0.1) for secure.example.com failed: connection refused.
+;; no servers could be reached
+;; Connection to 127.0.0.1#5302(127.0.0.1) for secure.example.com failed: connection refused.
+;; no servers could be reached
+;; Connection to 127.0.0.1#5302(127.0.0.1) for secure.example.com failed: connection refused.
+;; no servers could be reached
+root@767fb16c16ca:/app/dns/primary# dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: SERVFAIL, id: 33532
+;; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1
+
+;; OPT PSEUDOSECTION:
+; EDNS: version: 0, flags: do; udp: 1232
+; COOKIE: 2c9d74846d80e4c40100000069f3486baa72afd7da741e00 (good)
+root@767fb16c16ca:/app/dns/primary#

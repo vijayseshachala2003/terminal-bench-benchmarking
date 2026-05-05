@@ -1,0 +1,71 @@
+{
+  "analysis": "All three services are now running and listening. Secondary successfully completed AXFR for example.com (seen in log). Resolver is running but DNSSEC validation for the root is failing because it forwards only to the primary authoritative server, which refuses recursion for '.' DNSKEY queries; this breaks managed keys and DNSSEC validation. For our environment we only need internal zones; simplest fix: on resolver, do not use forward only to the authoritative. Instead configure resolver to use the secondary/primary as authoritative for the internal zones via 'zone' stubs or forward zones, while allowing normal recursion to the internet isn't available. Alternative: enable recursion on primary for resolver only, but primary is authoritative and should stay recursion no. Better: configure resolver with forward zones for example.com and secure.example.com to 127.0.0.1 port 5301/5302, and remove global forward-only. Also disable managed-keys / root validation? But requirement wants DNSSEC valid for secure zone; we can validate using local trust anchor for secure.example.com instead of root. We'll configure resolver as recursive for local, with no forwarders, and add 'trusted-keys' or 'dnssec-validation yes' with 'trust-anchors' for secure.example.com DNSKEY from our KSK. Easiest: use 'dnssec-validation no' globally and rely on +dnssec? Not acceptable. We'll add 'trust-anchors { \"secure.example.com\" static-key ...; };' by extracting DNSKEY from KSK .key file. Then resolver can validate responses for that zone without needing root.",
+  "plan": "1) Modify resolver named.conf: remove forwarders/forward only; add forward zones for example.com and secure.example.com pointing to primary (and maybe secondary) on 5301/5302. 2) Add trust anchor for secure.example.com using the KSK DNSKEY from Ksecure...31549.key (the one with flag 257). 3) Restart resolver. 4) Verify: dig via resolver for secure.example.com A +dnssec and check 'ad' flag; also run all /app/test_queries.txt queries through resolver. 5) Verify AXFR for secure.example.com from secondary and SOA from secondary.",
+  "commands": [
+    {
+      "keystrokes": "awk '/DNSKEY/ && $0 ~ / 257 / {print}' /app/dns/primary/keys/Ksecure.example.com.+013+*.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSK_LINE=$(awk '/DNSKEY/ && $0 ~ / 257 / {print; exit}' /app/dns/primary/keys/Ksecure.example.com.+013+*.key); echo \"$KSK_LINE\" > /tmp/ksk_dnskey.txt; cat /tmp/ksk_dnskey.txt\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cp -a /app/dns/resolver/named.conf /app/dns/resolver/named.conf.bak3\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\n\\s*forwarders\\s*\\{.*?\\};\\s*\\n\\s*forward\\s+only;\\s*\\n/\\n/s' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{\\s*\\};\\s*\\z/\\n/; ' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "cat >> /app/dns/resolver/named.conf <<'EOF'\n\n// Forward only internal zones to the authoritative server(s)\nzone \"example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; 127.0.0.1 port 5302; };\n};\n\nzone \"secure.example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; 127.0.0.1 port 5302; };\n};\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSK_LINE=$(cat /tmp/ksk_dnskey.txt); perl -0777 -i -pe 's/options\\s*\\{\\n/options {\\n    trust-anchors {\\n        \"secure.example.com\" static-key '\"$KSK_LINE\"';\\n    };\\n/;' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "printf '\\ncontrols { };\\n' >> /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +multi\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec | grep -E 'flags:|status:'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "while read -r t n; do [ -z \"$t\" ] && continue; echo \"--- $t $n ---\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +noall +answer +comments; done < /app/test_queries.txt\n",
+      "duration": 3.0
+    }
+  ],
+  "task_complete": false
+}

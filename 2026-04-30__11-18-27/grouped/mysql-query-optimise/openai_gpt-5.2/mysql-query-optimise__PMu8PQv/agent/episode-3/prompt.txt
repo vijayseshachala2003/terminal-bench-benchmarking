@@ -1,0 +1,236 @@
+New Terminal Output:
+
+root@9402f7503758:/app# cat > /app/optimize.py <<'PY'
+> import re, json, math, glob
+> from collections import defaultdict
+>
+> SLOW_THRESHOLD = 1.0
+> WINDOW = 60
+>
++> num_re = re.compile(r"\b\d+(?:\.\d+)?\b")
+> str_re = re.compile(r"'(?:\\'|[^'])*'")
+>
+> def norm_sql(sql: str) -> str:
+>     s = sql.strip().rstrip(';').strip()
+>     s = re.sub(r"\s+", " ", s)
+>     # IN (...) -> IN (?)
+>     s = re.sub(r"\bIN\s*\(\s*([^)]*?)\s*\)", "IN (?)", s, flags=re.IGNORECASE)
+>     s = str_re.sub("?", s)
+>     s = num_re.sub("?", s)
+>     s = re.sub(r"\s*(=|<|>|<=|>=|<>|!=)\s*", r" \1 ", s)
+>     s = re.sub(r"\s+", " ", s).strip()
+>     return s.upper()
+>
+>
+> def parse_slow_logs(paths):
+>     entries = []
+>     for p in paths:
+>         with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+>             lines = f.readlines()
+>         i = 0
+>         while i < len(lines):
+>             if lines[i].startswith('# Time:'):
+>                 qtime = None
+>                 ts = None
+>                 # scan until blank line
+>                 j = i
+>                 while j < len(lines) and lines[j].strip() != "":
+>                     if lines[j].startswith('# Query_time:'):
+>                         m = re.search(r"Query_time:\s*([0-9.]+)", lines[j])
+>                         if m:
+>                             qtime = float(m.group(1))
+>                     if lines[j].startswith('SET timestamp='):
+>                         m = re.search(r"SET timestamp=(\d+)", lines[j])
+>                         if m:
+>                             ts = int(m.group(1))
+>                     j += 1
+>
+>                 # find SQL after SET timestamp
+>                 sql = None
+>                 k = i
+>                 while k < len(lines) and not lines[k].startswith('SET timestamp='):
+>                     k += 1
+>                 if k < len(lines) and lines[k].startswith('SET timestamp='):
+>                     k += 1
+>                     # statement may span multiple lines until ';'
+>                     stmt = []
+>                     while k < len(lines) and lines[k].strip():
+>                         # skip use db;
+>                         if lines[k].strip().lower().startswith('use '):
+>                             k += 1
+>                             continue
+>                         stmt.append(lines[k].rstrip('\n'))
+>                         if ';' in lines[k]:
+>                             break
+>                         k += 1
+>                     if stmt:
+>                         sql = " ".join(stmt)
+>
+>                 if ts is not None and qtime is not None and sql is not None:
+>                     entries.append((ts, qtime, sql))
+>                 i = j
+>             else:
+>                 i += 1
+>     return entries
+>
+p>
+> def extract_tables_aliases(sqlu: str):
+>     mapping = {}
+>     for m in re.finditer(r"\bFROM\s+([A-Z0-9_]+)(?:\s+([A-Z0-9_]+))?", sqlu):
+>         table = m.group(1)
+>         alias = m.group(2) or table
+>         mapping[alias] = table
+>     for m in re.finditer(r"\bJOIN\s+([A-Z0-9_]+)(?:\s+([A-Z0-9_]+))?", sqlu):
+>         table = m.group(1)
+>         alias = m.group(2) or table
+>         mapping[alias] = table
+>     return mapping
+>
+>
+> def extract_indexable_columns(sqlu: str, meta_tables):
+>     alias_map = extract_tables_aliases(sqlu)
+>     cols = set()
+>
+>     def add(alias, col):
+>         if alias in alias_map:
+>             t = alias_map[alias].lower()
+>             c = col.lower()
+>             if t in meta_tables and c in meta_tables[t]['columns']:
+>                 cols.add((t, c))
+>
+>     # ON clause(s)
+i>     for m in re.finditer(r"\bON\s+([^;]+?)(?=\bWHERE\b|\bORDER\b|\bGROUP\b|$)", sqlu):
+>         on = m.group(1)
+>         for m2 in re.finditer(r"\b([A-Z0-9_]+)\.([A-Z0-9_]+)\s*(=|<|>|<=|>=|<>|!=)", on):
+>             add(m2.group(1), m2.group(2))
+>         for m2 in re.finditer(r"(=|<|>|<=|>=|<>|!=)\s*([A-Z0-9_]+)\.([A-Z0-9_]+)\b", on):
+>             add(m2.group(2), m2.group(3))
+>
+>     # WHERE
+>     m = re.search(r"\bWHERE\s+(.+?)(?=\bORDER\b|\bGROUP\b|\bLIMIT\b|$)", sqlu)
+>     if m:
+>         w = m.group(1)
+>         for m2 in re.finditer(r"\b([A-Z0-9_]+)\.([A-Z0-9_]+)\s*(=|<|>|<=|>=|<>|!=|IN)\b", w):
+>             add(m2.group(1), m2.group(2))
+>         # bare col only if single table
+>         if len(set(alias_map.values())) == 1:
+>             only_table = list(set(alias_map.values()))[0].lower()
+>             for m2 in re.finditer(r"\b([A-Z0-9_]+)\s*(=|<|>|<=|>=|<>|!=|IN)\b", w):
+>                 col = m2.group(1)
+>                 if col in ('AND','OR','NOT','IN','LIKE','BETWEEN','IS','NULL'):
+>                     continue
+>                 c = col.lower()
+>                 if only_table in meta_tables and c in meta_tables[only_table]['columns']:
+>                     cols.add((only_table, c))
+>
+>     # ORDER BY
+>     m = re.search(r"\bORDER\s+BY\s+(.+?)(?=\bLIMIT\b|$)", sqlu)
+>     if m:
+>         ob = m.group(1)
+>         for m2 in re.findite
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+n('/app/optimization.json', 'w'), indent=2)
+>
+>     # Text report
+>     total_slow = len(slow)
+>     unique_pats = len(normalized_patterns)
+>
+>     pat_impacts = {}
+>     for d in pats_sorted:
+>         pat = d['pattern']
+>         cols = idx_cols_by_pattern.get(pat, set())
+>         smax = 0.0
+>         for t, c in cols:
+>             distinct = float(meta_tables[t]['columns'][c]['distinct_values'])
+>             total_rows = float(meta_tables[t]['total_rows'])
+>             sel = distinct / total_rows if total_rows else 0.0
+>             smax = max(smax, sel)
+>         pat_impacts[pat] = round1(d['frequency'] * d['avg_execution_time'] * max(smax, 0.1))
+>
+>     def trunc60(s):
+>         return s if len(s) <= 60 else s[:60] + '...'
+>
+>     lines = []
+>     lines.append('ADVANCED MYSQL OPTIMIZATION ANALYSIS')
+>     lines.append('=====================================')
+>     lines.append(f'Total Slow Queries: {total_slow}')
+>     lines.append(f'Unique Query Patterns: {unique_pats}')
+>     lines.append(f'Total Budget: {int(budget)} points')
+>     lines.append(f'Budget Used: {round1(budget_used)} points')
+>     lines.append('')
+>     lines.append('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):')
+>     for i, d in enumerate(normalized_patterns[:5], start=1):
+>         pat = d['pattern']
+>         lines.append(f"{i}. {trunc60(pat)} (Impact: {pat_impacts[pat]:.1f}, Freq: {d['frequency']}, Avg: {d['avg_execution_time']:.1f}s, Total: {d['total_time
+']:.1f}s)")
+>     lines.append('')
+>     lines.append('TEMPORAL CORRELATIONS:')
+>     for i, c in enumerate(temporal[:3], start=1):
+>         lines.append(f"{i}. Pattern Pair (Strength: {c['correlation_strength']}):")
+>         lines.append(f"   - {trunc60(c['pattern1'])}")
+>         lines.append(f"   - {trunc60(c['pattern2'])}")
+>     lines.append('')
+>     lines.append('RECOMMENDED INDEXES (5 max):')
+>     for i, r in enumerate(out['recommended_indexes'], start=1):
+>         cols = ','.join(r['columns'])
+>         lines.append(f"{i}. {r['table']}({cols}) - Impact: {r['impact_score']:.1f}, Cost: {r['cost']:.1f} [{r['reason']}]"
+>         )
+>     lines.append('')
+>     lines.append('OPTIMIZATION SUMMARY:')
+>     lines.append(f"- Estimated total impact reduction: {total_impact:.1f}")
+>     lines.append(f"- Remaining budget: {round1(budget - budget_used):.1f} points")
+>     lines.append(f"- Tables optimized: {len(set(r['table'] for r in out['recommended_indexes']))}")
+>
+>     open('/app/recommendations.txt', 'w').write("\n".join(lines) + "\n")
+>
+>
+> if __name__ == '__main__':
+>     main()
+> PY
+root@9402f7503758:/app# ls -la /app/optimize.py
+-rw-r--r--. 1 root root 14108 Apr 30 11:26 /app/optimize.py
+root@9402f7503758:/app# python3 /app/optimize.py
+root@9402f7503758:/app# ls -la /app/optimization.json /app/recommendations.txt
+-rw-r--r--. 1 root root 6245 Apr 30 11:26 /app/optimization.json
+-rw-r--r--. 1 root root 1594 Apr 30 11:26 /app/recommendations.txt
+root@9402f7503758:/app# sed -n '1,120p' /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 989.2 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 6.1, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.2, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 12):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE STATUS = ?
+2. Pattern Pair (Strength: 12):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE COUNTRY = ?
+3. Pattern Pair (Strength: 11):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+
+RECOMMENDED INDEXES (5 max):
+1. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+2. users(id) - Impact: 49.9, Cost: 214.6 [high_impact]
+3. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+4. order_items(order_id) - Impact: 25.2, Cost: 230.2 [high_impact]
+5. orders(status) - Impact: 5.4, Cost: 122.0 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 169.5
+- Remaining budget: 10.8 points
+- Tables optimized: 4
+root@9402f7503758:/app# python3 -c "import json; d=json.load(open('/app/optimization.json')); print('patterns',len(d['normalized_patterns']),'cands',len(d['inde
+x_candidates']),'corr',len(d['temporal_correlations']),'reco',len(d['recommended_indexes']),'budget',d['total_budget_used'],'impact',d['total_impact'])"
+patterns 18 cands 10 corr 3 reco 5 budget 989.2 impact 169.5
+root@9402f7503758:/app#

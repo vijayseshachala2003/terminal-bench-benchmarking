@@ -1,0 +1,195 @@
+New Terminal Output:
+
+root@12067b6bdb7c:/app# python3 << 'PYEOF'
+> with open('/app/analyze_deps.py', 'w') as f:
+>     f.write('''#!/usr/bin/env python3
+> """Advanced Python Static Analyzer with Type Inference."""
+>
+> import ast
+> import json
+> import os
+> import sys
+> import argparse
+> import builtins
+> from pathlib import Path
+> from collections import defaultdict
+>
+> BUILTIN_NAMES = set(dir(builtins))
+>
+>
+> def get_stdlib_modules():
+>     if hasattr(sys, 'stdlib_module_names'):
+>         return set(sys.stdlib_module_names)
+>     return set()
+>
+>
+> def is_stdlib_module(module_name):
+>     top_level = module_name.split('.')[0]
+>     stdlib = get_stdlib_modules()
+>     if top_level in stdlib:
+>         return True
+>     if top_level.startswith('_'):
+>         try:
+>             __import__(top_level)
+>             return True
+>         except ImportError:
+>             pass
+>     return False
+>
+>
+> def parse_file(filepath):
+>     try:
+>         with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+>             source = fh.read()
+>         return ast.parse(source, filename=str(filepath))
+>     except (SyntaxError, ValueError, UnicodeDecodeError):
+>         return None
+>
+>
+> def get_py_files(project_dir):
+>     py_files = []
+>     project_path = Path(project_dir).resolve()
+>     for root, dirs, files in os.walk(project_path):
+>         for fn in files:
+>             if fn.endswith('.py'):
+>                 py_files.append(Path(root) / fn)
+>     return py_files
+>
+>
+> def file_to_module(filepath, project_dir):
+>     project_path = Path(project_dir).resolve()
+>     file_path = Path(filepath).resolve()
+>     rel = file_path.relative_to(project_path)
+>     parts = list(rel.parts)
+>     if parts[-1] == '__init__.py':
+>         parts = parts[:-1]
+>     else:
+>         parts[-1] = parts[-1][:-3]
+>     return '.'.join(parts) if parts else ''
+>
+>
+> def module_to_file(module_name, project_dir):
+>     project_path = Path(project_dir).resolve()
+>     parts = module_name.split('.')
+>     pkg_path = project_path / Path(*parts) / '__init__.py'
+>     if pkg_path.exists():
+>         return pkg_path
+>     if len(parts) > 1:
+>         mod_path = project_path / Path(*parts[:-1]) / (parts[-1] + '.py')
+>     else:
+>         mod_path = project_path / (parts[0] + '.py')
+>     if mod_path.exists():
+>         return mod_path
+>     return None
+>
+>
+> def resolve_relative_import(importing_file, module_name, level, project_dir):
+>     project_path = Path(project_dir).resolve()
+>     file_path = Path(importing_file).resolve()
+>     rel = file_path.relative_to(project_path)
+>     parts = list(rel.parts)
+>     if parts[-1] == '__init__.py':
+>         pkg_parts = parts[:-1]
+>     else:
+>         pkg_parts = parts[:-1]
+>     if parts[-1] == '__init__.py':
+>         up = level - 1
+>     else:
+>         up = level - 1
+>     if up > len(pkg_parts):
+>         return None
+>     if up > 0:
+>         base_parts = pkg_parts[:-up]
+>     else:
+>         base_parts = pkg_parts
+>     if module_name:
+>         return '.'.join(base_parts + [module_name]) if base_parts else module_name
+>     else:
+>         return '.'.join(base_parts) if base_parts else None
+>
+>
+> def get_module_exports(tree, filepath):
+>     exports = set()
+>     has_all = False
+>     all_names = []
+>     for node in ast.iter_child_nodes(tree):
+>         if isinstance(node, ast.Assign):
+>             for target in node.targets:
+>                 if isinstance(target, ast.Name) and target.id == '__all__':
+>                     has_all = True
+>                     if isinstance(node.value, (ast.List, ast.Tuple)):
+>                         for elt in node.value.elts:
+>                             if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+>                                 all_names.append(elt.value)
+>     if has_all:
+>         return set(all_names)
+>     for node in ast.iter_child_nodes(tree):
+>         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+>             if not node.name.startswith('_'):
+>                 exports.add(node.name)
+>         elif isinstance(node, ast.ClassDef):
+>             if not node.name.startswith('_'):
+>                 exports.add(node.name)
+>         elif isinstance(node, ast.Assign):
+>             for target in node.targets:
+>                 if isinstance(target, ast.Name) and not target.id.startswith('_'):
+>                     exports.add(target.id)
+>         elif isinstance(node, ast.AnnAssign):
+>             if isinstance(node.target, ast.Name) and not node.target.id.startswith('_'):
+>                 exports.add(node.target.id)
+>         elif isinstance(node, ast.Import):
+>             for alias in node.names:
+>                 name = alias.asname if alias.asname else alias.name.split('.')[0]
+>                 if not name.startswith('_'):
+>                     exports.add(name)
+>         elif isinstance(node, ast.ImportFrom):
+>             for alias in node.names:
+>                 if alias.name == '*':
+>                     continue
+>                 name = alias.asname if alias.asname else alias.name
+>                 if not name.startswith('_'):
+>                     exports.add(name)
+>     return exports
+>
+>
+> def get_all_top_level_names(tree):
+>     names = set()
+>     for node in ast.iter_child_nodes(tree):
+>         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+>             names.add(node.name)
+>         elif isinstance(node, ast.ClassDef):
+>             names.add(node.name)
+>         elif isinstance(node, ast.Assign):
+>             for target in node.targets:
+>                 if isinstance(target, ast.Name):
+>                     names.add(target.id)
+>         elif isinstance(node, ast.AnnAssign):
+>             if isinstance(node.target, ast.Name):
+>                 names.add(node.target.id)
+>         elif isinstance(node, ast.Import):
+>             for alias in node.names:
+>                 name = alias.asname if alias.asname else alias.name.split('.')[0]
+>                 names.add(name)
+>         elif isinstance(node, ast.ImportFrom):
+>             for alias in node.names:
+>                 if alias.name != '*':
+>                     name = alias.asname if alias.asname else alias.name
+>                     names.add(name)
+>     return names
+>
+>
+> def collect_names_in_target(target):
+>     names = set()
+>     if isinstance(target, ast.Name):
+>         names.add(target.id)
+>     elif isinstance(target, (ast.Tuple, ast.List)):
+>         for elt in target.elts:
+>             names.update(collect_names_in_target(elt))
+>     elif isinstance(target, ast.Starred):
+>         names.update(collect_names_in_target(target.value))
+>     return names
+> ''')
+> print('Part 1 written')
+> PYEOF
+Part 1 written
+root@12067b6bdb7c:/app#

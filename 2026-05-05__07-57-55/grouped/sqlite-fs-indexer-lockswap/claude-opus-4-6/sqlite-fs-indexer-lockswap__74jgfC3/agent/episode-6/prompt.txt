@@ -1,0 +1,295 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@ece4444ae416:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+> import fcntl
+>
+>
+> def _read_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Read and parse ignore patterns from the ignore file."""
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 pattern = unicodedata.normalize("NFC", line.strip())
+>                 if pattern:
+>                     patterns.append(pattern)
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _pattern_match(pattern, text):
+>     """
+>     Match pattern against text.
+>     '*' matches zero or more characters except '/'.
+>     '**' is NOT a recursive glob - just two consecutive '*' wildcards
+>     (equivalent to a single '*').
+>     All other characters are literal.
+>     """
+>     return _do_match(pattern, 0, text, 0, {})
+>
+>
+> def _do_match(pattern, pi, text, ti, memo):
+>     """Recursive pattern matching with memoization."""
+>     key = (pi, ti)
+>     if key in memo:
+>         return memo[key]
+>
+>     result = False
+>     if pi == len(pattern):
+>         result = (ti == len(text))
+>     elif pattern[pi] == '*':
+>         # '*' matches zero or more non-'/' characters
+>         # Try matching zero chars first, then more
+>         for k in range(ti, len(text) + 1):
+>             if k > ti and text[k - 1] == '/':
+>                 break
+>             if _do_match(pattern, pi + 1, text, k, memo):
+>                 result = True
+>                 break
+>     else:
+>         if ti < len(text) and pattern[pi] == text[ti]:
+>             result = _do_match(pattern, pi + 1, text, ti + 1, memo)
+>
+>     memo[key] = result
+>     return result
+>
+>
+> def _should_ignore(rel_path_nfc, patterns):
+>     """
+>     Check if a file should be ignored based on patterns.
+>     rel_path_nfc is the NFC-normalized relative path using '/' separators.
+>     """
+>     for pattern in patterns:
+>         if pattern.startswith('/'):
+>             # Anchored: match against full relative path only
+>             anchor_pattern = pattern[1:]
+>             if _pattern_match(anchor_pattern, rel_path_nfc):
+>                 return True
+>         elif '/' in pattern:
+>             # Contains '/' but no leading '/': match full path or any suffix after '/'
+>             if _pattern_match(pattern, rel_path_nfc):
+>                 return True
+>             idx = 0
+>             while True:
+>                 idx = rel_path_nfc.find('/', idx)
+>                 if idx == -1:
+>                     break
+>                 suffix = rel_path_nfc[idx + 1:]
+>                 if _pattern_match(pattern, suffix):
+>                     return True
+>                 idx += 1
+>         else:
+>             # No '/': match against each path component
+>             components = rel_path_nfc.split('/')
+>             for comp in components:
+>                 if _pattern_match(pattern, comp):
+>                     return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of a file, return (hex_digest, size)."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, 'rb') as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     ignore_patterns = _read_ignore_patterns()
+>
+>     # Dict: nfc_path -> (original_rel_path, full_path)
+>     file_map = {}
+>     root_dir = os.path.abspath(root_dir)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories; sort for determinism
+>         dirnames[:] = [
+>             d for d in sorted(dirnames)
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>
+>         for filename in filenames:
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Relative path with forward slashes
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, '/')
+>
+>             # NFC normalize
+>             rel_path_nfc = unicodedata.normalize('NFC', rel_path)
+>
+>             # Check ignore patterns
+>             if _should_ignore(rel_path_nfc, ignore_patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original
+>        
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+th)
+>
+>     # Build rows sorted by NFC path for determinism
+>     rows = []
+>     for nfc_path in sorted(file_map.keys()):
+>         orig_rel, full_path = file_map[nfc_path]
+>         try:
+>             hex_digest, size = _hash_file(full_path)
+>             rows.append((nfc_path, hex_digest, size))
+>         except (OSError, IOError):
+>             continue
+>
+>     # Write to database with concurrency safety
+>     # Use a lock file + temp file + atomic rename
+>     db_abs = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_abs)
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     lock_path = db_abs + ".lock"
+>     lock_fd = open(lock_path, 'w')
+>     try:
+>         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+>
+>         fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db', prefix='.indexer_tmp_')
+>         os.close(fd)
+>
+>         try:
+>             conn = sqlite3.connect(tmp_path)
+>             try:
+>                 conn.execute('PRAGMA journal_mode=WAL')
+>                 conn.execute('PRAGMA synchronous=FULL')
+>                 conn.execute(
+>                     'CREATE TABLE files ('
+>                     '  path TEXT PRIMARY KEY,'
+>                     '  sha256 TEXT NOT NULL,'
+>                     '  size INTEGER NOT NULL'
+>                     ')'
+>                 )
+>                 conn.executemany(
+>                     'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+>                     rows
+>                 )
+>                 conn.commit()
+>             finally:
+>                 conn.close()
+>
+>             os.replace(tmp_path, db_abs)
+>         except Exception:
+>             try:
+>                 os.unlink(tmp_path)
+>             except OSError:
+>                 pass
+>             raise
+>     finally:
+>         fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+>         lock_fd.close()
+>         try:
+>             os.unlink(lock_path)
+>         except OSError:
+>             pass
+> PYTHON_EOF
+root@ece4444ae416:/app# python3 -c "from app.indexer import build_index; print('Import OK')"
+Import OK
+root@ece4444ae416:/app# # Run full test suite
+root@ece4444ae416:/app# python3 -c "
+> from app.indexer import build_index
+> import sqlite3, os, tempfile, multiprocessing
+>
+> # Test 1: Basic
+> print('=== Test 1: Basic ===')
+> with tempfile.TemporaryDirectory() as d:
+>     with open(os.path.join(d, 'hello.txt'), 'w') as f:
+>         f.write('hello')
+>     os.makedirs(os.path.join(d, 'sub'))
+>     with open(os.path.join(d, 'sub', 'world.txt'), 'w') as f:
+>         f.write('world')
+>     db = os.path.join(d, 'test.db')
+>     build_index(d, db)
+>     conn = sqlite3.connect(db)
+>     rows = conn.execute('SELECT * FROM files ORDER BY path').fetchall()
+>     for r in rows:
+>         print(r)
+>     assert len(rows) == 2
+>     assert rows[0][0] == 'hello.txt'
+>     assert rows[1][0] == 'sub/world.txt'
+>     print(conn.execute('PRAGMA integrity_check').fetchone())
+>     conn.close()
+>
+> # Test 2: Symlinks ignored
+> print('=== Test 2: Symlinks ===')
+> with tempfile.TemporaryDirectory() as d:
+>     with open(os.path.join(d, 'real.txt'), 'w') as f:
+>         f.write('real')
+>     os.symlink(os.path.join(d, 'real.txt'), os.path.join(d, 'link.txt'))
+>     os.makedirs(os.path.join(d, 'realdir'))
+>     with open(os.path.join(d, 'realdir', 'inner.txt'), 'w') as f:
+>         f.write('inner')
+>     os.symlink(os.path.join(d, 'realdir'), os.path.join(d, 'linkdir'))
+>     db = os.path.join(d, 'test.db')
+>     build_index(d, db)
+>     conn = sqlite3.connect(db)
+>     rows = conn.execute('SELECT * FROM files ORDER BY path').fetchall()
+>     paths = [r[0] for r in rows]
+>     print('Paths:', paths)
+>     assert 'link.txt' not in paths
+>     assert 'linkdir/inner.txt' not in paths
+>     assert 'real.txt' in paths
+>     assert 'realdir/inner.txt' in paths
+>     conn.close()
+>
+> # Test 3: Concurrency
+> print('=== Test 3: Concurrency ===')
+> with tempfile.TemporaryDirectory() as d:
+>     for i in range(10):
+>         with open(os.path.join(d, f'file{i}.txt'), 'w') as f:
+>             f.write(f'content{i}')
+>     db = os.path.join(d, 'test.db')
+>     def worker(_):
+>         build_index(d, db)
+>     with multiprocessing.Pool(4) as pool:
+>         pool.map(worker, range(8))
+>     conn = sqlite3.connect(db)
+>     print('integrity:', conn.execute('PRAGMA integrity_check').fetchone())
+>     rows = conn.execute('SELECT * FROM files ORDER BY path').fetchall()
+>     assert len(rows) == 10
+>     conn.close()
+>
+> print('All tests passed!')
+> "
+=== Test 1: Basic ===
+('hello.txt', '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', 5)
+('sub/world.txt', '486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7', 5)
+('ok',)
+=== Test 2: Symlinks ===
+Paths: ['real.txt', 'realdir/inner.txt']
+=== Test 3: Concurrency ===
+integrity: ('ok',)
+Traceback (most recent call last):
+  File "<string>", line 61, in <module>
+    assert len(rows) == 10
+           ^^^^^^^^^^^^^^^
+AssertionError
+root@ece4444ae416:/app#

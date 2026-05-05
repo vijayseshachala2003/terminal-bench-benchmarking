@@ -1,0 +1,24 @@
+
+
+Zero TSan warnings in the output. The problem is that when `main()` returns, the detached watchdog thread keeps the process alive until 120s, then calls `_exit(1)` which skips TSan's atexit handler that would print "reported 0 warnings". I need to make the process exit cleanly before the watchdog fires. Let me look at the stress_test.cpp more carefully to understand the flow, and then add a quick `_exit(0)` or similar at the end of main in stress_test.cpp to ensure clean termination.
+
+Actually, the issue is that when main() returns with `return 0`, the C runtime calls `exit(0)`, which runs atexit handlers (including TSan's), but on Linux with glibc, `exit()` doesn't terminate other threads. The detached watchdog thread is still running, and it seems like the process hangs. But TSan's atexit handler should still run during `exit(0)` processing...
+
+Wait, maybe the issue is that TSan only prints "reported 0 warnings" when there ARE 0 warnings AND it detects it was actually used. Or maybe it only prints when there are >0 warnings. Let me test this theory by looking at TSan behavior.
+
+Actually, looking at TSan source code behavior: TSan prints "ThreadSanitizer: reported N warnings" at exit, including when N=0. But only if the process exits normally (via exit/return from main). The `_exit(1)` from the watchdog bypasses this.
+
+The real question: does the process actually reach `exit()` from main's return, or does it hang? The TIMEOUT message appearing suggests the process doesn't exit when main returns. This is because on Linux, when main() returns and exit() is called, it doesn't terminate detached threads - the process waits... actually no, `exit()` should terminate the process. Let me check if the issue is something else.
+
+Let me just modify stress_test.cpp to call `_exit(0)` at the end of main to ensure immediate termination, but before that, flush and call TSan's handler. Actually, the simplest fix: add `_exit(0)` right after the test result, or better yet, add `exit(0)` which will trigger atexit handlers.
+
+{
+  "analysis": "Zero TSan warnings detected. The issue is that the detached watchdog thread prevents clean process exit, causing _exit(1) to be called after 120s which skips TSan's atexit summary handler. I need to ensure the process exits cleanly so TSan can print its 'reported 0 warnings' line.",
+  "plan": "Modify stress_test.cpp to add _exit() calls right after the return statements in main, so the process terminates before the watchdog fires. But _exit skips atexit. Better: use exit() or just kill the watchdog. Actually simplest: set timed_out flag at end of main so watchdog exits, or just call quick_exit/exit explicitly. Let me look at the full stress_test.cpp structure again and add a clean exit.",
+  "commands": [
+    {
+      "keystrokes": "cat /app/stress_test.cpp\n",
+      "duration": 0.5
+    }
+  ]
+}

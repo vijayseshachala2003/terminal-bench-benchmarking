@@ -1,0 +1,174 @@
+Current terminal state:
+New Terminal Output:
+
+root@d8f8f0c8b28a:/app# cat << 'EOF' > /app/solution.py
+> import re
+> from collections import defaultdict
+>
+> def solve(lines: list[str]) -> str:
+>     valid_events = []
+>     for line in lines:
+>         if not line or line.startswith('#'): continue
+>         parts = line.split(' ')
+>         if len(parts) < 3: break
+>         idx, tx, op = parts[0], parts[1], parts[2]
+>         if not re.match(r'^[1-9][0-9]*$', idx) or not re.match(r'^[a-z0-9]{1,8}$', tx): break
+>         arg = parts[3] if len(parts) > 3 else None
+>         if len(parts) > 4: break
+>         if op == 'VOTE':
+>             if arg not in ('YES', 'NO'): break
+>         elif op in ('FENCE', 'EPOCH'):
+>             if not arg or not re.match(r'^[A-F0-9]{8}$', arg): break
+>         elif op in ('BEGIN', 'PREPARE', 'COMMIT', 'ABORT', 'END'):
+>             if arg is not None: break
+>         else:
+>             break
+>         valid_events.append({'idx': idx, 'tx': tx, 'op': op, 'arg': arg})
+>
+>     shard_epochs = defaultdict(list)
+>     tx_shards = {}
+>     tx_events = defaultdict(list)
+>     for ev in valid_events:
+>         tx, op, arg, shard = ev['tx'], ev['op'], ev['arg'], ev['tx'][0]
+>         tx_shards[tx] = shard
+>         if op == 'EPOCH':
+>             shard_epochs[shard].append(int(arg, 16))
+>         else:
+>             tx_events[tx].append(ev)
+>
+>     bad_shards = set()
+>     for shard, epochs in shard_epochs.items():
+>         for i in range(1, len(epochs)):
+>             if epochs[i] <= epochs[i-1]:
+>                 bad_shards.add(shard)
+>                 break
+>
+>     bad_txs = {}
+>     ins_txs = defaultdict(list)
+>
+>     for tx, shard in tx_shards.items():
+>         if shard in bad_shards:
+>             bad_txs[tx] = 'BAD_EPOCH'
+>             continue
+>
+>         events = tx_events[tx]
+>         ops = [ev['op'] for ev in events]
+>         args = [ev['arg'] for ev in events]
+>
+>         last_fence = -1
+>         bad_reason = None
+>         for ev in events:
+>             if ev['op'] == 'FENCE':
+>                 v = int(ev['arg'], 16)
+>                 if v <= last_fence:
+>                     bad_reason = 'BAD_FENCE'
+>                     break
+>                 last_fence = v
+>         if bad_reason:
+>             bad_txs[tx] = bad_reason
+>             continue
+>
+>         votes = set(ev['arg'] for ev in events if ev['op'] == 'VOTE')
+>         if len(votes) > 1:
+>             bad_txs[tx] = 'BAD_VOTE'
+>             continue
+>
+>         # Check BAD_ORDER conditions explicitly listed
+>         if 'END' in ops and 'COMMIT' not in ops and 'ABORT' not in ops:
+>             bad_txs[tx] = 'BAD_ORDER'
+>             continue
+>         if 'COMMIT' in ops and 'NO' in votes:
+>             bad_txs[tx] = 'BAD_ORDER'
+>             continue
+>         if ('COMMIT' in ops or 'ABORT' in ops) and 'PREPARE' not in ops:
+>             # Wait, ABORT can be from BEGUN. "ABORT allowed from BEGUN or PREPARED or DECIDED_ABORT states"
+>             # "If tx has decision (COMMIT/ABORT) but missing PREPARE -> BAD_ORDER"
+>             bad_txs[tx] = 'BAD_ORDER'
+>             continue
+>
+>         # Simulate state machine with allowed insertions to catch other BAD_ORDERs
+>         state = 'NEW'
+>         for ev in events:
+>             op = ev['op']
+>             if op == 'FENCE': continue
+>             if op == 'BEGIN':
+>                 if state != 'NEW': bad_reason = 'BAD_ORDER'; break
+>                 state = 'BEGUN'
+>             elif op == 'PREPARE':
+>                 if state == 'NEW': state = 'BEGUN' # implicit insertion
+>                 if state != 'BEGUN': bad_reason = 'BAD_ORDER'; break
+>                 state = 'PREPARED'
+>             elif op == 'VOTE':
+>                 if state == 'NEW': state = 'PREPARED' # implicit insertions
+>                 elif state == 'BEGUN': state = 'PREPARED' # implicit insertion
+>                 if state != 'PREPARED': bad_reason = 'BAD_ORDER'; break
+>             elif op == 'COMMIT':
+>                 if state != 'PREPARED': bad_reason = 'BAD_ORDER'; break
+>                 state = 'DECIDED_COMMIT'
+>             elif op == 'ABORT':
+>                 if state == 'NEW': state = 'BEGUN'
+>                 if state not in ('BEGUN', 'PREPARED', 'DECIDED_ABORT'): bad_reason = 'BAD_ORDER'; break
+>                 state = 'DECIDED_ABORT'
+>             elif op == 'END':
+>                 if state not in ('DECIDED_COMMIT', 'DECIDED_ABORT'): bad_reason = 'BAD_ORDER'; break
+>                 state = 'ENDED'
+>
+>         if bad_reason:
+>             bad_txs[tx] = bad_reason
+>             continue
+>
+>         # Compute insertions
+>         has_begin = 'BEGIN' in ops
+>         has_prepare = 'PREPARE' in ops
+>         has_commit = 'COMMIT' in ops
+>         has_abort = 'ABORT' in ops
+>         has_decision = has_commit or has_abort
+>         has_end = 'END' in ops
+>         has_vote = 'VOTE' in ops
+>
+>         ins = []
+>         if not has_begin:
+>             ins.append('BEGIN')
+>         if not has_prepare and (has_vote or has_decision or (not has_decision and 'NO' not in votes)):
+>             # If we will insert COMMIT, we need PREPARE. If we insert ABORT, we don't strictly need PREPARE but wait:
+>             # "If tx had any VOTE but no PREPARE before it, insert BEGIN and PREPARE"
+>             if has_vote or (not has_decision and 'NO' not in votes):
+>                 ins.append('PREPARE')
+>
+>         if not has_decision:
+>             if 'NO' in votes:
+>                 ins.append('ABORT')
+>             else:
+>                 if not has_prepare and 'PREPARE' not in ins:
+>                     ins.append('PREPARE')
+>                 ins.append('COMMIT')
+>
+>         if not has_end:
+>             ins.append('END')
+>
+>         ins_txs[tx] = ins
+>
+>     out = []
+>     for tx in sorted(bad_txs.keys()):
+>         out.append(f"BAD {tx} {bad_txs[tx]}")
+>
+>     op_order = {op: i for i, op in enumerate(['BEGIN', 'PREPARE', 'VOTE', 'COMMIT', 'ABORT', 'END', 'FENCE', 'EPOCH'])}
+>
+>     ins_lines = []
+>     for tx, ins_list in ins_txs.items():
+>         for op in ins_list:
+>             ins_lines.append((tx, op_order[op], '', f"INS {tx} {op}"))
+>
+>     ins_lines.sort()
+>     for _, _, _, line in ins_lines:
+>         out.append(line)
+>
+>     return "\n".join(out) if out else "OK"
+> EOF
+root@d8f8f0c8b28a:/app# python3 -c "from solution import solve; print(solve(['1 a1 BEGIN', '2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@d8f8f0c8b28a:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

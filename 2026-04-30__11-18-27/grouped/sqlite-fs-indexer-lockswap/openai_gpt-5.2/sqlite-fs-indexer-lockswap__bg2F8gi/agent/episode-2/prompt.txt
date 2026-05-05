@@ -1,0 +1,292 @@
+New Terminal Output:
+
+root@6d230bcd7ff7:/app# cat > /app/app/indexer.py <<'PY'
+> """Filesystem to SQLite indexer.
+'/' as a normal character; but we must ensure '*' doesn't cross '/'.
+
+    fnmatch's '*' will match '/', so we must prevent that. We do so by translating
+    pattern to a regex where '*' becomes '[^/]*'. Using fnmatch.translate and then
+    patching is possible but fragile; simplest is to implement our own small glob.
+
+    Supported:
+    - '*' matches zero or more characters except '/'
+    - all other characters match literally
+    - no character classes, no '?'
+
+    This is sufficient for the tests as specified.
+    """
+
+    # Fast path: no '*' in pattern -> exact match
+    if "*" not in pattern:
+        return text == pattern
+
+    # Two literal '*' in a row are not special; they mean literal '*' '*'.
+    # We handle that by escaping '**' into literal '*' characters.
+    pat, sentinel = _escape_double_star(pattern)
+
+    # Replace sentinel with literal '*' in matching.
+    # We'll implement a simple wildcard matcher with only '*' wildcard.
+    def char_eq(tch: str, pch: str) -> bool:
+        if pch == sentinel:
+            return tch == "*"
+        return tch == pch
+
+    # Tokenize pattern into literals and '*' wildcards (excluding sentinel).
+    tokens: List[Tuple[str, str]] = []  # (kind, value) kind in {'lit','star'}
+    i = 0
+    while i < len(pat):
+        ch = pat[i]
+        if ch == "*":
+            tokens.append(("star", "*"))
+            i += 1
+            continue
+        # literal run
+        j = i
+        while j < len(pat) and pat[j] != "*":
+            j += 1
+        tokens.append(("lit", pat[i:j]))
+        i = j
+
+    # Match with backtracking over '*' but forbidding matching '/'.
+    t = text
+    ti = 0
+    tok_i = 0
+    star_tok_index: Optional[int] = None
+    star_text_index: Optional[int] = None
+
+    def lit_match_at(ti0: int, lit: str) -> Optional[int]:
+        if ti0 + len(lit) > len(t):
+            return None
+        for k, pch in enumerate(lit):
+            tch = t[ti0 + k]
+            if pch == sentinel:
+                if tch != "*":
+                    return None
+            else:
+      >
+> This module implements build_index(root_dir, db_path).
+>
+> Key properties required by tests:
+> - Deterministic traversal and results.
+> - Unicode NFC normalization for stored paths and ignore matching.
+> - Ignore symlinks entirely (do not traverse, do not index).
+> - Handle NFC collisions by choosing the lexicographically largest *original* relative path.
+> - Concurrency-safe: multiple processes may build the same db_path concurrently without
+>   leaving a corrupted/half-written database.
+>
+> Standard library only.
+> """
+>
+> from __future__ import annotations
+>
+> import fnmatch
+> import hashlib
+> import os
+> import sqlite3
+> import unicodedata
+> from dataclasses import dataclass
+> from typing import Dict, Iterable, List, Optional, Tuple
+>
+>
+> IGNORE_FILE = "/data/ignore.txt"
+>
+>
+> def _nfc(s: str) -> str:
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> def _to_posix_relpath(rel: str) -> str:
+>     # Ensure forward slashes regardless of platform.
+>     return rel.replace("\\", "/")
+>
+>
+> def _split_components(posix_rel: str) -> List[str]:
+>     if not posix_rel:
+>         return []
+>     return [c for c in posix_rel.split("/") if c != ""]
+>
+>
+> def _escape_double_star(pattern: str) -> str:
+>     """Make '**' mean two literal '*' characters.
+>
+>     We do this by temporarily replacing '**' with a sentinel that won't occur,
+>     then matching with fnmatch where '*' keeps its meaning, and finally treating
+>     the sentinel as a literal '*'.
+>
+>     fnmatch doesn't have an escape for '*', so we translate by replacing the
+>     sentinel with a character class matching literal '*'.
+>     """
+>
+>     sentinel = "\u0000"  # NUL unlikely in text patterns
+>     while sentinel in pattern:
+>         sentinel += "\u0000"
+>     return pattern.replace("**", sentinel), sentinel
+>
+>
+a> def _fnmatch_no_slash(text: str, pattern: str) -> bool:
+>     """fnmatch where '*' does not match '/'.
+>
+>     We implement by splitting on '/' and matching segment-wise if pattern has no '/'.
+>     For patterns with '/', we still rely on fnmatch.fnmatchcase which already treats
+>     '/' as a normal character; but we must ensure '*' doesn't cross '/'.
+>
+>     fnmatch's '*' will match '/', so we must prevent that. We do so by translating
+>     pattern to a regex where '*' becomes '[^/]*'. Using fnmatch.translate and then
+>     patching is possible but fragile; simplest is to implement our own small glob.
+>
+>     Supported:
+>     - '*' matches zero or more characters except '/'
+>     - all other characters match literally
+>     - no character classes, no '?'
+>
+>     This is sufficient for the tests as specified.
+>     """
+>
+>     # Fast path: no '*' in pattern -> exact match
+>     if "*" not in pattern:
+>         return text == pattern
+>
+>     # Two literal '*' in a row are not special; they mean literal '*' '*'.
+> 
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+  continue
+>
+>     return False
+>
+>
+> def _iter_files(root_dir: str, patterns: List[_Pattern]) -> Iterable[Tuple[str, str]]:
+>     """Yield (rel_original_posix, rel_nfc_posix) for regular files under root_dir."""
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     def walk(dir_path: str, rel_prefix: str) -> Iterable[Tuple[str, str]]:
+>         try:
+>             with os.scandir(dir_path) as it:
+>                 entries = list(it)
+>         except OSError:
+>             return
+>
+>         # Deterministic order
+>         entries.sort(key=lambda e: e.name)
+>
+>         for e in entries:
+>             try:
+>                 # Never follow symlinks; ignore symlink entries entirely.
+>                 if e.is_symlink():
+>                     continue
+>
+>                 name = e.name
+>                 rel_orig = name if not rel_prefix else f"{rel_prefix}/{name}"
+>                 rel_orig = _to_posix_relpath(rel_orig)
+>                 rel_nfc = _nfc(rel_orig)
+>
+>                 # Apply ignore rules for both dirs and files (so we can prune dirs).
+>                 if _pattern_matches(rel_nfc, patterns):
+>                     continue
+>
+>                 if e.is_dir(follow_symlinks=False):
+>                     yield from walk(e.path, rel_orig)
+>                 elif e.is_file(follow_symlinks=False):
+>                     yield (rel_orig, rel_nfc)
+>                 else:
+>                     # Ignore non-regular file types
+>                     continue
+>             except OSError:
+>                 continue
+>
+>     yield from walk(root_dir, "")
+>
+>
+> def _hash_file(path: str) -> Tuple[str, int]:
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(path, "rb") as f:
+>         while True:
+>             b = f.read(1024 * 1024)
+>             if not b:
+>                 break
+>             size += len(b)
+>             h.update(b)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     patterns = _read_patterns()
+>
+>     root_abs = os.path.abspath(root_dir)
+>
+>     # Resolve NFC collisions: map nfc_path -> (orig_rel, abs_path)
+>     chosen: Dict[str, Tuple[str, str]] = {}
+>     for rel_orig, rel_nfc in _iter_files(root_abs, patterns):
+>         abs_path = os.path.join(root_abs, rel_orig.replace("/", os.sep))
+>         prev = chosen.get(rel_nfc)
+>         if prev is None or rel_orig > prev[0]:
+>             chosen[rel_nfc] = (rel_orig, abs_path)
+>
+>     # Deterministic insertion order by NFC path
+>     rows: List[Tuple[str, str, int]] = []
+>     for rel_nfc in sorted(chosen.keys()):
+>         _, abs_path = chosen[rel_nfc]
+>         try:
+>             sha, size = _hash_file(abs_path)
+>         except OSError:
+>             # If a file disappears/is unreadable during indexing, skip it.
+>             continue
+>         rows.append((rel_nfc, sha, int(size)))
+>
+>     db_path_abs = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_path_abs) or "."
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     # Concurrency safety: build a complete DB in a unique temp file, then atomically
+>     # replace the target path. This avoids multi-writer contention and prevents
+>     # half-written databases.
+>     tmp_path = None
+>     try:
+>         pid = os.getpid()
+>         base = os.path.basename(db_path_abs)
+>         # Ensure uniqueness even among same-pid fast retries.
+>         for i in range(1000):
+>             candidate = os.path.join(db_dir, f".{base}.tmp.{pid}.{i}")
+>             try:
+>                 fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+>                 os.close(fd)
+>                 tmp_path = candidate
+>                 break
+>             except FileExistsError:
+>                 continue
+>         if tmp_path is None:
+>             raise RuntimeError("Could not allocate temporary database path")
+>
+>         con = sqlite3.connect(tmp_path, timeout=30.0)
+>         try:
+>             con.execute("PRAGMA journal_mode=WAL")
+>             con.execute("PRAGMA synchronous=NORMAL")
+>             con.execute("PRAGMA temp_store=MEMORY")
+>             con.execute("PRAGMA foreign_keys=OFF")
+>
+>             con.execute(
+>                 "CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)"
+>             )
+>             con.execute("BEGIN")
+>             con.executemany("INSERT INTO files(path, sha256, size) VALUES (?, ?, ?)", rows)
+>             con.execute("COMMIT")
+>         finally:
+>             con.close()
+>
+>         os.replace(tmp_path, db_path_abs)
+>         tmp_path = None
+>
+>     finally:
+>         if tmp_path is not None:
+>             try:
+>                 os.unlink(tmp_path)
+>             except OSError:
+>                 pass
+> PY
+root@6d230bcd7ff7:/app# python -m compileall -q /app/app/indexer.py
+root@6d230bcd7ff7:/app# pytest -q /tests/test_outputs.py
+bash: pytest: command not found
+root@6d230bcd7ff7:/app#

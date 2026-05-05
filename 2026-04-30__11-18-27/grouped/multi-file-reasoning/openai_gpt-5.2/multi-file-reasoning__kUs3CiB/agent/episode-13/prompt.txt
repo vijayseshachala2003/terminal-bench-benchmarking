@@ -1,0 +1,103 @@
+New Terminal Output:
+
+}root@47a44cdb3aaf:/app# python - <<'PY'
+> from pathlib import Path
+> import re
+> p=Path('/app/analyze_deps.py')
+> s=p.read_text(encoding='utf-8')
+>
+> # Patch the block that initializes edges/invalid and fills them.
+> # We'll replace from 'edges={m:set() for m in modules}' through the end of the for-loop that appends invalid.
+> pat = re.compile(r"edges=\{m:set\(\) for m in modules\}\ninvalid: List\[Tuple\[Path,str\]\]=\[\]\nfor m,info in modules\.items\(\):[\s\S]*?elif it\.level>0: i
+nvalid\.append\(\(info\.path, f\"\{'.'\*it\.level\}\{it\.module or ''\}\"\)\)\)\n", re.M)
+>
+> new = r'''top_levels = {name.split(".")[0] for name in modules.keys() if name}
+> edges={m:set() for m in modules}
+> invalid: List[Tuple[Path,str]]=[]
+> for m,info in modules.items():
+>     t=asts.get(m)
+>     if t is None: continue
+>     for it in imports.get(m,[]):
+>         if it.kind=="import":
+>             parts=it.name.split(".")
+>             # If import targets project namespace (top-level matches), require some prefix exists.
+>             if parts and parts[0] in top_levels:
+>                 found=None
+>                 for i in range(len(parts),0,-1):
+>                     cand=".".join(parts[:i])
+>                     if cand in modules:
+>                         found=cand
+>                         break
+>                 if found:
+>                     edges[m].add(found)
+>                 else:
+>                     invalid.append((info.path, it.name))
+>             else:
+>                 # external/stdlib: ignore
+>                 pass
+>         else:
+>             # from <module> import <name>
+>             if it.level>0:
+>                 rm=resolve_import_to_project(modules, info.path, m, it.module, it.level)
+>                 if rm:
+>                     edges[m].add(rm)
+>                 else:
+>                     invalid.append((info.path, f"{'.'*it.level}{it.module or ''}"))
+>             else:
+>                 modname = it.module
+>                 if modname:
+>                     parts = modname.split(".")
+>                     if parts and parts[0] in top_levels:
+>                         if modname in modules:
+>                             edges[m].add(modname)
+>                         else:
+>                             invalid.append((info.path, modname))
+>                 # else: from-import from external/stdlib -> ignore
+> '''
+>
+> s2,n = pat.subn(new, s)
+> if n!=1:
+>     raise SystemExit(f'Failed to patch import validation block (matches={n})')
+>
+> p.write_text(s2, encoding='utf-8')
+> print('patched import validation')
+> PY
+Failed to patch import validation block (matches=0)
+root@47a44cdb3aaf:/app# python -m py_compile /app/analyze_deps.py
+root@47a44cdb3aaf:/app# python /app/analyze_deps.py --project-dir /tmp/proj --out /tmp/report.json && jq . /tmp/report.json 2>/dev/null || cat /tmp/report.json
+{
+  "all_refs_defined": false,
+  "errors": [
+    {
+      "file": "/app/pkg/__init__.py",
+      "message": "Unused import: f",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/pkg/c.py",
+      "message": "Undefined reference: missing",
+      "type": "undefined_reference"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}root@47a44cdb3aaf:/app# mkdir -p /tmp/proj2/p && printf "" > /tmp/proj2/p/__init__.py && echo "import p.nope" > /tmp/proj2/p/a.py && python /app/analyze_deps.p
+y --project-dir /tmp/proj2 --out /tmp/r2.json && cat /tmp/r2.json
+{
+  "all_refs_defined": true,
+  "errors": [
+    {
+      "file": "/app/p/a.py",
+      "message": "Unused import: nope",
+      "type": "unused_import"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}root@47a44cdb3aaf:/app#

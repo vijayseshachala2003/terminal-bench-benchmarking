@@ -1,0 +1,134 @@
+New Terminal Output:
+
+root@abb2fd015a0a:/app# cat > /app/lockfree_queue.cpp << 'EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::TaggedPtr LockFreeQueue::load_tagged(std::atomic<uintptr_t>& atomic_ptr, std::memory_order order) {
+>     uintptr_t tagged = atomic_ptr.load(order);
+>     return TaggedPtr((Node*)(tagged & ~3ULL), tagged & 3ULL);
+> }
+>
+> void LockFreeQueue::store_tagged(std::atomic<uintptr_t>& atomic_ptr, LockFreeQueue::TaggedPtr tp, std::memory_order order) {
+>     uintptr_t tagged = (uintptr_t)tp.ptr | tp.tag;
+>     atomic_ptr.store(tagged, order);
+> }
+>
+> bool LockFreeQueue::cas_tagged(std::atomic<uintptr_t>& atomic_ptr, LockFreeQueue::TaggedPtr& expected, LockFreeQueue::TaggedPtr desired,
+>                      std::memory_order success, std::memory_order failure) {
+>     uintptr_t exp_tagged = (uintptr_t)expected.ptr | expected.tag;
+>     uintptr_t des_tagged = (uintptr_t)desired.ptr | desired.tag;
+>     return atomic_ptr.compare_exchange_weak(exp_tagged, des_tagged, success, failure);
+> }
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     TaggedPtr tp(dummy, 0);
+>     store_tagged(head_, tp, std::memory_order_relaxed);
+>     store_tagged(tail_, tp, std::memory_order_relaxed);
+>     store_tagged(free_list_, TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     TaggedPtr head_tp = load_tagged(head_, std::memory_order_relaxed);
+>     delete head_tp.ptr;
+>
+>     TaggedPtr free_tp = load_tagged(free_list_, std::memory_order_relaxed);
+>     while (free_tp.ptr) {
+>         TaggedPtr next_tp = load_tagged(free_tp.ptr->next, std::memory_order_relaxed);
+>         delete free_tp.ptr;
+>         free_tp = next_tp;
+>     }
+>
+>     for (auto* node : to_free_) {
+>         delete node;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     TaggedPtr node_tp = load_tagged(free_list_, std::memory_order_acquire);
+>     while (node_tp.ptr) {
+>         TaggedPtr next_tp = load_tagged(node_tp.ptr->next, std::memory_order_acquire);
+>         TaggedPtr expected = node_tp;
+>         TaggedPtr desired(next_tp.ptr, node_tp.tag + 1);
+>         if (cas_tagged(free_list_, expected, desired)) {
+>             node_tp.ptr->value = value;
+>             store_tagged(node_tp.ptr->next, TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+>             return node_tp.ptr;
+>         }
+>         node_tp = load_tagged(free_list_, std::memory_order_acquire);
+>     }
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::free_node(Node* node) {
+>     to_free_.push_back(node);
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>     while (true) {
+>         TaggedPtr tail_tp = load_tagged(tail_, std::memory_order_acquire);
+>         TaggedPtr next_tp = load_tagged(tail_tp.ptr->next, std::memory_order_acquire);
+>         TaggedPtr tail_check = load_tagged(tail_, std::memory_order_acquire);
+>         if (tail_tp == tail_check) {
+>             if (next_tp.ptr == nullptr) {
+>                 TaggedPtr expected_next(nullptr, next_tp.tag);
+>                 TaggedPtr desired_next(new_node, next_tp.tag + 1);
+>                 if (cas_tagged(tail_tp.ptr->next, expected_next, desired_next)) {
+>                     TaggedPtr expected_tail = tail_tp;
+>                     TaggedPtr desired_tail(new_node, tail_tp.tag + 1);
+>                     cas_tagged(tail_, expected_tail, desired_tail);
+>                     return;
+>                 }
+>             } else {
+>                 TaggedPtr expected_tail = tail_tp;
+>                 TaggedPtr desired_tail(next_tp.ptr, tail_tp.tag + 1);
+>                 cas_tagged(tail_, expected_tail, desired_tail);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         TaggedPtr head_tp = load_tagged(head_, std::memory_order_acquire);
+>         TaggedPtr tail_tp = load_tagged(tail_, std::memory_order_acquire);
+>         TaggedPtr next_tp = load_tagged(head_tp.ptr->next, std::memory_order_acquire);
+>         TaggedPtr head_check = load_tagged(head_, std::memory_order_acquire);
+>         if (head_tp == head_check) {
+>             if (head_tp.ptr == tail_tp.ptr) {
+>                 if (next_tp.ptr == nullptr) {
+>                     return false;
+>                 }
+>                 TaggedPtr expected_tail = tail_tp;
+>                 TaggedPtr desired_tail(next_tp.ptr, tail_tp.tag + 1);
+>                 cas_tagged(tail_, expected_tail, desired_tail);
+>             } else {
+>                 value = next_tp.ptr->value;
+>                 TaggedPtr expected_head = head_tp;
+>                 TaggedPtr desired_head(next_tp.ptr, head_tp.tag + 1);
+>                 if (cas_tagged(head_, expected_head, desired_head)) {
+>                     free_node(head_tp.ptr);
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> EOF
+root@abb2fd015a0a:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@abb2fd015a0a:/app# /app/stress_test
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 2500000
+Total operations: 10000000
+
+Segmentation fault (core dumped)
+root@abb2fd015a0a:/app#

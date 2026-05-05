@@ -1,0 +1,106 @@
+Current terminal state:
+New Terminal Output:
+
+root@5c8cab283b8d:/app# cat << 'EOF' > /app/app/indexer.py
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import fnmatch
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     # Normalize root_dir
+>     root_dir = os.path.abspath(root_dir)
+>
+>     # Read ignore patterns if file exists
+>     ignore_patterns = []
+>     ignore_path = '/data/ignore.txt'
+>     if os.path.exists(ignore_path):
+>         with open(ignore_path, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip()
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 # Normalize pattern to NFC
+>                 ignore_patterns.append(unicodedata.normalize('NFC', line))
+>
+>     # Function to check if path should be ignored
+>     def should_ignore(nfc_rel_path: str) -> bool:
+>         for pattern in ignore_patterns:
+>             if '/' in pattern:
+>                 if pattern.startswith('/'):
+>                     # Match full path after stripping leading /
+>                     if nfc_rel_path == pattern[1:]:
+>                         return True
+>                 else:
+>                     # Match full or suffix starting after /
+>                     if nfc_rel_path == pattern or nfc_rel_path.endswith('/' + pattern):
+>                         return True
+>             else:
+>                 # Match any component
+>                 components = nfc_rel_path.split('/')
+>                 if any(fnmatch.fnmatch(comp, pattern) for comp in components):
+>                     return True
+>         return False
+>
+>     # Collect all entries
+>     entries = {}
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Remove symlinked dirs from dirnames to not traverse
+>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+>         for filename in filenames:
+>             full_path = os.path.join(dirpath, filename)
+>             if os.path.islink(full_path):
+>                 continue  # Ignore symlinks
+>             rel_path = os.path.relpath(full_path, root_dir).replace(os.sep, '/')
+>             original_rel = rel_path
+>             nfc_rel = unicodedata.normalize('NFC', rel_path)
+>             if should_ignore(nfc_rel):
+>                 continue
+>             size = os.path.getsize(full_path)
+>             # Hash the file
+>             with open(full_path, 'rb') as f:
+>                 hasher = hashlib.sha256()
+>                 while chunk := f.read(8192):
+>                     hasher.update(chunk)
+>                 sha256 = hasher.hexdigest()
+>             # Store: key by nfc_rel, value (original_rel, sha256, size)
+>             if nfc_rel not in entries or original_rel > entries[nfc_rel][0]:
+>                 entries[nfc_rel] = (original_rel, sha256, size)
+>
+>     # Sort entries by nfc_rel for determinism
+>     sorted_entries = sorted(entries.items())
+>
+>     # Now, insert into database with concurrency handling
+>     max_retries = 10
+>     retry_delay = 0.1
+>     for attempt in range(max_retries):
+>         try:
+>             conn = sqlite3.connect(db_path, timeout=30.0)
+>             conn.execute('PRAGMA journal_mode=WAL')
+>             conn.execute('PRAGMA synchronous=NORMAL')
+>             conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')
+>             with conn:
+>                 conn.executemany('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)',
+>                                  [(nfc_path, data[1], data[2]) for nfc_path, data in sorted_entries])
+>             conn.close()
+>             break
+>         except sqlite3.OperationalError as e:
+>             if 'locked' in str(e).lower() and attempt < max_retries - 1:
+>                 import time
+>                 time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+>             else:
+>                 raise
+> EOF
+root@5c8cab283b8d:/app# ls -la /app/app/
+total 4
+drwxr-xr-x. 1 root root   24 Apr 30 09:49 .
+drwxr-xr-x. 1 root root   17 Apr 30 09:49 ..
+-rw-r--r--. 1 root root    0 Apr 30 09:49 __init__.py
+-rw-r--r--. 1 root root 3860 Apr 30 12:13 indexer.py
+root@5c8cab283b8d:/app# touch /app/app/__init__.py
+root@5c8cab283b8d:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

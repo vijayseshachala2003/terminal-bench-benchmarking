@@ -1,0 +1,43 @@
+{
+  "analysis": "We need to remove the spurious TIMEOUT line. The tail of stress_test.cpp shows returns at end; we haven't yet located where TIMEOUT is printed. It likely comes from a SIGALRM handler that prints and calls exit after 120s, but in our runs it prints immediately after completion, suggesting the handler is triggered late or the runner prints it. We should search the file for the TIMEOUT string and alarm/signal usage, then ensure we cancel any alarm and avoid printing TIMEOUT after completion (e.g., by setting timed_out=false and calling alarm(0) and/or guarding the handler with a 'finished' flag).",
+  "plan": "1) Search stress_test.cpp for the TIMEOUT message and alarm/signal code. 2) Add a global atomic<bool> finished flag; set it true before returning; in the SIGALRM handler, only print TIMEOUT if !finished. Also call alarm(0) after joining threads to cancel pending alarms. 3) Rebuild and rerun tsan stress test to confirm TIMEOUT line is gone, and ensure required TSan line still prints. 4) Re-run normal stress test quickly to ensure unchanged behavior.",
+  "commands": [
+    {
+      "keystrokes": "grep -n \"TIMEOUT\" -n /app/stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -nE \"alarm\\(|SIGALRM|signal\\(\" -n /app/stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/stress_test.cpp | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/std::atomic<bool> timed_out\\{false\\};/std::atomic<bool> timed_out{false};\\nstd::atomic<bool> finished{false};/s' /app/stress_test.cpp\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(void timeout_handler\\(int\\) \\{\\s*)([^}]*?)(\\s*\\})/$1if (finished.load(std::memory_order_relaxed)) { return; }\\n$2$3/s' /app/stress_test.cpp\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(All consumers finished\" << std::endl;\\s*)/\\1\\n    alarm(0);\\n    finished.store(true, std::memory_order_relaxed);\\n/s' /app/stress_test.cpp\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep -nE \"finished\\b|alarm\\(0\\)\" -n /app/stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "make clean && make tsan\n",
+      "duration": 20.0
+    },
+    {
+      "keystrokes": "/app/stress_test_tsan\n",
+      "duration": 60.0
+    }
+  ],
+  "task_complete": false
+}

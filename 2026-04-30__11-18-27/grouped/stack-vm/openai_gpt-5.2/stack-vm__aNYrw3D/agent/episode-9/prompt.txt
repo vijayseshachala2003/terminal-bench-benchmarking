@@ -1,0 +1,273 @@
+New Terminal Output:
+
+root@230de788e13b:/app# python3 - <<'PY'
+> src = '''#!/usr/bin/env python3
+> import sys,re
+>
+> def die(msg):
+>   print('ERROR: '+msg);sys.exit(1)
+>
+> def ex(val):
+>   print('EXCEPTION: '+str(val));sys.exit(1)
+>
+> def truth(v):
+>   if v is None: return False
+>   if isinstance(v,(int,float)): return v!=0
+>   if isinstance(v,str) or isinstance(v,list): return len(v)!=0
+>   return True
+>
+> def tname(v):
+>   if isinstance(v,bool) or isinstance(v,int): return 'int'
+>   if isinstance(v,float): return 'float'
+>   if isinstance(v,str): return 'string'
+>   if isinstance(v,list): return 'array'
+>   if isinstance(v,dict) and v.get('tag')=='closure': return 'closure'
+>   return 'unknown'
+>
+> tokre=re.compile(r"\s*(?:#.*$|(?P<s>\"(?:\\.|[^\"])*\")|(?P<w>[^\s#]+))")
+> esc=re.compile(r"\\(n|t|\\|\")")
+>
+> def unesc(s):
+>   return esc.sub(lambda m:{'n':'\n','t':'\t','\\':'\\','"':'"'}[m.group(1)],s)
+>
+> def toks(line):
+>   out=[];i=0
+>   while i<len(line):
+>     m=tokre.match(line,i)
+>     if not m: break
+>     i=m.end()
+>     if m.group('s'): out.append(m.group('s'))
+>     elif m.group('w'): out.append(m.group('w'))
+>     else: break
+>   return out
+>
+> def pval(x):
+>   if len(x)>=2 and x[0]=='"' and x[-1]=='"': return unesc(x[1:-1])
+>   if re.fullmatch(r"[+-]?\d+",x): return int(x)
+>   if re.fullmatch(r"[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?",x) or re.fullmatch(r"[+-]?\d+[eE][+-]?\d+",x): return float(x)
+>   return x
+>
+> class Heap:
+>   def __init__(s): s.n=1;s.b={};s.f=set()
+>   def alloc(s,n):
+>     if n<0: die('invalid allocation')
+>     base=s.n;s.n+=1;s.b[base]=[0]*n;s.f.discard(base);return (base,0)
+>   def _pa(s,a):
+>     if isinstance(a,tuple) and len(a)==2 and isinstance(a[0],int) and isinstance(a[1],int): return a
+>     if isinstance(a,int): return (a,0)
+>     die('invalid address')
+>   def _live(s,base):
+>     if base in s.f or base not in s.b: die('use after free')
+>   def load(s,a):
+>     base,off=s._pa(a);s._live(base);blk=s.b[base]
+>     if off<0 or off>=len(blk): die('invalid address')
+>     return blk[off]
+>   def store(s,a,v):
+>     base,off=s._pa(a);s._live(base);blk=s.b[base]
+>     if off<0 or off>=len(blk): die('invalid address')
+>     blk[off]=v
+>   def free(s,a):
+>     base,_=s._pa(a);s._live(base);s.f.add(base)
+>
+> class VM:
+>   def __init__(s,lines):
+>     s.code=[];s.labels={};s.procs={}
+>     for ln,l in enumerate(lines,1):
+>       ts=toks(l.rstrip('\n'))
+>       if not ts: continue
+>       op=ts[0].upper();args=ts[1:]
+>       if op=='LABEL': s.labels[args[0]]=len(s.code);continue
+>       if op=='PROC': s.procs[args[0]]=(len(s.code),int(args[1]),int(args[2]));continue
+>       if op=='ENDPROC': continue
+>       s.code.append((op,args,ln))
+>     s.ip=0;s.st=[];s.cs=[];s.heap=Heap();s.h=None
+>   def pop(s):
+>     if not s.st: die('stack underflow')
+>     return s.st.pop()
+>   def peek(s):
+>     if not s.st: die('stack underflow')
+>     return s.st[-1]
+>   def throw(s,v):
+>     if s.h is None: ex(v)
+>     s.st.append(v);s.ip=s.h
+>   def run(s):
+>     while s.ip<len(s.code):
+>       op,args,ln=s.code[s.ip];s.ip+=1
+>       try: s.step(op,args)
+>       except SystemExit: raise
+>       except Exception as e: die(f'internal error at line {ln}: {e}')
+>   def step(s,op,args):
+>     if op=='HALT': sys.exit(0)
+>     if op=='PUSH': s.st.append(pval(args[0]));return
+>     if op=='POP': s.pop();return
+>     if op=='DUP': s.st.append(s.peek());return
+>     if op=='SWAP':
+>       if len(s.st)<2: die('stack underflow')
+>       s.st[-1],s.st[-2]=s.st[-2],s.st[-1];return
+>     if op=='ROT':
+>       if len(s.st)<3: die('stack underflow')
+>       a,b,c=s.st[-3],s.st[-2],s.st[-1]
+>       s.st[-3],s.st[-2],s.st[-1]=b,c,a;return
+>
+>     if op in ('ADD','SUB','MUL','DIV','MOD'):
+>       b=s.pop();a=s.pop()
+>       if op=='ADD' and isinstance(a,str) and isinstance(b,str): s.st.append(a+b);return
+>       if op=='ADD' and (isinstance(a,str)^isinstance(b,str)):
+>         s.throw('type error');return
+>       if not isinstance(a,(int,float)) or not isinstance(b,(int,float)):
+>         s.throw('type error');return
+>       fl=isinstance(a,float) or isinstance(b,float)
+>       x=float(a) if fl else int(a); y=float(b) if fl else int(b)
+>       if op=='DIV' and (y==0 or y==0.0): s.throw('division by zero');return
+>       if op=='MOD' and (y==0 or y==0.0): s.throw('division by zero');return
+>       if op=='ADD': r=x+y
+>       elif op=='SUB': r=x-y
+>       elif op=='MUL': r=x*y
+>       elif op=='DIV': r=(x/y) if fl else (int(x)//int(y))
+>       else:
+>         if fl: s.throw('type error');return
+>         r=int(x)%int(y)
+>       s.st.append(r);return
+>
+>     if op=='NEG':
+>       v=s.pop()
+>       if not isinstance(v,(int,float)): s.throw('type error');return
+>       s.st.append(-v);return
+>
+>     if op in ('EQ','NE','LT','GT','LE','GE'):
+>       b=s.pop();a=s.pop()
+>       if op=='EQ': s.st.append(1 if a==b else 0);return
+>       if op=='NE': s.st.append(1 if a!=b else 0);return
+>       if type(a)!=type(b) o
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+r):
+>           ss=v.strip(); s.st.append(int(float(ss)) if ('.' in ss or 'e' in ss.lower()) else int(ss))
+>         else: s.throw('type error');
+>       except: s.throw('type error')
+>       return
+>     if op=='TOFLOAT':
+>       v=s.pop()
+>       try:
+>         if isinstance(v,float): s.st.append(v)
+>         elif isinstance(v,int): s.st.append(float(v))
+>         elif isinstance(v,str): s.st.append(float(v.strip()))
+>         else: s.throw('type error')
+>       except: s.throw('type error')
+>       return
+>     if op=='TOSTR': s.st.append(str(s.pop()));return
+>     if op=='LEN':
+>       v=s.pop()
+>       if isinstance(v,(str,list)): s.st.append(len(v))
+>       else: s.throw('type error')
+>       return
+>
+>     if op=='NEWARRAY': s.st.append([0]*int(args[0]));return
+>     if op=='ALOAD':
+>       i=s.pop();arr=s.pop()
+>       if not isinstance(i,int) or not isinstance(arr,list): s.throw('type error');return
+>       if i<0 or i>=len(arr): s.throw('type error');return
+>       s.st.append(arr[i]);return
+>     if op=='ASTORE':
+>       v=s.pop();i=s.pop();arr=s.pop()
+>       if not isinstance(i,int) or not isinstance(arr,list): s.throw('type error');return
+>       if i<0 or i>=len(arr): s.throw('type error');return
+>       arr[i]=v;return
+>
+>     if op=='ALLOC': s.st.append(s.heap.alloc(int(args[0])));return
+>     if op=='LOAD': s.st.append(s.heap.load(s.pop()));return
+>     if op=='STORE': v=s.pop();a=s.pop();s.heap.store(a,v);return
+>     if op=='FREE': s.heap.free(s.pop());return
+>
+>     if op=='LLOAD':
+>       n=int(args[0])
+>       if not s.cs: s.throw('type error');return
+>       fr=s.cs[-1]
+>       if n<0 or n>=len(fr['loc']): s.throw('type error');return
+>       s.st.append(fr['loc'][n]);return
+>     if op=='LSTORE':
+>       n=int(args[0]);v=s.pop()
+>       if not s.cs: s.throw('type error');return
+>       fr=s.cs[-1]
+>       if n<0 or n>=len(fr['loc']): s.throw('type error');return
+>       fr['loc'][n]=v;return
+>
+>     if op in ('JMP','JZ','JNZ','TRY'):
+>       lab=args[0]
+>       if lab not in s.labels: s.throw('type error');return
+>       tgt=s.labels[lab]
+>       if op=='JMP': s.ip=tgt;return
+>       if op=='TRY': s.h=tgt; return
+>       v=s.pop();c=truth(v)
+>       if (op=='JZ' and not c) or (op=='JNZ' and c): s.ip=tgt
+>       return
+>     if op=='ENDTRY': s.h=None;return
+>     if op=='THROW': s.throw(s.pop());return
+>
+>     if op=='CALL':
+>       name=args[0]
+>       if name not in s.procs: s.throw('type error');return
+>       entry,nargs,nlocals=s.procs[name]
+>       if len(s.st)<nargs: die('stack underflow')
+>       argv=s.st[-nargs:]; del s.st[-nargs:]
+>       s.cs.append({'ret':s.ip,'loc':list(argv)+[0]*nlocals,'clo':None,'h':s.h})
+>       s.ip=entry;return
+>     if op=='RET':
+>       rv=s.pop()
+>       if not s.cs: s.throw('type error');return
+>       fr=s.cs.pop(); s.ip=fr['ret']; s.h=s.cs[-1]['h'] if s.cs else None
+>       s.st.append(rv);return
+>
+>     if op=='CLOSURE':
+>       pname=args[0];nc=int(args[1])
+>       if pname not in s.procs: s.throw('type error');return
+>       if len(s.st)<nc: die('stack underflow')
+>       caps=s.st[-nc:]; del s.st[-nc:]
+>       entry,nargs,nlocals=s.procs[pname]
+>       s.st.append({'tag':'closure','entry':entry,'nargs':nargs,'nlocals':nlocals,'caps':list(caps)});return
+>     if op=='CALLCLOSURE':
+>       clo=s.pop()
+>       if not (isinstance(clo,dict) and clo.get('tag')=='closure'): s.throw('type error');return
+>       nargs=clo['nargs']
+>       if len(s.st)<nargs: die('stack underflow')
+>       argv=s.st[-nargs:]; del s.st[-nargs:]
+>       s.cs.append({'ret':s.ip,'loc':list(argv)+[0]*clo['nlocals'],'clo':clo,'h':s.h})
+>       s.ip=clo['entry'];return
+>     if op=='GETCAPTURED':
+>       n=int(args[0])
+>       if not s.cs or s.cs[-1]['clo'] is None: s.throw('type error');return
+>       caps=s.cs[-1]['clo']['caps']
+>       if n<0 or n>=len(caps): s.throw('type error');return
+>       s.st.append(caps[n]);return
+>
+>     if op=='PRINT': sys.stdout.write(str(s.peek()));sys.stdout.flush();return
+>     if op=='PRINTLN': sys.stdout.write(str(s.peek())+'\n');sys.stdout.flush();return
+>     if op=='READ':
+>       line=sys.stdin.readline();
+>       if line.endswith('\n'): line=line[:-1]
+>       s.st.append(line);return
+>
+>     die('unknown instruction: '+op)
+>
+> def main():
+>   if len(sys.argv)!=2:
+>     print('Usage: /app/svm <program.svm>');return 1
+>   with open(sys.argv[1],'r',encoding='utf-8') as f: lines=f.readlines()
+>   VM(lines).run();return 0
+>
+> if __name__=='__main__':
+>   sys.exit(main())
+> '''
+> open('/app/svm','w',encoding='utf-8').write(src)
+> print('OK wrote',len(src))
+> PY
+OK wrote 9646
+root@230de788e13b:/app# chmod +x /app/svm
+root@230de788e13b:/app# head -n 2 /app/svm
+#!/usr/bin/env python3
+import sys,re
+root@230de788e13b:/app# /app/svm /app/smoke.svm
+  File "/app/svm", line 24
+    tokre=re.compile(r"\s*(?:#.*$|(?P<s>"(?:\.|[^"])*")|(?P<w>[^\s#]+))")
+                                          ^
+SyntaxError: invalid syntax
+root@230de788e13b:/app#

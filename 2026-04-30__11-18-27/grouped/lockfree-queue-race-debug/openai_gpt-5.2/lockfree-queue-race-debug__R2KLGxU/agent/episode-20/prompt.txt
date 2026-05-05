@@ -1,0 +1,182 @@
+New Terminal Output:
+
+grep -n "OPS_PER_THREAD" TIMEOUT: stress test exceeded 120s wall clock limit
+All consumers finished
+Duration: 120247 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 102463
+Unique values: 102463
+Duplicates: 0
+Missing: 4897537
+Invalid: 0
+
+STRESS TEST FAILED
+  - Count mismatch: got 102463, expected 5000000
+  - Found 4897537 missing values
+STRESS TEST FAILED
+  - Wall clock timeout after 120s
+ThreadSanitizer: reported 4 warnings
+root@5c7f91368d01:/app# cat > lockfree_queue.cpp <<'EOF'
+> #include "lockfree_queue.h"
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(dummy, std::memory_order_relaxed);
+>     tail_.store(dummy, std::memory_order_relaxed);
+>
+a>     // We do not reuse nodes while the queue is concurrently accessed.
+>     // Without a full safe reclamation scheme (hazard pointers/epochs) and
+>     // ABA protection, reuse leads to use-after-free and ABA bugs.
+>     free_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue.
+>     uint64_t v;
+>     while (dequeue(v)) {
+>     }
+axed>
+>     // Delete the final dummy node.
+>     Node* head = head_.load(std::memory_order_relaxed);
+>     delete head;
+>
+>     // Delete all retired nodes.
+>     Node* n = free_list_.load(std::memory_order_relaxed);
+>     while (n) {
+>         Node* next = n->next.load(std::memory_order_relaxed);
+>         delete n;
+>         n = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     // Always allocate fresh nodes: avoids ABA from pointer reuse.
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::free_node(Node* node) {
+>     // Retire nodes for deletion in the destructor (no reuse).
+>     Node* old = free_list_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old, std::memory_order_relaxed);
+>     } while (!free_list_.compare_exchange_weak(
+>         old, node, std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+ >     while (true) {
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail->next.load(std::memory_order_acquire);
+>
+>         if (tail == tail_.load(std::memory_order_acquire)) {
+>             if (next == nullptr) {
+>                 // Link new node.
+>                 if (tail->next.compare_exchange_weak(
+>                         next, new_node,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed)) {
+>                     // Swing tail to the inserted node (best effort).
+>                     tail_.compare_exchange_weak(
+>                         tail, new_node,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed);
+>                     return;
+>                 }
+>             } else {
+>                 // Tail is behind, advance it.
+>                 tail_.compare_exchange_weak(
+>                     tail, next,
+>                     std::memory_order_release,
+>                     std::memory_order_relaxed);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         Node* head = head_.load(std::memory_order_acquire);
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head->next.load(std::memory_order_acquire);
+>
+>         if (head == head_.load(std::memory_order_acquire)) {
+>             if (head == tail) {
+>                 if (next == nullptr) {
+>                     return false;
+>                 }
+>                 // Tail is behind, advance it.
+>                 tail_.compare_exchange_weak(
+>                     tail, next,
+>                     std::memory_order_release,
+>                     std::memory_order_relaxed);
+>             } else {
+>                 // Read value from the first real node.
+>                 uint64_t next_value = next->value;
+>
+_>                 // Swing head to next.
+>                 if (head_.compare_exchange_weak(
+>                         head, next,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed)) {
+>                     value = next_value;
+>                     free_node(head);
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> EOF
+root@5c7f91368d01:/app# sed -i 's/static constexpr int OPS_PER_THREAD = 1250000;/static constexpr int OPS_PER_THREAD = 2500000;/' stress_test.cpp
+root@5c7f91368d01:/app# grep -n "OPS_PER_THREAD" -n stress_test.cpp
+15:constexpr int OPS_PER_THREAD = 1250000;  // 10M total (4 producers * 1.25M each)
+33:    uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+35:    for (int i = 0; i < OPS_PER_THREAD; ++i) {
+74:    std::cout << "Operations per producer: " << OPS_PER_THREAD << std::endl;
+75:    std::cout << "Total operations: " << (NUM_PRODUCERS * OPS_PER_THREAD) << std::endl;
+143:    uint64_t expected_count = static_cast<uint64_t>(NUM_PRODUCERS) * OPS_PER_THREAD;
+170:        uint64_t base = static_cast<uint64_t>(producer_id) * OPS_PER_THREAD;
+171:        for (int i = 0; i < OPS_PER_THREAD; ++i) {
+root@5c7f91368d01:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@5c7f91368d01:/app# /app/stress_test
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 1394 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@5c7f91368d01:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@5c7f91368d01:/app# /app/stress_test_tsan
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+

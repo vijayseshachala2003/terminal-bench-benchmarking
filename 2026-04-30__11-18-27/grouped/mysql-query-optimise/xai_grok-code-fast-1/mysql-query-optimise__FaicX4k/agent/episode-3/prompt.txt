@@ -1,0 +1,276 @@
+New Terminal Output:
+
+root@39837010ada4:/app# cat > /app/analyze.py << 'EOF'
+h('# Time:'):
+                if lines[i].startswith('# Query_time: '):
+                    parts = lines[i].split()
+                    query_time = float(parts[2])
+                elif not lines[i].startswith('#') and lines[i].strip():
+                    query += lines[i] + ' '
+                i += 1
+            if query_time and query_time > 1.0:
+                entries.append((timestamp, query_time, query.strip()))
+        else:
+            i += 1
+    return entries
+
+def extract_columns_from_query(query):
+    tables = set()
+    columns = set()
+    # Simple regex to find FROM tables
+    from_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+    if from_match:
+        tables.add(from_match.group(1))
+    join_matches = re.findall(r'JOIN\s+(\w+)', query, re.IGNORECASE)
+    tables.update(join_matches)
+    # WHERE columns
+    where_cols = re.findall(r'\b(\w+)\s*[=<>!]+\s*\?', query)
+    columns.update(where_cols)
+    # IN
+    in_cols = re.findall(r'\b(\w+)\s+IN\s+\(\?', query)
+    columns.update(in_cols)
+    # ORDER BY
+    order_cols = re.findall(r'ORDER BY\s+(\w+)', query, re.IGNORECASE)
+    columns.update(order_cols)
+    # JOIN ON
+    on_cols = re.findall(r'ON\s+\w+\.(\w+)\s*=\s*\w+\.(\w+)', query)
+    for c1, c2 in on_cols:
+        columns.update([c1, c2])
+    return tables, columns
+
+# Load metadata
+with open('/app/query_metadata.json') as f:
+    metadata = json.load(f)
+budget = metadata['budget']
+tables_meta = metadata['tables']
+
+# Read logs
+all_entries = []
+for log_file in glob.glob('/app/mysql_slow_*.log'):
+    with open(log_file) as f:
+        content = f.read()
+    all_entries.extend(parse_slow_log(content))
+
+# Group by normalized pattern
+patterns = defaultdict(list)
+for ts, qt, q in all_entries:
+    norm = normalize_query(q)
+    patterns[norm].append((ts, qt))
+
+normalized_patterns = []
+for pat, entries in patterns.items():
+    freq = len(entries)
+    total_time = sum(qt for _, qt in entries)
+    avg_time = total_time / freq
+    normalized_patterns.append({
+        'pattern': pat,
+        'frequency': freq,
+        'avg_execution_time': round(avg_time, 1),
+        'total_time': round(total_time, 1)
+    })
+normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+
+total_slow_queries = sum(p['frequency'] for p in normalized_patterns)
+
+# Index candidates
+index_candidates = []
+table_patterns = defaultdict(list)
+for pat in normalized_patterns:
+    tables, cols = extract_columns_from_query(pat['pattern'])
+    for table in tables:
+        if table in tables_meta:
+            table_patterns[table].append((pat, cols))
+
+# Single column candidates
+candidate_map = {}
+for table, pats_cols in table_patterns.items():
+    table_cols_meta = tables_meta[table]['columns']
+    for pat, cols in pats_cols:
+        for col in cols:
+            if col in table_cols_meta:
+                sel = table_cols_meta[col]['distinct_values'] / tables_meta[table]['total_rows']
+                sel = round(sel, 2)
+                impact = pat['frequency'] * pat['avg_execution_time'] * max(sel, 0.1)
+                impact = round(impact, 1)
+              > import json
+> import re
+> import os
+> import glob
+> from datetime import datetime, timedelta
+> from collections import defaultdict, Counter
+> import math
+>
+> def normalize_query(query):
+>     query = query.upper()
+>     # Replace numbers
+>     query = re.sub(r'\b\d+\.?\d*\b', '?', query)
+>     # Replace strings
+>     query = re.sub(r"'[^']*'", '?', query)
+>     query = re.sub(r'\"[^\"]*\"', '?', query)
+>     # Replace IN lists
+>     query = re.sub(r'IN\s*\(\s*\?\s*(?:,\s*\?\s*)*\)', 'IN (?)', query)
+>     return query.strip()
+>
+> def parse_slow_log(content):
+>     entries = []
+>     lines = content.split('\n')
+>     i = 0
+>     while i < len(lines):
+>         if lines[i].startswith('# Time: '):
+>             time_str = lines[i][8:]
+>             try:
+>                 timestamp = datetime.strptime(time_str.strip(), '%y%m%d %H:%M:%S')
+>             except:
+>                 i += 1
+>                 continue
+>             query_time = None
+>             query = ''
+>             i += 1
+>             while i < len(lines) and not lines[i].startswith('# Time:'):
+>                 if lines[i].startswith('# Query_time: '):
+>                     parts = lines[i].split()
+>                     query_time = float(parts[2])
+>                 elif not lines[i].startswith('#') and lines[i].strip():
+>                     query += lines[i] + ' '
+>                 i += 1
+>             if query_time and query_time > 1.0:
+>                 entries.append((timestamp, query_time, query.strip()))
+>         else:
+>             i += 1
+>     return entries
+>
+> def extract_columns_from_query(query):
+>     tables = set()
+>     columns = set()
+>     # Simple regex to find FROM tables
+>     from_match = re.search(r'FROM\s+(\w+)', query, re.IGNORECASE)
+>     if from_match:
+>         tables.add(from_match.group(1))
+>   
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+(-x['impact_score'], x['table'] + ''.join(x['columns'])))
+>
+> # Temporal correlations
+> all_times = [(ts, pat) for pat in patterns for ts, _ in patterns[pat]]
+> all_times.sort()
+> window_size = timedelta(seconds=60)
+> correlations = defaultdict(lambda: {'count': 0, 'deltas': []})
+> for i in range(len(all_times)):
+>     ts1, p1 = all_times[i]
+>     window_end = ts1 + window_size
+>     j = i + 1
+>     while j < len(all_times) and all_times[j][0] <= window_end:
+>         ts2, p2 = all_times[j]
+>         if p1 != p2:
+>             pair = tuple(sorted([p1, p2]))
+>             correlations[pair]['count'] += 1
+>             correlations[pair]['deltas'].append(abs((ts2 - ts1).total_seconds()))
+>         j += 1
+>
+> temporal_correlations = []
+> for (p1, p2), data in correlations.items():
+>     if data['count'] >= 3:
+>         avg_delta = sum(data['deltas']) / len(data['deltas'])
+>         temporal_correlations.append({
+>             'pattern1': p1,
+>             'pattern2': p2,
+>             'correlation_strength': data['count'],
+>             'avg_time_delta': round(avg_delta, 1)
+>         })
+> temporal_correlations.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+> temporal_correlations = temporal_correlations[:3]
+>
+> # Recommendations
+> recommended = []
+> table_count = defaultdict(int)
+> total_cost = 0
+> for cand in index_candidates:
+>     if len(recommended) >= 5:
+>         break
+>     if table_count[cand['table']] >= 2:
+>         continue
+>     if total_cost + cand['cost'] > budget:
+>         continue
+>     recommended.append(cand)
+>     table_count[cand['table']] += 1
+>     total_cost += cand['cost']
+>
+> total_impact = sum(c['impact_score'] for c in recommended)
+>
+> # Output JSON
+> output = {
+>     'normalized_patterns': normalized_patterns,
+>     'index_candidates': index_candidates,
+>     'temporal_correlations': temporal_correlations,
+>     'recommended_indexes': recommended,
+>     'total_budget_used': round(total_cost, 1),
+>     'total_impact': round(total_impact, 1)
+> }
+> with open('/app/optimization.json', 'w') as f:
+>     json.dump(output, f, indent=2)
+>
+> # Text output
+> with open('/app/recommendations.txt', 'w') as f:
+>     f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+>     f.write('=====================================\n')
+>     f.write(f'Total Slow Queries: {total_slow_queries}\n')
+>     f.write(f'Unique Query Patterns: {len(normalized_patterns)}\n')
+>     f.write(f'Total Budget: {budget} points\n')
+>     f.write(f'Budget Used: {round(total_cost, 1)} points\n\n')
+>     f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+>     for i, pat in enumerate(normalized_patterns[:5], 1):
+>         # Compute S_max
+>         tables, cols = extract_columns_from_query(pat['pattern'])
+>         s_max = 0.1
+>         for table in tables:
+>             if table in tables_meta:
+>                 for col in cols:
+>                     if col in tables_meta[table]['columns']:
+>                         sel = tables_meta[table]['columns'][col]['distinct_values'] / tables_meta[table]['total_rows']
+>                         s_max = max(s_max, sel)
+>         impact = round(pat['frequency'] * pat['avg_execution_time'] * s_max, 1)
+>         pat_str = pat['pattern'][:60] + ('...' if len(pat['pattern']) > 60 else '')
+>         f.write(f'{i}. {pat_str} (Impact: {impact}, Freq: {pat["frequency"]}, Avg: {pat["avg_execution_time"]}s, Total: {pat["total_time"]}s)\n')
+>     f.write('\nTEMPORAL CORRELATIONS:\n')
+>     for i, corr in enumerate(temporal_correlations, 1):
+>         f.write(f'{i}. Pattern Pair (Strength: {corr["correlation_strength"]}):\n')
+>         f.write(f'   - {corr["pattern1"]}\n')
+>         f.write(f'   - {corr["pattern2"]}\n')
+>     f.write('\nRECOMMENDED INDEXES (5 max):\n')
+>     for i, idx in enumerate(recommended, 1):
+>         cols_str = ','.join(idx['columns'])
+>         f.write(f'{i}. {idx["table"]}({cols_str}) - Impact: {idx["impact_score"]}, Cost: {idx["cost"]} [high_impact]\n')
+>     f.write('\nOPTIMIZATION SUMMARY:\n')
+>     f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+>     f.write(f'- Remaining budget: {round(budget - total_cost, 1)} points\n')
+>     f.write(f'- Tables optimized: {len(table_count)}\n')
+>
+> EOF
+root@39837010ada4:/app# python3 /app/analyze.py
+root@39837010ada4:/app# head -30 /app/optimization.json
+{
+  "normalized_patterns": [],
+  "index_candidates": [],
+  "temporal_correlations": [],
+  "recommended_indexes": [],
+  "total_budget_used": 0,
+  "total_impact": 0
+}root@39837010ada4:/app# cat /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 0
+Unique Query Patterns: 0
+Total Budget: 1000 points
+Budget Used: 0 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+
+TEMPORAL CORRELATIONS:
+
+RECOMMENDED INDEXES (5 max):
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 0
+- Remaining budget: 1000 points
+- Tables optimized: 0
+root@39837010ada4:/app#

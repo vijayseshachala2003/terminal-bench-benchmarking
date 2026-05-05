@@ -1,0 +1,139 @@
+New Terminal Output:
+
+root@edf7e17d37d3:/app# sed -n '1,200p' /app/dns/primary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5301 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-transfer { key "transfer-key"; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-primary.pid";
+};
+
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "PrimarySecretKey12345678901234567890ABCD==";
+};
+
+zone "example.com" {
+    type master;
+    file "/app/dns/primary/zones/example.com.zone";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+zone "secure.example.com" {
+    type master;
+    file "/app/dns/primary/zones/secure.example.com.zone.signed";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-primary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@edf7e17d37d3:/app# sed -n '1,200p' /app/dns/secondary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5302 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-secondary.pid";
+};
+
+; BUG: TSIG key has DIFFERENT secret than primary
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "SecondaryDifferentKey999888777666555==";
+};
+
+server 127.0.0.1 {
+    keys { transfer-key; };
+};
+
+zone "example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+zone "secure.example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/secure.example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-secondary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@edf7e17d37d3:/app# sed -n '1,200p' /app/dns/resolver/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5300 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-recursion { any; };
+    recursion yes;
+    forwarders {
+        127.0.0.1 port 5301;
+    };
+    forward only;
+    dnssec-validation auto;
+    ; BUG: Negative cache TTL way too high
+    max-ncache-ttl 86400;
+    pid-file "/var/run/named/named-resolver.pid";
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-resolver.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@edf7e17d37d3:/app# mkdir -p /app/dns/primary/cache /app/dns/primary/dynamic /app/dns/secondary/cache /app/dns/secondary/dynamic /app/dns/resolver/cache /ap
+p/dns/resolver/dynamic
+root@edf7e17d37d3:/app# grep -nE 'directory|managed-keys-directory|key-directory|include' /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/res
+olver/named.conf
+/app/dns/primary/named.conf:2:    directory "/var/cache/bind";
+/app/dns/secondary/named.conf:2:    directory "/var/cache/bind";
+/app/dns/resolver/named.conf:2:    directory "/var/cache/bind";
+root@edf7e17d37d3:/app# perl -0777 -i -pe 's#directory\s+"/var/cache/bind";#directory "/app/dns/primary/cache";#g; s#managed-keys-directory\s+"/var/cache/bind";
+#managed-keys-directory "/app/dns/primary/dynamic";#g' /app/dns/primary/named.conf
+root@edf7e17d37d3:/app# perl -0777 -i -pe 's#directory\s+"/var/cache/bind";#directory "/app/dns/secondary/cache";#g; s#managed-keys-directory\s+"/var/cache/bind
+";#managed-keys-directory "/app/dns/secondary/dynamic";#g' /app/dns/secondary/named.conf
+root@edf7e17d37d3:/app# perl -0777 -i -pe 's#directory\s+"/var/cache/bind";#directory "/app/dns/resolver/cache";#g; s#managed-keys-directory\s+"/var/cache/bind"
+;#managed-keys-directory "/app/dns/resolver/dynamic";#g' /app/dns/resolver/named.conf
+root@edf7e17d37d3:/app# named-checkconf /app/dns/primary/named.conf && echo OK_primary
+/app/dns/primary/named.conf:14: bad secret 'bad base64 encoding'
+root@edf7e17d37d3:/app# named-checkconf /app/dns/secondary/named.conf && echo OK_secondary
+/app/dns/secondary/named.conf:11: syntax error near ';'
+root@edf7e17d37d3:/app# named-checkconf /app/dns/resolver/named.conf && echo OK_resolver
+/app/dns/resolver/named.conf:13: '}' expected near ';'
+root@edf7e17d37d3:/app# pkill named || true
+root@edf7e17d37d3:/app# named -c /app/dns/primary/named.conf -g >/tmp/named_primary.log 2>&1 &
+[1] 771
+root@edf7e17d37d3:/app# named -c /app/dns/secondary/named.conf -g >/tmp/named_secondary.log 2>&1 &
+[2] 790
+[1]   Exit 1                  named -c /app/dns/primary/named.conf -g > /tmp/named_primary.log 2>&1
+root@edf7e17d37d3:/app# named -c /app/dns/resolver/named.conf -g >/tmp/named_resolver.log 2>&1 &
+[3] 808
+[2]   Exit 1                  named -c /app/dns/secondary/named.conf -g > /tmp/named_secondary.log 2>&1
+root@edf7e17d37d3:/app# sleep 0.5; ss -lntup | grep -E '(:5300|:5301|:5302)'
+[3]+  Exit 1                  named -c /app/dns/resolver/named.conf -g > /tmp/named_resolver.log 2>&1
+root@edf7e17d37d3:/app#

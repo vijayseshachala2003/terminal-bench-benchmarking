@@ -1,0 +1,135 @@
+{
+  "analysis": "Multiple blockers prevent services from starting/working: (1) All three configs set directory \"/var/cache/bind\" which is not writable in this environment, causing named to fail parsing with permission denied. (2) Primary named.conf has a TSIG secret that is not valid base64. (3) Secondary named.conf has a syntax error near ';' (likely due to the 'BUG:' line using ';' comment style incorrectly) and also has a different TSIG secret than primary. (4) Resolver named.conf has a syntax error ('}' expected near ';') likely due to an inline '; BUG:' comment. (5) secure.example.com signed zone file is broken: expired signatures and multiple bad base64 encodings; must be re-signed or switch to unsigned zone + disable DNSSEC (but requirement expects DNSSEC validation to pass, so we should re-sign). example.com zone has glue warnings but loads OK; may still be acceptable but could cause resolution issues for delegated subdomain if queried.",
+  "plan": "1) Fix all named.conf issues: change working directory to a writable path under /app/dns/* (and create it), remove/convert problematic '; BUG:' lines to proper BIND comments, and make TSIG secrets valid base64 and identical on primary+secondary (prefer using existing /app/dns/*/keys/transfer.key if present). 2) Ensure secondary can write its slave zone files: create /app/dns/secondary/zones and use it as directory/zone file path. 3) Regenerate a correct signed zone for secure.example.com: either use dnssec-signzone with fresh keys (generate ZSK/KSK) and update primary to serve the new .signed; then ensure resolver validates (dnssec-validation yes/auto). 4) Restart all named instances and verify: dig SOA/A, AXFR from secondary, run all /app/test_queries.txt via resolver. 5) After clean results, write /app/dns_health.json with zones healthy, issues fixed, transfer status, and dnssec_valid=true.",
+  "commands": [
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/primary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/secondary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/cache /app/dns/secondary/cache /app/dns/resolver/cache /app/dns/secondary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/primary/cache\";#g' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/secondary/cache\";#g' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#directory\\s+\"/var/cache/bind\";#directory \"/app/dns/resolver/cache\";#g' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'BUG:' -n /app/dns/secondary/named.conf /app/dns/resolver/named.conf || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -pi -e 's/^\\s*;\\s*BUG:.*$/\\/\\/ BUG (fixed): removed invalid semicolon-style comment that broke parsing/g' /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cp -f /app/dns/primary/keys/transfer.key /app/dns/secondary/keys/transfer.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[^}]*\\};/include \"\\/app\\/dns\\/primary\\/keys\\/transfer.key\";\\n/s' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[^}]*\\};/include \"\\/app\\/dns\\/secondary\\/keys\\/transfer.key\";\\n/s' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ls -la /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && dnssec-keygen -a ECDSAP256SHA256 -b 256 -n ZONE secure.example.com\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && dnssec-keygen -f KSK -a ECDSAP256SHA256 -b 256 -n ZONE secure.example.com\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && dnssec-signzone -o secure.example.com -N increment -t -S secure.example.com.zone\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntp | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +authority +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1\" \"$2}' /app/test_queries.txt | while read -r t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +noall +answer +authority +comments; done\n",
+      "duration": 6.0
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

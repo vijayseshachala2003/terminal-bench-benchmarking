@@ -1,0 +1,183 @@
+New Terminal Output:
+
+root@d49e8c480943:/app# grep -n "g_retired\|try_reclaim\|abort" -n /app/lockfree_queue.cpp
+36:        if (id >= kMaxThreads) std::abort();
+68:thread_local std::vector<LockFreeQueue::Node*> g_retired;
+71:void try_reclaim() {
+72:    if (g_retired.size() < kScanThreshold) return;
+75:    keep.reserve(g_retired.size());
+77:    for (auto* n : g_retired) {
+84:    g_retired.swap(keep);
+98:    for (auto* n : g_retired) delete n;
+99:    g_retired.clear();
+118:    g_retired.push_back(node);
+119:    try_reclaim();
+root@d49e8c480943:/app# perl -0777 -i -pe 's/thread_local std::vector<LockFreeQueue::Node\*> g_retired;/thread_local std::vector<void*> g_retired;/g; s/std::vec
+tor<LockFreeQueue::Node\*> keep;/std::vector<void*> keep;/g; s/for \(auto\* n : g_retired\)/for (void* n : g_retired)/g; s/keep\.push_back\(n\);/keep.push_back(
+n);/g; s/delete n;/\/\/ deleted by caller\n            keep.push_back(n);/g' /app/lockfree_queue.cpp
+root@d49e8c480943:/app# perl -0777 -i -pe 's/if \(id >= kMaxThreads\) std::abort\(\);/if (id >= kMaxThreads) ::abort();/g' /app/lockfree_queue.cpp
+root@d49e8c480943:/app# perl -0777 -i -pe 's/#include <vector>/#include <vector>\n#include <cstdlib>/g' /app/lockfree_queue.cpp
+root@d49e8c480943:/app# sed -n '1,120p' /app/lockfree_queue.cpp
+#include "lockfree_queue.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <cstdlib>
+
+// Correct Michael-Scott MPMC queue with hazard-pointer reclamation.
+//
+// Key properties:
+//  - Proper acquire/release synchronization between producers and consumers.
+//  - Safe node lifetime: removed nodes are retired and only deleted after no
+//    thread is protecting them with a hazard pointer.
+//  - ABA/pointer-reuse safety: nodes are not freed/reused while any thread may
+//    still hold a reference; this prevents a CAS from succeeding on a recycled
+//    address.
+
+namespace {
+
+constexpr int kMaxThreads = 64;
+constexpr int kHazardPerThread = 2; // head and next
+
+struct HazardDomain {
+    std::atomic<int> next_id{0};
+    std::array<std::array<std::atomic<void*>, kHazardPerThread>, kMaxThreads> hp;
+
+    HazardDomain() {
+        for (auto& row : hp) {
+            for (auto& slot : row) slot.store(nullptr, std::memory_order_relaxed);
+        }
+    }
+
+    int acquire_thread_id() {
+        int id = next_id.fetch_add(1, std::memory_order_relaxed);
+        // In this kata environment we know thread count is small; keep it simple.
+        if (id >= kMaxThreads) ::abort();
+        return id;
+    }
+
+    void set_hp(int tid, int which, void* p) {
+        hp[tid][which].store(p, std::memory_order_release);
+    }
+
+    void clear_hp(int tid, int which) {
+        hp[tid][which].store(nullptr, std::memory_order_release);
+    }
+
+    bool is_hazard(void* p) {
+        for (int t = 0; t < kMaxThreads; ++t) {
+            for (int i = 0; i < kHazardPerThread; ++i) {
+                if (hp[t][i].load(std::memory_order_acquire) == p) return true;
+            }
+        }
+        return false;
+    }
+};
+
+HazardDomain g_domain;
+
+thread_local int g_tid = -1;
+
+int tid() {
+    if (g_tid == -1) g_tid = g_domain.acquire_thread_id();
+    return g_tid;
+}
+
+// Retire list per thread.
+thread_local std::vector<void*> g_retired;
+constexpr size_t kScanThreshold = 256;
+
+void try_reclaim() {
+    if (g_retired.size() < kScanThreshold) return;
+
+    std::vector<void*> keep;
+    keep.reserve(g_retired.size());
+
+    for (void* n : g_retired) {
+        if (g_domain.is_hazard(n)) {
+            keep.push_back(n);
+        } else {
+            // deleted by caller
+            keep.push_back(n);
+        }
+    }
+    g_retired.swap(keep);
+}
+
+} // namespace
+
+LockFreeQueue::LockFreeQueue() {
+    Node* dummy = new Node();
+    head_.store(dummy, std::memory_order_relaxed);
+    tail_.store(dummy, std::memory_order_relaxed);
+    free_list_.store(nullptr, std::memory_order_relaxed);
+}
+
+LockFreeQueue::~LockFreeQueue() {
+    // Best-effort reclamation for the current thread.
+    for (void* n : g_retired) // deleted by caller
+            keep.push_back(n);
+    g_retired.clear();
+
+    // Delete the remaining list starting from head.
+    Node* n = head_.load(std::memory_order_relaxed);
+    while (n) {
+        Node* next = n->next.load(std::memory_order_relaxed);
+        // deleted by caller
+            keep.push_back(n);
+        n = next;
+    }
+}
+
+LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+    // Disable freelist reuse; hazard reclamation handles deletion.
+    (void)free_list_;
+    return new Node(value);
+}
+
+void LockFreeQueue::free_node(Node* node) {
+root@d49e8c480943:/app# perl -0777 -i -pe 's/void try_reclaim\(\) \{[\s\S]*?\n\}/void try_reclaim() {\n    if (g_retired.size() < kScanThreshold) return;\n    s
+td::vector<void*> keep;\n    keep.reserve(g_retired.size());\n    for (void* p : g_retired) {\n        if (g_domain.is_hazard(p)) {\n            keep.push_back(
+p);\n        } else {\n            delete reinterpret_cast<LockFreeQueue::Node*>(p);\n        }\n    }\n    g_retired.swap(keep);\n}\n/sm' /app/lockfree_queue.c
+pp
+root@d49e8c480943:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+lockfree_queue.cpp:80:52: error: 'Node' is a private member of 'LockFreeQueue'
+            delete reinterpret_cast<LockFreeQueue::Node*>(p);
+                                                   ^
+./lockfree_queue.h:19:12: note: declared private here
+    struct Node {
+           ^
+lockfree_queue.cpp:99:13: error: use of undeclared identifier 'keep'
+            keep.push_back(n);
+            ^
+lockfree_queue.cpp:107:13: error: use of undeclared identifier 'keep'
+            keep.push_back(n);
+            ^
+3 errors generated.
+make: *** [Makefile:13: stress_test] Error 1
+root@d49e8c480943:/app# /app/stress_test
+bash: /app/stress_test: No such file or directory
+root@d49e8c480943:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+lockfree_queue.cpp:80:52: error: 'Node' is a private member of 'LockFreeQueue'
+            delete reinterpret_cast<LockFreeQueue::Node*>(p);
+                                                   ^
+./lockfree_queue.h:19:12: note: declared private here
+    struct Node {
+           ^
+lockfree_queue.cpp:99:13: error: use of undeclared identifier 'keep'
+            keep.push_back(n);
+            ^
+lockfree_queue.cpp:107:13: error: use of undeclared identifier 'keep'
+            keep.push_back(n);
+            ^
+3 errors generated.
+make: *** [Makefile:18: stress_test_tsan] Error 1
+root@d49e8c480943:/app# TSAN_OPTIONS='symbolize=0' /app/stress_test_tsan
+bash: /app/stress_test_tsan: No such file or directory
+root@d49e8c480943:/app#

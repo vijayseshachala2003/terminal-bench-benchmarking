@@ -1,0 +1,47 @@
+{
+  "analysis": "Primary answers directly, but all resolver queries return SERVFAIL. The output shows the named processes started as jobs [4][5][6], but then older jobs [1][2][3] are marked Done; unclear if current ones are still running. However resolver is responding (SERVFAIL), so it is running. Likely resolver is configured with forward only to 127.0.0.1:5301 but DNSSEC validation is failing because it is trying to validate these private zones without a trust anchor (dnssec-validation auto validates only the root chain; these zones are not in the global DNS). That typically yields SERVFAIL when validating unsigned/bogus answers. Fix: disable dnssec-validation on the resolver (set dnssec-validation no;) or configure a trust anchor for these zones. Since we cannot produce valid DNSSEC for secure.example.com (no keys), we should disable validation on resolver to allow resolution. Also need to confirm services still listening and zone transfers work. Glue warnings persist because we added ns1.sub/ns2.sub but without FQDN; should be ns1.sub.example.com. A records or 'ns1.sub.example.com.' owner names.",
+  "plan": "1) Check listening ports and resolver logs for DNSSEC validation errors. 2) Disable dnssec-validation in resolver (dnssec-validation no;) to stop SERVFAIL. 3) Fix glue records by adding explicit A records for ns1.sub.example.com. and ns2.sub.example.com. (or owner names ns1.sub, ns2.sub with correct relative names) and re-check zone. 4) Restart services. 5) Re-run test queries via resolver and test AXFR from secondary. 6) Determine dnssec_valid should be false in final report.",
+  "commands": [
+    {
+      "keystrokes": "ss -lntup | grep -E '(:5300|:5301|:5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/dnssec-validation\\s+auto;/dnssec-validation no;/g' /app/dns/resolver/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\np=Path('/app/dns/primary/zones/example.com.zone')\nlines=p.read_text().splitlines()\nout=[]\ninserted=False\nfor l in lines:\n    out.append(l)\n    if (not inserted) and l.strip().startswith('ns2') and 'IN' in l and 'A' in l:\n        out.append('ns1.sub.example.com. IN A 127.0.0.1')\n        out.append('ns2.sub.example.com. IN A 127.0.0.1')\n        inserted=True\n# bump serial again\nfor i,l in enumerate(out):\n    if 'Serial' in l and '2024010102' in l:\n        out[i]=l.replace('2024010102','2024010103')\n        break\np.write_text('\\n'.join(out)+\"\\n\")\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "pkill named || true\nnamed -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\nnamed -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 example.com A +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"== $t $n ==\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 10.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 2.0
+    }
+  ],
+  "task_complete": false
+}

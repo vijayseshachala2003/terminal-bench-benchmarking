@@ -1,0 +1,237 @@
+New Terminal Output:
+
+root@4527829bfcc8:/app# cat > solution.py <<'PY'
+> from __future__ import annotations
+>
+> import re
+>
+> IDX_RE = re.compile(r"^[1-9][0-9]*$")
+> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+>
+> def solve(lines: list[str]) -> str:
+>     def parse_line(line: str) -> tuple[str, str, str, str | None] | None:
+>         parts = line.split(" ")
+>         if len(parts) < 3 or len(parts) > 4:
+>             return None
+>         idx, tx, op = parts[0], parts[1], parts[2]
+>         arg = parts[3] if len(parts) == 4 else None
+>
+>         if not IDX_RE.match(idx):
+>             return None
+>         if not TX_RE.match(tx):
+>             return None
+>
+>         if op in {"BEGIN", "PREPARE", "COMMIT", "ABORT", "END"}:
+>             if arg is not None:
+>                 return None
+>         elif op == "VOTE":
+>             if arg not in {"YES", "NO"}:
+>                 return None
+>         elif op in {"FENCE", "EPOCH"}:
+>             if arg is None or not NONCE_RE.match(arg):
+>                 return None
+>         else:
+>             return None
+>
+>         return idx, tx, op, arg
+>
+>     def h2i(n: str) -> int:
+>         return int(n, 16)
+>
+>     # shard-level epoch monotonicity (poison shard on any non-increasing)
+>     shard_last_epoch: dict[str, int] = {}
+>     shard_poisoned: set[str] = set()
+>
+>     # per-tx facts
+>     txs: set[str] = set()
+>
+>     saw_begin: set[str] = set()
+>     saw_prepare: set[str] = set()
+>     saw_vote: set[str] = set()
+>     saw_commit: set[str] = set()
+>     saw_abort: set[str] = set()
+>     saw_end: set[str] = set()
+>     saw_any_nonepoch_event: set[str] = set()  # any op except EPOCH
+>
+>     vote_kind: dict[str, str] = {}  # YES/NO (if any)
+>
+>     last_fence: dict[str, int] = {}
+>
+>     bad_reason: dict[str, str] = {}
+>
+>     def mark_bad(tx: str, reason: str) -> None:
+>         if tx not in bad_reason:
+>             bad_reason[tx] = reason
+>
+>     # Process valid prefix
+>     for raw in lines:
+>         line = raw.rstrip("\n")
+>         if not line or line.startswith("#"):
+>             continue
+>         parsed = parse_line(line)
+>         if parsed is None:
+>             break
+>         _idx, tx, op, arg = parsed
+>         txs.add(tx)
+>
+>         if op == "EPOCH":
+>             shard = tx[0]
+>             if shard in shard_poisoned:
+>                 continue
+>             v = h2i(arg)  # type: ignore[arg-type]
+>             prev = shard_last_epoch.get(shard)
+>             if prev is None:
+>                 shard_last_epoch[shard] = v
+>             else:
+>                 if v <= prev:
+>                     shard_poisoned.add(shard)
+>                 else:
+>                     shard_last_epoch[shard] = v
+>             continue
+>
+>         saw_any_nonepoch_event.add(tx)
+>
+>         if tx in bad_reason:
+>             # once bad (vote/fence), still ignore further per-tx checks
+>             continue
+>
+>         if op == "BEGIN":
+>             saw_begin.add(tx)
+>         elif op == "PREPARE":
+>             saw_prepare.add(tx)
+>         elif op == "VOTE":
+>             saw_vote.add(tx)
+>             prev = vote_kind.get(tx)
+>             if prev is None:
+>                 vote_kind[tx] = arg  # type: ignore[assignment]
+>             elif prev != arg:
+>                 mark_bad(tx, "BAD_VOTE")
+>         elif op == "COMMIT":
+>             saw_commit.add(tx)
+>             if vote_kind.get(tx) == "NO":
+>                 mark_bad(tx, "BAD_ORDER")
+>         elif op == "ABORT":
+>             saw_abort.add(tx)
+>         elif op == "END":
+>             saw_end.add(tx)
+>         elif op == "FENCE":
+>             v = h2i(arg)  # type: ignore[arg-type]
+>             prev = last_fence.get(tx)
+>             if prev is not None and v <= prev:
+>                 mark_bad(tx, "BAD_FENCE")
+>             else:
+>                 last_fence[tx] = v
+>
+>     # shard poisoning => BAD_EPOCH for all tx in those shards
+>     for tx in txs:
+>         if tx[0] in shard_poisoned:
+>             bad_reason[tx] = "BAD_EPOCH"
+>
+>     # Bespoke irreparable checks based on whole prefix
+>     for tx in txs:
+>         if tx in bad_reason:
+>             continue
+>         has_decision = (tx in saw_commit) or (tx in saw_abort)
+>         if tx in saw_end and not has_decision:
+>             bad_reason[tx] = "BAD_ORDER"
+>             continue
+>         if has_decision and tx not in saw_prepare:
+>             bad_reason[tx] = "BAD_ORDER"
+>             continue
+>         if tx in saw_commit and vote_kind.get(tx) == "NO":
+>             bad_reason[tx] = "BAD_ORDER"
+>             continue
+>
+>     # Compute canonical minimal insertions
+>     ins: list[tuple[str, str, str | None]] = []
+>     for tx in txs:
+>         if tx in bad_reason:
+>             continue
+>
+>         # prerequisites
+>         if tx not in saw_begin and tx in saw_any_nonepoch_event:
+>             ins.append((tx, "BEGIN", None))
+>
+>         # Need PREPARE if any vote or decision/end observed, but PREPARE missing
+>         if tx not in saw_prepare and (tx in saw_vote or tx in saw_commit or tx in saw_abort or tx in saw_end):
+>             ins.append((tx, "PREPARE", None))
+>             # If we inserted PREPARE and BEGIN is missing, BEGIN must be inserted too
+>             if tx not in saw_begin and (tx, "BEGIN", None) not in ins:
+>                 ins.append((tx, "BEGIN", None))
+>
+>         # decision
+>         has_decision = (tx in saw_commit) or (tx in saw_abort)
+>         if not has_decision:
+>             if vote_kind.get(tx) == "NO":
+>                 ins.append((tx, "ABORT", None))
+>             else:
+>                 ins.append((tx, "COMMIT", None))
+>
+>         # end
+>         if tx not in saw_end:
+>             ins.append((tx, "END", None))
+>
+>     bad_lines = [f"BAD {tx} {reason}" for tx, reason in sorted(bad_reason.items())]
+>
+>     ins_sorted = sorted(ins, key=lambda t: (t[0], OP_ORDER[t[1]], "" if t[2] is None else t[2]))
+>     ins_lines = [
+>         f"INS {tx} {op}" + ("" if arg is None else f" {arg}")
+>         for (tx, op, arg) in ins_sorted
+>     ]
+>
+>     out = bad_lines + ins_lines
+>     return "OK" if not out else "\n".join(out)
+> PY
+root@4527829bfcc8:/app# python -m py_compile solution.py
+root@4527829bfcc8:/app# python - <<'PY'
+> from solution import solve
+>
+> def run(inp):
+>     print(solve(inp.splitlines()))
+>     print('---')
+>
+> run('''1 a1 BEGIN
+> 2 a1 PREPARE
+> ''')
+> run('''1 c1 BEGIN
+> 2 c1 PREPARE
+> 3 c1 VOTE YES
+> 4 c1 VOTE NO
+> ''')
+> run('''1 d1 BEGIN
+> 2 d1 END
+> ''')
+> run('''1 a1 BEGIN
+> 2 a1 EPOCH 0000000A
+> 3 a2 BEGIN
+> 4 a2 EPOCH 00000009
+> 5 b1 BEGIN
+> 6 b1 EPOCH 00000001
+> ''')
+> PY
+INS a1 COMMIT
+INS a1 END
+---
+BAD c1 BAD_VOTE
+---
+BAD d1 BAD_ORDER
+---
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 COMMIT
+INS b1 END
+---
+root@4527829bfcc8:/app#

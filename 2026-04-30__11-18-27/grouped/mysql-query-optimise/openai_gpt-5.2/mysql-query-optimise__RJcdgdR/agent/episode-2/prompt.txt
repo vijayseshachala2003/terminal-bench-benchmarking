@@ -1,0 +1,258 @@
+New Terminal Output:
+
+root@3bb0998acaf7:/app# grep -RIn "^USE " /app/mysql_slow_*.log | head -n 20
+root@3bb0998acaf7:/app# python3 - <<'PY'
+> import glob,os,re,json,math
+> from collections import defaultdict,Counter
+> from datetime import datetime,timezone
+>
+> APP='/app'
+> with open(os.path.join(APP,'query_metadata.json')) as f:
+>     meta=json.load(f)
+>
+> budget=float(meta.get('budget',1000))
+> meta_tables=meta.get('tables',{})
+> meta_tables_lc={t.lower():t for t in meta_tables}
+>
+> # --- Slow log parsing ---
+> time_re=re.compile(r'^#\s*Time:\s*(.+)\s*$')
+> qt_re=re.compile(r'^#\s*Query_time:\s*([0-9.]+)\b')
+> setts_re=re.compile(r'^SET\s+timestamp\s*=\s*(\d+)\s*;\s*$',re.I)
+>
+>
+> def parse_time(s):
+>     s=s.strip()
+>     try:
+>         if s.endswith('Z'):
+>             dt=datetime.fromisoformat(s[:-1]).replace(tzinfo=timezone.utc)
+>             return dt.timestamp()
+>         dt=datetime.fromisoformat(s)
+>         if dt.tzinfo is None:
+>             dt=dt.replace(tzinfo=timezone.utc)
+>         return dt.timestamp()
+>     except Exception:
+>         pass
+>     try:
+>         dt=datetime.strptime(s,'%y%m%d %H:%M:%S').replace(tzinfo=timezone.utc)
+>         return dt.timestamp()
+>     except Exception:
+>         return None
+>
+>
+> def extract_relevant_statement(sql_block:str):
+>     # Split on semicolons, drop USE statements and empties; keep last DML/SELECT statement
+>     parts=[p.strip() for p in sql_block.split(';')]
+>     parts=[p for p in parts if p]
+>     # drop USE <db>
+>     parts=[p for p in parts if not re.match(r'^USE\s+\S+\s*$',p,re.I)]
+>     if not parts:
+>         return None
+>     # Prefer last statement that looks like SELECT/INSERT/UPDATE/DELETE
+>     for p in reversed(parts):
+>         if re.match(r'^(SELECT|UPDATE|DELETE|INSERT)\b',p,re.I):
+>             return p
+>     # else return last non-USE statement
+>     return parts[-1] if parts else None
+>
+>
+> def read_slow_logs():
+>     entries=[]
+>     for path in sorted(glob.glob(os.path.join(APP,'mysql_slow_*.log'))):
+>         with open(path,errors='ignore') as f:
+>             cur_time=None
+>             cur_qt=None
+>             cur_setts=None
+>             sql_lines=[]
+>             def flush():
+>                 nonlocal cur_time,cur_qt,cur_setts,sql_lines
+>                 if cur_qt is None or not sql_lines:
+>                     cur_time=None;cur_qt=None;cur_setts=None;sql_lines=[]
+>                     return
+>                 sql=''.join(sql_lines).strip()
+>                 stmt=extract_relevant_statement(sql)
+>                 if stmt:
+>                     ts=cur_setts if cur_setts is not None else cur_time
+>                     entries.append({'ts':0.0 if ts is None else float(ts), 'query_time':float(cur_qt), 'sql':stmt})
+>                 cur_time=None;cur_qt=None;cur_setts=None;sql_lines=[]
+>             for line in f:
+>                 if line.startswith('# Time:'):
+>                     flush()
+>                     m=time_re.match(line)
+>                     if m:
+>                         cur_time=parse_time(m.group(1))
+>                 elif line.startswith('# Query_time:'):
+>                     m=qt_re.match(line)
+>                     if m:
+>                         cur_qt=float(m.group(1))
+>                 elif line.upper().startswith('SET TIMESTAMP'):
+>                     m=setts_re.match(line)
+>                     if m:
+>                         cur_setts=float(m.group(1))
+>                 elif line.startswith('#'):
+>                     continue
+>                 else:
+>                     if line.strip()!='':
+>                         sql_lines.append(line)
+>             flush()
+>     return entries
+>
+> entries=read_slow_logs()
+,{}).items():
+        for > slow=[e for e in entries if e['query_time']>1.0]
+>
+> # --- Normalization ---
+> str_re=re.compile(r"'(?:''|[^'])*'")
+> num_re=re.compile(r"\b\d+(?:\.\d+)?\b")
+> in_re=re.compile(r"\bIN\s*\(\s*([^)]*?)\s*\)",re.I)
+>
+> def normalize_sql(sql):
+>     s=re.sub(r"\s+"," ",sql.strip())
+>     s=in_re.sub("IN (?)", s)
+>     s=str_re.sub("?", s)
+>     s=num_re.sub("?", s)
+>     s=re.sub(r"\s*=\s*"," = ",s)
+>     s=re.sub(r"\s*<\s*"," < ",s)
+>     s=re.sub(r"\s*>\s*"," > ",s)
+>     s=re.sub(r"\s+"," ",s).strip()
+>     return s.upper()
+>
+> slow_norm=[{**e,'pattern':normalize_sql(e['sql'])} for e in slow]
+>
+> # Group patterns
+> pat_stats=defaultdict(lambda: {'frequency':0,'total_time':0.0,'times':[]})
+> for e in slow_norm:
+>     st=pat_stats[e['pattern']]
+>     st['frequency']+=1
+>     st['total_time']+=e['query_time']
+>     st['times'].append(e['ts'])
+>
+> normalized_patterns=[]
+> pat_raw={}
+> for p,st in pat_stats.items():
+>     freq=st['frequency']
+>     total=st['total_time']
+>     avg=total/freq if freq else 0.0
+>     pat_raw[p]=(freq,avg,total)
+>     normalized_patterns.append({'pattern':p,'frequency':freq,'avg_execution_time':round(avg,1),'total_time':round(total,1)})
+> normalized_patterns.sort(key=lambda x:(-x['total_time'], x['pattern']))
+>
+> # --- Extract indexable 
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+>
+> out={
+>   'normalized_patterns':normalized_patterns,
+>   'index_candidates':index_candidates,
+>   'temporal_correlations':corr_top,
+>   'recommended_indexes':sorted(recommended, key=lambda x:(-x['impact_score'], x['table']+"("+",".join(x['columns'])+")")),
+>   'total_budget_used':budget_used,
+>   'total_impact':total_impact
+> }
+> with open(os.path.join(APP,'optimization.json'),'w') as f:
+>     json.dump(out,f,indent=2)
+>
+> # Text report
+>
+> def trunc60(s):
+>     return (s[:60]+'...') if len(s)>60 else s
+>
+> lines=[]
+> lines.append('ADVANCED MYSQL OPTIMIZATION ANALYSIS')
+> lines.append('=====================================')
+> lines.append(f'Total Slow Queries: {len(slow)}')
+> lines.append(f'Unique Query Patterns: {len(normalized_patterns)}')
+> lines.append(f'Total Budget: {int(budget)} points')
+> lines.append(f'Budget Used: {budget_used} points')
+> lines.append('')
+> lines.append('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):')
+> for i,item in enumerate(normalized_patterns[:5],start=1):
+>     p=item['pattern']; freq=item['frequency']; avg=item['avg_execution_time']; total=item['total_time']
+>     smax=round(pattern_smax.get(p,0.0),2)
+>     impact=round(freq*(total/freq if freq else 0.0)*max(smax,0.1),1)
+>     lines.append(f"{i}. {trunc60(p)} (Impact: {impact}, Freq: {freq}, Avg: {avg}s, Total: {total}s)")
+> lines.append('')
+> lines.append('TEMPORAL CORRELATIONS:')
+> if corr_top:
+>     for i,c in enumerate(corr_top,start=1):
+>         lines.append(f"{i}. Pattern Pair (Strength: {c['correlation_strength']}):")
+>         lines.append(f"   - {trunc60(c['pattern1'])}")
+>         lines.append(f"   - {trunc60(c['pattern2'])}")
+> else:
+>     lines.append('1. Pattern Pair (Strength: 0):')
+>     lines.append('   - N/A')
+>     lines.append('   - N/A')
+> lines.append('')
+> lines.append('RECOMMENDED INDEXES (5 max):')
+> rec_sorted=sorted(recommended, key=lambda x:(-x['impact_score'], x['table']+"("+",".join(x['columns'])+")"))
+> if rec_sorted:
+>     for i,r in enumerate(rec_sorted,start=1):
+>         lines.append(f"{i}. {r['table']}({','.join(r['columns'])}) - Impact: {r['impact_score']}, Cost: {r['cost']} [{r['reason']}]"
+>         )
+> else:
+>     lines.append('1. N/A - Impact: 0.0, Cost: 0.0 [high_impact]')
+> lines.append('')
+> lines.append('OPTIMIZATION SUMMARY:')
+> lines.append(f'- Estimated total impact reduction: {total_impact}')
+> lines.append(f'- Remaining budget: {round(budget-budget_used,1)} points')
+> lines.append(f'- Tables optimized: {len(set(r["table"] for r in recommended))}')
+>
+> with open(os.path.join(APP,'recommendations.txt'),'w') as f:
+>     f.write('\n'.join(lines)+'\n')
+>
+> print('REGENERATED outputs without USE statements in patterns')
+> PY
+REGENERATED outputs without USE statements in patterns
+root@3bb0998acaf7:/app# sed -n '1,120p' /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 897.9 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 59.7, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.2, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 5):
+   - SELECT * FROM ORDERS WHERE ID = ?
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+2. Pattern Pair (Strength: 5):
+   - SELECT * FROM USERS WHERE ID = ?
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+3. Pattern Pair (Strength: 4):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREATED...
+
+RECOMMENDED INDEXES (5 max):
+1. users(email) - Impact: 59.7, Cost: 214.9 [high_impact]
+2. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+3. order_items(id) - Impact: 53.2, Cost: 237.6 [high_impact]
+4. users(id) - Impact: 49.9, Cost: 214.6 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 218.0
+- Remaining budget: 102.1 points
+- Tables optimized: 3
+root@3bb0998acaf7:/app# python3 - <<'PY'
+> import json
+> with open('/app/optimization.json') as f:
+>     d=json.load(f)
+> print('Total patterns:',len(d['normalized_patterns']))
+> print('First 3 patterns:')
+> for x in d['normalized_patterns'][:3]:
+>     print('-',x['pattern'][:80])
+> print('Recommended:',len(d['recommended_indexes']))
+> print('Budget used:',d['total_budget_used'])
+> PY
+Total patterns: 18
+First 3 patterns:
+- SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+- SELECT * FROM USERS WHERE EMAIL = ?
+- SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+Recommended: 4
+Budget used: 897.9
+root@3bb0998acaf7:/app#

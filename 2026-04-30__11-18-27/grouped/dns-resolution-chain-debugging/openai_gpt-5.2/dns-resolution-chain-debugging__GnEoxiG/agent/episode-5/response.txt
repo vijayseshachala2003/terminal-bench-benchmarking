@@ -1,0 +1,123 @@
+{
+  "analysis": "Controls are still causing attempts to read /etc/bind/rndc.key and fatal exit. Setting 'controls { };' did not prevent BIND from using the default rndc.key; likely BIND still enables the command channel by default unless 'controls { };' is placed correctly or we must add 'controls { inet ... keys { }; };' with an explicit 'key' stanza, or disable by setting 'controls { };' AND 'include' removal? Easiest: create our own rndc key file readable by named and point controls to it with an explicit 'keys { \"rndc-key\"; };' and define that key in config. Also DNSSEC signing failed because key filename pattern for KSK is wrong: dnssec-keygen outputs Ksecure.example.com.+008+07552.key but doesn't include 'KSK' in filename; need to detect KSK by parsing the .key file flags (257 for KSK, 256 for ZSK) or by using creation order and checking. secure.example.com.zone.signed still missing, so primary will fail loading that zone. Next: create local rndc key via rndc-confgen -a -c /app/dns/<svc>/run/rndc.key and include it or define it, update controls to use that key file; then sign zone selecting correct KSK/ZSK files by reading flags in .key files.",
+  "plan": "1) Generate per-service rndc key files with rndc-confgen and ensure permissions allow named to read them. 2) Add `include \"/app/dns/<svc>/run/rndc.key\";` to each named.conf and set a controls stanza that references the key name in that file (usually \"rndc-key\") on a non-privileged port. This avoids /etc/bind/rndc.key. 3) Fix DNSSEC signing: identify KSK and ZSK by inspecting the generated K*.key files (flags 257=KSK, 256=ZSK), then run dnssec-signzone to produce secure.example.com.zone.signed. 4) Restart all named instances and verify they stay up and listen on 5300/5301/5302. 5) Verify AXFR for both zones, run test queries, check DNSSEC validation (AD flag) via resolver. 6) Write /app/dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/run /app/dns/secondary/run /app/dns/resolver/run\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rndc-confgen -a -c /app/dns/primary/run/rndc.key -k rndc-key -p 9953\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "rndc-confgen -a -c /app/dns/secondary/run/rndc.key -k rndc-key -p 9954\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "rndc-confgen -a -c /app/dns/resolver/run/rndc.key -k rndc-key -p 9955\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "chmod 644 /app/dns/primary/run/rndc.key /app/dns/secondary/run/rndc.key /app/dns/resolver/run/rndc.key\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[\\s\\S]*?\\};\\n/\\ninclude \"\\/app\\/dns\\/primary\\/run\\/rndc.key\";\\ncontrols { inet 127.0.0.1 port 9953 allow { 127.0.0.1; } keys { \"rndc-key\"; }; };\\n/sg' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[\\s\\S]*?\\};\\n/\\ninclude \"\\/app\\/dns\\/secondary\\/run\\/rndc.key\";\\ncontrols { inet 127.0.0.1 port 9954 allow { 127.0.0.1; } keys { \"rndc-key\"; }; };\\n/sg' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ncontrols\\s*\\{[\\s\\S]*?\\};\\n/\\ninclude \"\\/app\\/dns\\/resolver\\/run\\/rndc.key\";\\ncontrols { inet 127.0.0.1 port 9955 allow { 127.0.0.1; } keys { \"rndc-key\"; }; };\\n/sg' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "ls -1 Ksecure.example.com.*.key || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "for f in Ksecure.example.com.*.key; do echo \"--- $f\"; awk '{print \"flags=\" $4 \" proto=\" $5 \" alg=\" $6}' \"$f\"; done\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "KSK=$(awk '$4==257{print FILENAME}' Ksecure.example.com.*.key | head -n1 | sed 's/\\.key$//'); ZSK=$(awk '$4==256{print FILENAME}' Ksecure.example.com.*.key | head -n1 | sed 's/\\.key$//'); echo \"KSK=$KSK\"; echo \"ZSK=$ZSK\"; dnssec-signzone -o secure.example.com -N increment -t -k \"$KSK\" secure.example.com.zone \"$ZSK\"\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | egrep 'status:|flags:|secure\\.example\\.com\\.|RRSIG|DNSKEY' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

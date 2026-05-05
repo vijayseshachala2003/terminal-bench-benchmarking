@@ -1,0 +1,247 @@
+New Terminal Output:
+
+root@6b59a722c62c:/app# wc -l /app/solution.py
+235 /app/solution.py
+root@6b59a722c62c:/app# : > /app/solution.py
+root@6b59a722c62c:/app# cat > /app/solution.py <<'PY'
+> import re
+> from dataclasses import dataclass
+>
+> IDX_RE = re.compile(r"^[1-9][0-9]*$")
+> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OPS_NOARG = {"BEGIN", "PREPARE", "COMMIT", "ABORT", "END"}
+> OPS_WITHARG = {"VOTE", "FENCE", "EPOCH"}
+> ALL_OPS = OPS_NOARG | OPS_WITHARG
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+>
+> def _nonce_int(x: str) -> int:
+>     return int(x, 16)
+>
+>
+> def _malformed(parts: list[str]) -> bool:
+>     if len(parts) < 3:
+>         return True
+>     idx, tx, op = parts[0], parts[1], parts[2]
+>     if IDX_RE.match(idx) is None:
+>         return True
+>     if TX_RE.match(tx) is None:
+>         return True
+>     if op not in ALL_OPS:
+>         return True
+>
+>     if op in OPS_NOARG:
+>         return len(parts) != 3
+>
+>     if len(parts) != 4:
+>         return True
+>     arg = parts[3]
+>     if op == "VOTE":
+>         return arg not in ("YES", "NO")
+>     if op in ("FENCE", "EPOCH"):
+>         return NONCE_RE.match(arg) is None
+>     return True
+>
+>
+> @dataclass
+> class TxInfo:
+>     tx: str
+>     shard: str
+>
+>     saw_begin: bool = False
+>     saw_prepare: bool = False
+>     saw_commit: bool = False
+>     saw_abort: bool = False
+>     saw_end: bool = False
+>
+>     saw_vote: bool = False
+>     vote_kind: str | None = None
+>     bad_vote: bool = False
+>
+>     # whether we observed dependent ops before prerequisites
+>     begin_seen_so_far: bool = False
+>     prepare_seen_so_far: bool = False
+>     need_ins_begin: bool = False
+>     need_ins_prepare: bool = False
+>
+>     # fence monotonicity
+>     last_fence: int | None = None
+>     bad_fence: bool = False
+>
+>
+> def solve(lines: list[str]) -> str:
+>     shard_last_epoch: dict[str, int] = {}
+>     shard_bad_epoch: set[str] = set()
+>
+>     txs: dict[str, TxInfo] = {}
+>
+>     def get_tx(tx: str) -> TxInfo:
+>         info = txs.get(tx)
+>         if info is None:
+>             info = TxInfo(tx=tx, shard=tx[0])
+>             txs[tx] = info
+>         return info
+>
+>     for raw in lines:
+>         line = raw.rstrip("\n")
+>         if not line or line.startswith("#"):
+>             continue
+>
+>         parts = line.split(" ")
+>         if _malformed(parts):
+>             break
+>
+>         tx, op = parts[1], parts[2]
+>         arg = parts[3] if len(parts) == 4 else None
+>
+>         info = get_tx(tx)
+>
+>         if op == "EPOCH":
+>             shard = info.shard
+>             if shard in shard_bad_epoch:
+>                 continue
+>             v = _nonce_int(arg)  # type: ignore[arg-type]
+>             prev = shard_last_epoch.get(shard)
+>             if prev is None:
+>                 shard_last_epoch[shard] = v
+>             elif v <= prev:
+>                 shard_bad_epoch.add(shard)
+>             else:
+>                 shard_last_epoch[shard] = v
+>             continue
+>
+>         if op == "FENCE":
+>             v = _nonce_int(arg)  # type: ignore[arg-type]
+>             if info.last_fence is None:
+>                 info.last_fence = v
+>             elif v <= info.last_fence:
+>                 info.bad_fence = True
+>             else:
+>                 info.last_fence = v
+>             continue
+>
+>         if op == "BEGIN":
+>             info.saw_begin = True
+>             info.begin_seen_so_far = True
+>             continue
+>
+>         if op == "PREPARE":
+>             info.saw_prepare = True
+>             if not info.begin_seen_so_far:
+>                 info.need_ins_begin = True
+>             info.prepare_seen_so_far = True
+>             continue
+>
+>         if op == "VOTE":
+>             info.saw_vote = True
+>             if not info.begin_seen_so_far:
+>                 info.need_ins_begin = True
+>             if not info.prepare_seen_so_far:
+>                 info.need_ins_prepare = True
+>
+>             v = arg  # type: ignore[assignment]
+>             if info.vote_kind is None:
+>                 info.vote_kind = v
+>             elif info.vote_kind != v:
+>                 info.bad_vote = True
+>             continue
+>
+>         if op == "COMMIT":
+>             info.saw_commit = True
+>             continue
+>
+>         if op == "ABORT":
+>             info.saw_abort = True
+>             continue
+>
+>         if op == "END":
+>             info.saw_end = True
+>             continue
+>
+>     bad: dict[str, str] = {}
+>     ins: list[tuple[str, str, str | None]] = []
+>
+>     for tx, info in txs.items():
+>         if info.shard in shard_bad_epoch:
+>             bad[tx] = "BAD_EPOCH"
+>             continue
+>         if info.bad_fence:
+>             bad[tx] = "BAD_FENCE"
+>             continue
+>         if info.bad_vote:
+>             bad[tx] = "BAD_VOTE"
+>             continue
+>
+>         has_decision = info.saw_commit or info.saw_abort
+>
+>         # irreparable cases (spec)
+>         if info.saw_end and not has_decision:
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>         if info.saw_commit and info.vote_kind == "NO":
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>         if has_decision and not info.saw_prepare:
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>
+>         # Determine what we will insert
+>         will_insert_decision = not has_decision
+>         require_prepare = info.saw_vote or will_insert_decision
+>
+>         if (not info.saw_begin) or info.need_ins_begin:
+>             ins.append((tx, "BEGIN", None))
+>
+>         if require_prepare and ((not info.saw_prepare) or info.need_ins_prepare):
+>             ins.append((tx, "PREPARE", None))
+>
+>         if will_insert_decision:
+>             if info.vote_kind == "NO":
+>                 ins.append((tx, "ABORT", None))
+>             else:
+>                 ins.append((tx, "COMMIT", None))
+>
+>         if not info.saw_end:
+>             ins.append((tx, "END", None))
+>
+>     out: list[str] = []
+>     for tx in sorted(bad):
+>         out.append(f"BAD {tx} {bad[tx]}")
+>
+>     def ins_key(t: tuple[str, str, str | None]):
+>         tx, op, arg = t
+>         return (tx, OP_ORDER[op], "" if arg is None else arg)
+>
+>     for tx, op, arg in sorted(ins, key=ins_key):
+>         out.append(f"INS {tx} {op}" if arg is None else f"INS {tx} {op} {arg}")
+>
+>     return "OK" if not out else "\n".join(out)
+> PY
+root@6b59a722c62c:/app# python -m py_compile /app/solution.py
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','
+6 b1 EPOCH 00000001']))"
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO']))"
+BAD c1 BAD_VOTE
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 d1 BEGIN','2 d1 END']))"
+BAD d1 BAD_ORDER
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@6b59a722c62c:/app#

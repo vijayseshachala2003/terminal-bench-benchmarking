@@ -1,0 +1,830 @@
+[?2004hroot@11c624f1cda6:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@11c624f1cda6:/app# clear
+[?2004l[H[J[3J[?2004hroot@11c624f1cda6:/app# ls -la
+[?2004ltotal 0
+drwxr-xr-x. 2 root root  6 Apr 30 09:45 .
+drwxr-xr-x. 1 root root 74 Apr 30 13:57 ..
+[?2004hroot@11c624f1cda6:/app# sed -n '1,200p' solution.py 2>/dev/null || echo 'solution.py missing'
+[?2004lsolution.py missing
+[?2004hroot@11c624f1cda6:/app# cat > solution.py <<'PY'
+[?2004l[?2004h> import re
+[?2004l[?2004h> from collections import defaultdict
+[?2004l[?2004h> 
+[?2004l[?2004h> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+[?2004l[?2004h> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+[?2004l[?2004h> 
+[?2004l[?2004h> OP_ORDER = {
+[?2004l[?2004h>     "BEGIN": 0,
+[?2004l[?2004h>     "PREPARE": 1,
+[?2004l[?2004h>     "VOTE": 2,
+[?2004l[?2004h>     "COMMIT": 3,
+[?2004l[?2004h>     "ABORT": 4,
+[?2004l[?2004h>     "END": 5,
+[?2004l[?2004h>     "FENCE": 6,
+[?2004l[?2004h>     "EPOCH": 7,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> STATE_NEW = "NEW"
+[?2004l[?2004h> STATE_BEGUN = "BEGUN"
+[?2004l[?2004h> STATE_PREPARED = "PREPARED"
+[?2004l[?2004h> STATE_DECIDED_COMMIT = "DECIDED_COMMIT"
+[?2004l[?2004h> STATE_DECIDED_ABORT = "DECIDED_ABORT"
+[?2004l[?2004h> STATE_ENDED = "ENDED"
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _parse_line(line: str):
+[?2004l[?2004h>     """Return (idx:int, tx:str, op:str, arg:str|None) or raise ValueError."""
+[?2004l[?2004h>     parts = line.split(" ")
+[?2004l[?2004h>     if any(p == "" for p in parts):
+[?2004l[?2004h>         # spec says single spaces; but split(" ") would produce '' on multiple spaces
+[?2004l[?2004h>         # treat as malformed
+[?2004l[?2004h>         raise ValueError("bad whitespace")
+[?2004l[?2004h>     if len(parts) < 3:
+[?2004l[?2004h>         raise ValueError("too few fields")
+[?2004l[?2004h>     if len(parts) > 4:
+[?2004lontinue
+            inf[?2004h>         raise ValueError("too many fields")
+[?2004l[?2004h> 
+[?2004l[?2004h>     idx_s, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>     arg = parts[3] if len(parts) == 4 else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not idx_s.isdigit() or int(idx_s) <= 0:
+[?2004l[?2004h>         raise ValueError("bad idx")
+[?2004l[?2004h>     idx = int(idx_s)
+[?2004l[?2004h> 
+[?2004lR[?2004h>     if not TX_RE.fullmatch(tx):
+[?2004l[?2004h>         raise ValueError("bad tx")
+[?2004l[?2004h> 
+[?2004l [?2004h>     if op == "BEGIN":
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("BEGIN arg")
+[?2004l[?2004h>     elif op == "PREPARE":
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("PREPARE arg")
+[?2004l[?2004h>     elif op == "VOTE":
+[?2004l [?2004h>         if arg not in ("YES", "NO"):
+[?2004l[?2004h>             raise ValueError("VOTE arg")
+[?2004l[?2004h>     elif op == "COMMIT":
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("COMMIT arg")
+[?2004l[?2004h>     elif op == "ABORT":
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("ABORT arg")
+[?2004l[?2004h>     elif op == "END":
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("END arg")
+[?2004l[?2004h>     elif op == "FENCE":
+[?2004l[?2004h>         if arg is None or not NONCE_RE.fullmatch(arg):
+[?2004l[?2004h>             raise ValueError("FENCE arg")
+[?2004l[?2004h>     elif op == "EPOCH":
+[?2004l[?2004h>         if arg is None or not NONCE_RE.fullmatch(arg):
+[?2004l[?2004h>             raise ValueError("EPOCH arg")
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         raise ValueError("unknown op")
+[?2004l[?2004h> 
+[?2004l[?2004h>     return idx, tx, op, arg
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class TxInfo:
+[?2004l[?2004h>     __slots__ = (
+[?2004l[?2004h>         "seen",
+[?2004l[?2004h>         "has_begin",
+[?2004l[?2004h>         "has_prepare",
+[?2004l[?2004h>         "has_commit",
+[?2004l[?2004h>         "has_abort",
+[?2004l[?2004h>         "has_end",
+[?2004l[?2004h>         "votes",  # set of observed vote values
+[?2004l[?2004h>         "bad_reason",
+[?2004l[?2004h>         "state",
+[?2004l[?2004h>         "last_fence",  # int or None
+[?2004l[?2004h>     )
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         self.seen = False
+[?2004l[?2004h>         self.has_begin = False
+[?2004l[?2004h>         self.has_prepare = False
+[?2004l[?2004h>         self.has_commit = False
+[?2004l[?2004h>         self.has_abort = False
+[?2004l[?2004h>         self.has_end = False
+[?2004l[?2004h>         self.votes = set()
+[?2004l[?2004h>         self.bad_reason = None
+[?2004l[?2004h>         self.state = STATE_NEW
+[?2004l[?2004h>         self.last_fence = None
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     # 1) Parse valid prefix
+[?2004l[?2004h>     events = []  # list of (tx, op, arg)
+[?2004l[?2004h>     for raw in lines:
+[?2004l[?2004h>         if not raw or raw.startswith("#"):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             _idx, tx, op, arg = _parse_line(raw)
+[?2004l[?2004h>         except ValueError:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2) Shard-level EPOCH monotonicity; mark poisoned shards
+[?2004l[?2004h>     shard_last_epoch = {}
+[?2004l[?2004h>     poisoned_shards = set()
+[?2004l[?2004h>     for tx, op, arg in events:
+[?2004l[?2004h>         if op != "EPOCH":
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         val = int(arg, 16)
+[?2004l[?2004h>         if shard in poisoned_shards:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if shard in shard_last_epoch and val <= shard_last_epoch[shard]:
+[?2004l[?2004h>             poisoned_shards.add(shard)
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         shard_last_epoch[shard] = val
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3) Per-tx scan (ignoring EPOCH for state machine)
+[?2004l[?2004h>     txs = defaultdict(TxInfo)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def mark_bad(tx: str, reason: str):
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         if info.bad_reason is None:
+[?2004l[?2004h>             info.bad_reason = reason
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx, op, arg in events:
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         info.seen = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in poisoned_shards:
+[?2004l[?2004h>             # Still record as seen, but no further processing needed
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if info.bad_reason is not None:
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "EPOCH":
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # FENCE monotonicity (does not change state)
+[?2004l[?2004h>         if op == "FENCE":
+[?2004l[?2004h>             val = int(arg, 16)
+[?2004l[?2004h>             if info.last_fence is not None and val <= info.last_fence:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_FENCE")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.last_fence = val
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Votes: multiple allowed, must agree; only legal in PREPARED state per protocol
+[?2004l[?2004h>         if op == "VOTE":
+[?2004l[?2004h>             # protocol legality check
+[?2004l[?2004h>             if info.state != STATE_PREPARED:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.votes.add(arg)
+[?2004l[?2004h>             if len(info.votes) > 1:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_VOTE")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # State transitions
+[?2004l[?2004h>         if op == "BEGIN":
+[?2004l[?2004h>             if info.state != STATE_NEW:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_BEGUN
+[?2004l[?2004h>             info.has_begin = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "PREPARE":
+[?2004l[?2004h>             if info.state != STATE_BEGUN:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_PREPARED
+[?2004l[?2004h>             info.has_prepare = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "COMMIT":
+[?2004l[?2004h>             # protocol: only from PREPARED and only if all observed votes YES or none
+[?2004l[?2004h>             if info.state != STATE_PREPARED:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             if "NO" in info.votes:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_DECIDED_COMMIT
+[?2004l[?2004h>             info.has_commit = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "ABORT":
+[?2004l[?2004h>             # allowed from BEGUN or PREPARED or DECIDED_ABORT
+[?2004l[?2004h>             if info.state not in (STATE_BEGUN, STATE_PREPARED, STATE_DECIDED_ABORT):
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_DECIDED_ABORT
+[?2004l[?2004h>             info.has_abort = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "END":
+[?2004l[?2004h>             if info.state not in (STATE_DECIDED_COMMIT, STATE_DECIDED_ABORT):
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_ENDED
+[?2004l[?2004h>             info.has_end = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # unreachable due to parser
+[?2004l[?2004h>         mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4) Apply shard poisoning
+[?2004l[?2004h>     for tx, info in list(txs.items()):
+[?2004l[?2004h>         if info.seen and tx[0] in poisoned_shards:
+[?2004l[?2004h>             info.bad_reason = "BAD_EPOCH"
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 5) Canonical minimal insertions for non-bad tx
+[?2004l[?2004h>     bad_lines = []
+[?2004l[?2004h>     ins_lines = []  # tuples (tx, op, arg_or_empty)
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in sorted(txs.keys()):
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         if not info.seen:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if info.bad_reason is not None:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} {info.bad_reason}")
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Irreparable cases (spec section 6) that depend on presence, not necessarily detected above
+[?2004l[?2004h>         has_decision = info.has_commit or info.has_abort
+[?2004l[?2004h>         if info.has_end and not has_decision:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if info.has_commit and "NO" in info.votes:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if has_decision and not info.has_prepare:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Prerequisites insertions based on observed events
+[?2004l[?2004h>         if not info.has_begin:
+[?2004l[?2004h>             # if any non-EPOCH event exists, prerequisites require BEGIN
+[?2004l[?2004h>             # (also if PREPARE/VOTE existed, but would have made it BAD_ORDER earlier)
+[?2004l[?2004h>             ins_lines.append((tx, "BEGIN", None))
+[?2004l[?2004h>             info.has_begin = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         if ("YES" in info.votes or "NO" in info.votes) and not info.has_prepare:
+[?2004l[?2004h>             ins_lines.append((tx, "PREPARE", None))
+[?2004l[?2004h>             info.has_prepare = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         if info.has_prepare is False:
+[?2004l[?2004h>             # If transaction had PREPARE in log, it would be True; otherwise only insert if needed for later
+[?2004l[?2004h>             pass
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Decision handling
+[?2004l[?2004h>         if not has_decision:
+[?2004l[?2004h>             # Need a decision; if not prepared but begun only, ABORT is allowed directly by protocol,
+[?2004l[?2004h>             # but canonical rules say: if any VOTE but no PREPARE before it, insert BEGIN+PREPARE as needed.
+[?2004l[?2004h>             # For no decision by end:
+[?2004l[?2004h>             if "NO" in info.votes:
+[?2004l[?2004h>                 ins_lines.append((tx, "ABORT", None))
+[?2004l[?2004h>                 info.has_abort = True
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 # bespoke default commit
+[?2004l[?2004h>                 # commit requires PREPARE; if missing, it's not an irreparable case unless decision existed.
+[?2004l[?2004h>                 # But to make a valid terminal tx, we must insert PREPARE before COMMIT.
+[?2004l[?2004h>                 if not info.has_prepare:
+[?2004l[?2004h>                     ins_lines.append((tx, "PREPARE", None))
+[?2004l[?2004h>                     info.has_prepare = True
+[?2004l[?2004h>                 ins_lines.append((tx, "COMMIT", None))
+[?2004l[?2004h>                 info.has_commit = True
+[?2004l[?2004h>             has_decision = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         # END handling
+[?2004l[?2004h>         if not info.has_end:
+[?2004l[?2004h>             ins_lines.append((tx, "END", None))
+[?2004l[?2004h>             info.has_end = True
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 6) Sort INS lines canonically
+[?2004l[?2004h>     def ins_key(t):
+[?2004l[?2004h>         tx, op, arg = t
+[?2004l[?2004h>         return (tx, OP_ORDER[op], "" if arg is None else arg)
+[?2004l[?2004h> 
+[?2004l[?2004h>     ins_lines_sorted = sorted(ins_lines, key=ins_key)
+[?2004l[?2004h> 
+[?2004l[?2004h>     out = []
+[?2004l[?2004h>     out.extend(bad_lines)
+[?2004l[?2004h>     for tx, op, arg in ins_lines_sorted:
+[?2004l[?2004h>         if arg is None:
+[?2004l[?2004h>             out.append(f"INS {tx} {op}")
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             out.append(f"INS {tx} {op} {arg}")
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not out:
+[?2004l[?2004h>         return "OK"
+[?2004l[?2004h>     return "\n".join(out)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     import sys
+[?2004l[?2004h>     print(solve(sys.stdin.read().splitlines()))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@11c624f1cda6:/app# python - <<'PY'
+[?2004l[?2004h> from solution import solve
+[?2004l[?2004h> 
+[?2004l[?2004h> # Example 1
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 a1 BEGIN",
+[?2004l[?2004h> "2 a1 EPOCH 0000000A",
+[?2004l[?2004h> "3 a2 BEGIN",
+[?2004l[?2004h> "4 a2 EPOCH 00000009",
+[?2004l[?2004h> "5 b1 BEGIN",
+[?2004l[?2004h> "6 b1 EPOCH 00000001",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> # Example 2
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 c1 BEGIN",
+[?2004l[?2004h> "2 c1 PREPARE",
+[?2004l[?2004h> "3 c1 VOTE YES",
+[?2004l[?2004h> "4 c1 VOTE NO",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> # Example 3
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 d1 BEGIN",
+[?2004l[?2004h> "2 d1 END",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> # Example 4
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 a1 BEGIN",
+[?2004l[?2004h> "2 a1 PREPARE",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> PY
+[?2004lBAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+---
+BAD c1 BAD_VOTE
+---
+BAD d1 BAD_ORDER
+---
+INS a1 COMMIT
+INS a1 END
+[?2004hroot@11c624f1cda6:/app# nl -ba solution.py | sed -n '1,120p'
+[?2004l     1	import re
+     2	from collections import defaultdict
+     3	
+     4	TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+     5	NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+     6	
+     7	OP_ORDER = {
+     8	    "BEGIN": 0,
+     9	    "PREPARE": 1,
+    10	    "VOTE": 2,
+    11	    "COMMIT": 3,
+    12	    "ABORT": 4,
+    13	    "END": 5,
+    14	    "FENCE": 6,
+    15	    "EPOCH": 7,
+    16	}
+    17	
+    18	STATE_NEW = "NEW"
+    19	STATE_BEGUN = "BEGUN"
+    20	STATE_PREPARED = "PREPARED"
+    21	STATE_DECIDED_COMMIT = "DECIDED_COMMIT"
+    22	STATE_DECIDED_ABORT = "DECIDED_ABORT"
+    23	STATE_ENDED = "ENDED"
+    24	
+    25	
+    26	def _parse_line(line: str):
+    27	    """Return (idx:int, tx:str, op:str, arg:str|None) or raise ValueError."""
+    28	    parts = line.split(" ")
+    29	    if any(p == "" for p in parts):
+    30	        # spec says single spaces; but split(" ") would produce '' on multiple spaces
+    31	        # treat as malformed
+    32	        raise ValueError("bad whitespace")
+    33	    if len(parts) < 3:
+    34	        raise ValueError("too few fields")
+    35	    if len(parts) > 4:
+    36	        raise ValueError("too many fields")
+    37	
+    38	    idx_s, tx, op = parts[0], parts[1], parts[2]
+    39	    arg = parts[3] if len(parts) == 4 else None
+    40	
+    41	    if not idx_s.isdigit() or int(idx_s) <= 0:
+    42	        raise ValueError("bad idx")
+    43	    idx = int(idx_s)
+    44	
+    45	    if not TX_RE.fullmatch(tx):
+    46	        raise ValueError("bad tx")
+    47	
+    48	    if op == "BEGIN":
+    49	        if arg is not None:
+    50	            raise ValueError("BEGIN arg")
+    51	    elif op == "PREPARE":
+    52	        if arg is not None:
+    53	            raise ValueError("PREPARE arg")
+    54	    elif op == "VOTE":
+    55	        if arg not in ("YES", "NO"):
+    56	            raise ValueError("VOTE arg")
+    57	    elif op == "COMMIT":
+    58	        if arg is not None:
+    59	            raise ValueError("COMMIT arg")
+    60	    elif op == "ABORT":
+    61	        if arg is not None:
+    62	            raise ValueError("ABORT arg")
+    63	    elif op == "END":
+    64	        if arg is not None:
+    65	            raise ValueError("END arg")
+    66	    elif op == "FENCE":
+    67	        if arg is None or not NONCE_RE.fullmatch(arg):
+    68	            raise ValueError("FENCE arg")
+    69	    elif op == "EPOCH":
+    70	        if arg is None or not NONCE_RE.fullmatch(arg):
+    71	            raise ValueError("EPOCH arg")
+    72	    else:
+    73	        raise ValueError("unknown op")
+    74	
+    75	    return idx, tx, op, arg
+    76	
+    77	
+    78	class TxInfo:
+    79	    __slots__ = (
+    80	        "seen",
+    81	        "has_begin",
+    82	        "has_prepare",
+    83	        "has_commit",
+    84	        "has_abort",
+    85	        "has_end",
+    86	        "votes",  # set of observed vote values
+    87	        "bad_reason",
+    88	        "state",
+    89	        "last_fence",  # int or None
+    90	    )
+    91	
+    92	    def __init__(self):
+    93	        self.seen = False
+    94	        self.has_begin = False
+    95	        self.has_prepare = False
+    96	        self.has_commit = False
+    97	        self.has_abort = False
+    98	        self.has_end = False
+    99	        self.votes = set()
+   100	        self.bad_reason = None
+   101	        self.state = STATE_NEW
+   102	        self.last_fence = None
+   103	
+   104	
+   105	def solve(lines: list[str]) -> str:
+   106	    # 1) Parse valid prefix
+   107	    events = []  # list of (tx, op, arg)
+   108	    for raw in lines:
+   109	        if not raw or raw.startswith("#"):
+   110	            continue
+   111	        try:
+   112	            _idx, tx, op, arg = _parse_line(raw)
+   113	        except ValueError:
+   114	            break
+   115	        events.append((tx, op, arg))
+   116	
+   117	    # 2) Shard-level EPOCH monotonicity; mark poisoned shards
+   118	    shard_last_epoch = {}
+   119	    poisoned_shards = set()
+   120	    for tx, op, arg in events:
+[?2004hroot@11c624f1cda6:/app# cat > solution.py <<'PY'
+[?2004l[?2004h> import re
+[?2004l[?2004h> from collections import defaultdict
+[?2004l[?2004h> 
+[?2004l[?2004h> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+[?2004l[?2004h> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+[?2004l[?2004h> 
+[?2004l[?2004h> OP_ORDER = {
+[?2004l[?2004h>     "BEGIN": 0,
+[?2004l[?2004h>     "PREPARE": 1,
+[?2004l[?2004h>     "VOTE": 2,
+[?2004l [?2004h>     "COMMIT": 3,
+[?2004l[?2004h>     "ABORT": 4,
+[?2004l[?2004h>     "END": 5,
+[?2004l[?2004h>     "FENCE": 6,
+[?2004l[?2004h>     "EPOCH": 7,
+[?2004l[?2004h> }
+[?2004l[?2004h> 
+[?2004l[?2004h> STATE_NEW = "NEW"
+[?2004l[?2004h> STATE_BEGUN = "BEGUN"
+[?2004l[?2004h> STATE_PREPARED = "PREPARED"
+[?2004l[?2004h> STATE_DECIDED_COMMIT = "DECIDED_COMMIT"
+[?2004l[?2004h> STATE_DECIDED_ABORT = "DECIDED_ABORT"
+[?2004l[?2004h> STATE_ENDED = "ENDED"
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def _parse_line(line: str):
+[?2004l[?2004h>     """Return (idx:int, tx:str, op:str, arg:str|None) or raise ValueError."""
+[?2004l[?2004h>     parts = line.split(" ")
+[?2004l[?2004h>     # Enforce single-space separation: split(" ") will create empty tokens if multiple spaces exist.
+[?2004l[?2004h>     if any(p == "" for p in parts):
+[?2004l[?2004h>         raise ValueError("bad whitespace")
+[?2004l[?2004h>     if len(parts) < 3:
+[?2004l[?2004h>         raise ValueError("too few fields")
+[?2004l[?2004h>     if len(parts) > 4:
+[?2004l[?2004h>         raise ValueError("too many fields")
+[?2004l[?2004h> 
+[?2004l[?2004h>     idx_s, tx, op = parts[0], parts[1], parts[2]
+[?2004l[?2004h>     arg = parts[3] if len(parts) == 4 else None
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not idx_s.isdigit():
+[?2004l[?2004h>         raise ValueError("bad idx")
+[?2004l[?2004h>     idx = int(idx_s)
+[?2004l[?2004h>     if idx <= 0:
+[?2004l[?2004h>         raise ValueError("bad idx")
+[?2004l[?2004h> 
+[?2004l[?2004h>     if not TX_RE.fullmatch(tx):
+[?2004l[?2004h>         raise ValueError("bad tx")
+[?2004l[?2004h> 
+[?2004l[?2004h>     if op in ("BEGIN", "PREPARE", "COMMIT", "ABORT", "END"):
+[?2004l[?2004h>         if arg is not None:
+[?2004l[?2004h>             raise ValueError("unexpected arg")
+[?2004l[?2004h>     elif op == "VOTE":
+[?2004l[?2004h>         if arg not in ("YES", "NO"):
+[?2004l[?2004h>             raise ValueError("bad vote")
+[?2004l[?2004h>     elif op in ("FENCE", "EPOCH"):
+[?2004l[?2004h>         if arg is None or not NONCE_RE.fullmatch(arg):
+[?2004l[?2004h>             raise ValueError("bad nonce")
+[?2004l[?2004h>     else:
+[?2004l[?2004h>         raise ValueError("unknown op")
+[?2004l[?2004h> 
+[?2004l[?2004h>     return idx, tx, op, arg
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> class TxInfo:
+[?2004l[?2004h>     __slots__ = (
+[?2004l[?2004h>         "seen",
+[?2004l[?2004h>         "has_begin",
+[?2004l[?2004h>         "has_prepare",
+[?2004l[?2004h>         "has_commit",
+[?2004l[?2004h>         "has_abort",
+[?2004l[?2004h>         "has_end",
+[?2004l[?2004h>         "votes",  # set of observed vote values
+[?2004l[?2004h>         "bad_reason",
+[?2004l[?2004h>         "state",
+[?2004l[?2004h>         "last_fence",  # int|None
+[?2004l[?2004h>     )
+[?2004l[?2004h> 
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         self.seen = False
+[?2004l[?2004h>         self.has_begin = False
+[?2004l         continue[?2004h>         self.has_prepare = False
+[?2004l[?2004h>         self.has_commit = False
+[?2004l[?2004h>         self.has_abort = False
+[?2004l[?2004h>         self.has_end = False
+[?2004l[?2004h>         self.votes = set()
+[?2004l[?2004h>         self.bad_reason = None
+[?2004l[?2004h>         self.state = STATE_NEW
+[?2004l[?2004h>         self.last_fence = None
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> def solve(lines: list[str]) -> str:
+[?2004l[?2004h>     # 1) Parse valid prefix (file order), stop at first malformed non-comment non-empty line.
+[?2004l[?2004h>     events: list[tuple[str, str, str | None]] = []
+[?2004l[?2004h>     for raw in lines:
+[?2004l[?2004h>         if not raw or raw.startswith("#"):
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             _idx, tx, op, arg = _parse_line(raw)
+[?2004l[?2004h>         except ValueError:
+[?2004l[?2004h>             break
+[?2004l[?2004h>         events.append((tx, op, arg))
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 2) Shard-level EPOCH monotonicity (strictly increasing per shard in file order).
+[?2004l[?2004h>     shard_last_epoch: dict[str, int] = {}
+[?2004l[?2004h>     poisoned_shards: set[str] = set()
+[?2004l[?2004h>     for tx, op, arg in events:
+[?2004l[?2004h>         if op != "EPOCH":
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         shard = tx[0]
+[?2004l[?2004h>         if shard in poisoned_shards:
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         val = int(arg, 16)
+[?2004l[?2004h>         prev = shard_last_epoch.get(shard)
+[?2004l[?2004h>         if prev is not None and val <= prev:
+[?2004l[?2004h>             poisoned_shards.add(shard)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             shard_last_epoch[shard] = val
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 3) Per-tx processing (EPOCH ignored for tx state machine)
+[?2004l[?2004h>     txs: defaultdict[str, TxInfo] = defaultdict(TxInfo)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def mark_bad(tx: str, reason: str):
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         if info.bad_reason is None:
+[?2004l[?2004h>             info.bad_reason = reason
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx, op, arg in events:
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         info.seen = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         # shard poisoned => BAD_EPOCH later, no insertions
+[?2004l[?2004h>         if tx[0] in poisoned_shards:
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if info.bad_reason is not None:
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "EPOCH":
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "FENCE":
+[?2004l[?2004h>             val = int(arg, 16)
+[?2004l[?2004h>             if info.last_fence is not None and val <= info.last_fence:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_FENCE")
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 info.last_fence = val
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "BEGIN":
+[?2004l[?2004h>             if info.state != STATE_NEW:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_BEGUN
+[?2004l[?2004h>             info.has_begin = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "PREPARE":
+[?2004l[?2004h>             if info.state != STATE_BEGUN:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_PREPARED
+[?2004l[?2004h>             info.has_prepare = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "VOTE":
+[?2004l[?2004h>             if info.state != STATE_PREPARED:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.votes.add(arg)
+[?2004l[?2004h>             if len(info.votes) > 1:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_VOTE")
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "COMMIT":
+[?2004l[?2004h>             if info.state != STATE_PREPARED:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             if "NO" in info.votes:
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_DECIDED_COMMIT
+[?2004l[?2004h>             info.has_commit = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "ABORT":
+[?2004l[?2004h>             if info.state not in (STATE_BEGUN, STATE_PREPARED, STATE_DECIDED_ABORT):
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_DECIDED_ABORT
+[?2004l[?2004h>             info.has_abort = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if op == "END":
+[?2004l[?2004h>             if info.state not in (STATE_DECIDED_COMMIT, STATE_DECIDED_ABORT):
+[?2004l[?2004h>                 mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             info.state = STATE_ENDED
+[?2004l[?2004h>             info.has_end = True
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # unreachable
+[?2004l[?2004h>         mark_bad(tx, "BAD_ORDER")
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 4) Apply shard poisoning to all seen tx in those shards
+[?2004l[?2004h>     for tx, info in txs.items():
+[?2004l[?2004h>         if info.seen and tx[0] in poisoned_shards:
+[?2004l[?2004h>             info.bad_reason = "BAD_EPOCH"
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 5) Compute canonical minimal insertions
+[?2004l[?2004h>     bad_lines: list[str] = []
+[?2004l[?2004h>     ins: list[tuple[str, str, str | None]] = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     for tx in sorted(txs.keys()):
+[?2004l[?2004h>         info = txs[tx]
+[?2004l[?2004h>         if not info.seen:
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         if info.bad_reason is not None:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} {info.bad_reason}")
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         has_decision = info.has_commit or info.has_abort
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Irreparable cases (spec section 6)
+[?2004l[?2004h>         if info.has_end and not has_decision:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if info.has_commit and "NO" in info.votes:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h>         if has_decision and not info.has_prepare:
+[?2004l[?2004h>             bad_lines.append(f"BAD {tx} BAD_ORDER")
+[?2004l[?2004h>             continue
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Prerequisites
+[?2004l[?2004h>         if not info.has_begin:
+[?2004l[?2004h>             ins.append((tx, "BEGIN", None))
+[?2004l[?2004h>             info.has_begin = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         # If a COMMIT must be inserted later, it requires PREPARE.
+[?2004l[?2004h>         # If votes exist, canonical prerequisites demand PREPARE too.
+[?2004l[?2004h>         if (info.votes and not info.has_prepare):
+[?2004l[?2004h>             ins.append((tx, "PREPARE", None))
+[?2004l[?2004h>             info.has_prepare = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Decision handling
+[?2004l[?2004h>         if not has_decision:
+[?2004l[?2004h>             if "NO" in info.votes:
+[?2004l[?2004h>                 ins.append((tx, "ABORT", None))
+[?2004l[?2004h>                 info.has_abort = True
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 if not info.has_prepare:
+[?2004l[?2004h>                     ins.append((tx, "PREPARE", None))
+[?2004l[?2004h>                     info.has_prepare = True
+[?2004l[?2004h>                 ins.append((tx, "COMMIT", None))
+[?2004l[?2004h>                 info.has_commit = True
+[?2004l[?2004h>             has_decision = True
+[?2004l[?2004h> 
+[?2004l[?2004h>         # END handling
+[?2004l[?2004h>         if not info.has_end:
+[?2004l[?2004h>             ins.append((tx, "END", None))
+[?2004l[?2004h>             info.has_end = True
+[?2004l[?2004h> 
+[?2004l[?2004h>     # 6) Output ordering
+[?2004l[?2004h>     bad_lines.sort(key=lambda s: s.split(" ")[1])
+[?2004l[?2004h> 
+[?2004l[?2004h>     def ins_key(t):
+[?2004l[?2004h>         tx, op, arg = t
+[?2004l[?2004h>         return (tx, OP_ORDER[op], "" if arg is None else arg)
+[?2004l[?2004h> 
+[?2004l[?2004h>     ins.sort(key=ins_key)
+[?2004l[?2004h> 
+[?2004l[?2004h>     out: list[str] = []
+[?2004l[?2004h>     out.extend(bad_lines)
+[?2004l[?2004h>     for tx, op, arg in ins:
+[?2004l[?2004h>         out.append(f"INS {tx} {op}" if arg is None else f"INS {tx} {op} {arg}")
+[?2004l[?2004h> 
+[?2004l[?2004h>     return "OK" if not out else "\n".join(out)
+[?2004l[?2004h> 
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     import sys
+[?2004l[?2004h>     print(solve(sys.stdin.read().splitlines()))
+[?2004l[?2004h> PY
+[?2004l[?2004hroot@11c624f1cda6:/app# python -m py_compile solution.py
+[?2004l[?2004hroot@11c624f1cda6:/app# python - <<'PY'
+[?2004l[?2004h> from solution import solve
+[?2004l[?2004h> 
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 a1 BEGIN",
+[?2004l[?2004h> "2 a1 EPOCH 0000000A",
+[?2004l[?2004h> "3 a2 BEGIN",
+[?2004l[?2004h> "4 a2 EPOCH 00000009",
+[?2004l[?2004h> "5 b1 BEGIN",
+[?2004l[?2004h> "6 b1 EPOCH 00000001",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 c1 BEGIN",
+[?2004l[?2004h> "2 c1 PREPARE",
+[?2004l[?2004h> "3 c1 VOTE YES",
+[?2004l[?2004h> "4 c1 VOTE NO",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 d1 BEGIN",
+[?2004l[?2004h> "2 d1 END",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> print('---')
+[?2004l[?2004h> lines = [
+[?2004l[?2004h> "1 a1 BEGIN",
+[?2004l[?2004h> "2 a1 PREPARE",
+[?2004l[?2004h> ]
+[?2004l[?2004h> print(solve(lines))
+[?2004l[?2004h> PY
+[?2004lBAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 PREPARE
+INS b1 COMMIT
+INS b1 END
+---
+BAD c1 BAD_VOTE
+---
+BAD d1 BAD_ORDER
+---
+INS a1 COMMIT
+INS a1 END
+[?2004hroot@11c624f1cda6:/app# 

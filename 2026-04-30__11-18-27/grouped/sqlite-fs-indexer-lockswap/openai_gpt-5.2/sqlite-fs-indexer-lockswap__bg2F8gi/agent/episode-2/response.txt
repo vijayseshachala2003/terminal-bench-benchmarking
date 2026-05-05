@@ -1,0 +1,19 @@
+{
+  "analysis": "indexer.py was written and compiles. pytest is not available in the environment (command not found), so we need to run tests via python -m pytest if installed as a module, or otherwise just do basic self-checks (import, run build_index on a small tree, verify SQLite schema and integrity_check). Also, the earlier ls used a bad flag; not relevant.",
+  "plan": "1) Try running tests with `python -m pytest` (often pytest is installed as a module even if the entrypoint isn't). 2) If not available, perform functional checks: create a small test tree under /data, run build_index into /output, then query SQLite for schema, row ordering, and run PRAGMA integrity_check. 3) Also do a quick concurrent run using background python processes to ensure no 'database is locked' and DB remains readable.",
+  "commands": [
+    {
+      "keystrokes": "python -m pytest -q /tests/test_outputs.py\n",
+      "duration": 60.0
+    },
+    {
+      "keystrokes": "python - <<'PY'\nimport os, sqlite3, tempfile, shutil\nfrom app.indexer import build_index\n\nroot = '/data/indexer_smoke'\ndb = '/output/index_smoke.sqlite3'\nshutil.rmtree(root, ignore_errors=True)\nos.makedirs(root, exist_ok=True)\n\nwith open(os.path.join(root,'a.txt'),'wb') as f: f.write(b'hello')\nos.makedirs(os.path.join(root,'sub'), exist_ok=True)\nwith open(os.path.join(root,'sub','b.bin'),'wb') as f: f.write(b'\\x00\\x01')\n\n# symlink should be ignored\ntry:\n    os.symlink(os.path.join(root,'a.txt'), os.path.join(root,'link_to_a'))\nexcept OSError:\n    pass\n\nbuild_index(root, db)\n\ncon = sqlite3.connect(db)\nprint('tables:', con.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall())\nprint('schema:', con.execute(\"PRAGMA table_info(files)\").fetchall())\nprint('rows:', con.execute(\"SELECT path, sha256, size FROM files ORDER BY path\").fetchall())\nprint('integrity:', con.execute(\"PRAGMA integrity_check\").fetchone())\ncon.close()\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python - <<'PY'\nimport os, sqlite3, shutil, subprocess, sys, time\n\nroot = '/data/indexer_conc'\ndb = '/output/index_conc.sqlite3'\nshutil.rmtree(root, ignore_errors=True)\nos.makedirs(root, exist_ok=True)\nfor i in range(50):\n    with open(os.path.join(root, f'f{i:03d}.txt'),'wb') as f:\n        f.write((str(i)*1000).encode())\n\nprocs = []\nfor _ in range(8):\n    procs.append(subprocess.Popen([sys.executable, '-c',\n        'from app.indexer import build_index; build_index(\"/data/indexer_conc\",\"/output/index_conc.sqlite3\")'\n    ]))\n\nrcs = [p.wait() for p in procs]\nprint('rcs', rcs)\n\ncon = sqlite3.connect(db)\nprint('integrity:', con.execute('PRAGMA integrity_check').fetchone())\nprint('count:', con.execute('SELECT COUNT(*) FROM files').fetchone())\ncon.close()\nPY\n",
+      "duration": 10.0
+    }
+  ],
+  "task_complete": false
+}

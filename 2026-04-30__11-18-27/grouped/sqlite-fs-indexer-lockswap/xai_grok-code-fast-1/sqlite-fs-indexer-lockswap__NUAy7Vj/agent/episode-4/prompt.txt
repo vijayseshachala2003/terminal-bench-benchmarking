@@ -1,0 +1,80 @@
+New Terminal Output:
+
+root@6cb167e31d66:/app# cat > /app/app/indexer.py << 'EOF'
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+>
+> def _normalize_path(path):
+>     return unicodedata.normalize('NFC', path.replace(os.sep, '/'))
+>
+> def _read_ignore_patterns():
+>     ignore_path = '/data/ignore.txt'
+>     patterns = []
+>     if os.path.exists(ignore_path):
+>         with open(ignore_path, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip()
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 patterns.append(_normalize_path(line))
+>     return patterns
+>
+> def _matches_pattern(rel_path, pattern):
+>     if pattern.startswith('/'):
+>         pattern = pattern[1:]
+>         return rel_path == pattern
+>     if '/' not in pattern:
+>         return any(comp == pattern for comp in rel_path.split('/'))
+>     # Contains / but not leading
+>     if rel_path == pattern or rel_path.endswith('/' + pattern):
+>         return True
+>     if pattern in rel_path:
+>         idx = rel_path.find(pattern)
+>         return idx > 0 and rel_path[idx-1] == '/'
+>     return False
+>
+> def _should_ignore(rel_path, patterns):
+>     return any(_matches_pattern(rel_path, p) for p in patterns)
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     patterns = _read_ignore_patterns()
+>     files = {}
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         for name in filenames:
+>             fullpath = os.path.join(dirpath, name)
+>             if os.path.islink(fullpath):
+>                 continue
+>             try:
+>                 rel_path = os.path.relpath(fullpath, root_dir)
+>                 nfc_rel_path = _normalize_path(rel_path)
+>                 if _should_ignore(nfc_rel_path, patterns):
+>                     continue
+>                 with open(fullpath, 'rb') as f:
+>                     data = f.read()
+>                 sha256 = hashlib.sha256(data).hexdigest()
+>                 size = len(data)
+>                 original = rel_path
+>                 key = nfc_rel_path
+>                 if key not in files or original > files[key][0]:
+>                     files[key] = (original, sha256, size)
+>             except (OSError, IOError):
+>                 continue
+>     # Sort for deterministic order
+>     sorted_files = sorted(files.items())
+>     conn = sqlite3.connect(db_path)
+>     conn.execute('PRAGMA journal_mode=WAL')
+>     conn.execute('PRAGMA synchronous=NORMAL')
+>     conn.execute('PRAGMA busy_timeout=30000')
+>     conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')
+>     for path, (orig, sha, sz) in sorted_files:
+>         conn.execute('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)', (path, sha, sz))
+>     conn.commit()
+>     conn.close()
+> EOF
+root@6cb167e31d66:/app# python3 -c "import app.indexer; print('Import successful')"
+Import successful
+root@6cb167e31d66:/app# cd /app && python3 -m pytest /tests/test_outputs.py -v
+/usr/local/bin/python3: No module named pytest
+root@6cb167e31d66:/app#

@@ -1,0 +1,145 @@
+New Terminal Output:
+
+root@9492a36ab7f6:/app# cat > /app/lockfree_queue.h <<'EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         uint64_t value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     std::atomic<Node*> head_;
+>     std::atomic<Node*> tail_;
+> };
+>
+> #endif
+> EOF
+root@9492a36ab7f6:/app# cat > /app/lockfree_queue.cpp <<'EOF'
+> #include "lockfree_queue.h"
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(dummy, std::memory_order_relaxed);
+>     tail_.store(dummy, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // All concurrent operations must be finished before destruction.
+>     // Reclaim all nodes reachable from head_.
+>     Node* node = head_.load(std::memory_order_relaxed);
+>     while (node) {
+>         Node* next = node->next.load(std::memory_order_relaxed);
+>         delete node;
+>         node = next;
+>     }
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = new Node(value);
+>
+>     while (true) {
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail->next.load(std::memory_order_acquire);
+>
+>         if (tail == tail_.load(std::memory_order_acquire)) {
+>             if (next == nullptr) {
+>                 // Publish the new node with release so its contents are visible.
+>                 if (tail->next.compare_exchange_weak(
+>                         next, new_node,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed)) {
+>                     // Best-effort tail swing.
+>                     tail_.compare_exchange_weak(
+>                         tail, new_node,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed);
+>                     return;
+>                 }
+>             } else {
+>                 // Tail is behind, advance it.
+>                 tail_.compare_exchange_weak(
+>                     tail, next,
+>                     std::memory_order_release,
+>                     std::memory_order_relaxed);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         Node* head = head_.load(std::memory_order_acquire);
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head->next.load(std::memory_order_acquire);
+>
+>         if (head == head_.load(std::memory_order_acquire)) {
+>             if (head == tail) {
+>                 if (next == nullptr) {
+>                     return false;
+>                 }
+>                 // Tail is behind, advance it.
+>                 tail_.compare_exchange_weak(
+>                     tail, next,
+>                     std::memory_order_release,
+>                     std::memory_order_relaxed);
+>             } else {
+>                 // Move head first; after success, next is the dequeued node.
+>                 if (head_.compare_exchange_weak(
+>                         head, next,
+>                         std::memory_order_release,
+>                         std::memory_order_relaxed)) {
+>                     value = next->value;
+>                     // Nodes are reclaimed in the destructor to avoid lifetime
+>                     // hazards and ABA issues under pointer reuse.
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> EOF
+root@9492a36ab7f6:/app# grep -n "Total operations" -n /app/stress_test.cpp && grep -n "10000000\|5000000" /app/stress_test.cpp | head
+75:    std::cout << "Total operations: " << (NUM_PRODUCERS * OPS_PER_THREAD) << std::endl;
+root@9492a36ab7f6:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@9492a36ab7f6:/app# /app/stress_test
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 2225 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@9492a36ab7f6:/app#

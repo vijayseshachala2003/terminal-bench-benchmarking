@@ -1,0 +1,135 @@
+{
+  "analysis": "Resolver config syntax is fixed, but named still exits due to permission issues writing pid-file under /var/run and session.key under /run, and trying to read /etc/bind/rndc.key / logging. Same will affect primary/secondary since their pid-file paths are also under /var/run. TSIG attempt failed: dnssec-keygen doesn’t accept 'HMAC-SHA256' as algorithm name here, so TSIG_SECRET became empty, and key blocks now have empty secrets (named-checkconf currently passes, but TSIG will not work and is insecure). DNSSEC keygen for zone worked, but signing step not yet run. Need to: move pid-file paths to writable /app/dns/*/run/*.pid, disable/adjust controls block to avoid /etc/bind/rndc.key, set session-keyfile to writable path, and generate a valid TSIG secret via tsig-keygen (or dnssec-keygen with correct algo name) and set it in both primary/secondary. Then sign secure zone, restart, test AXFR, queries, and DNSSEC validation, and write report.",
+  "plan": "1) Update all three named.conf: set pid-file to /app/dns/<svc>/run/named.pid; add session-keyfile to writable location; disable controls or point it to a local rndc key to avoid /etc/bind/rndc.key permission errors; optionally remove logging-to-file since -g is used anyway. 2) Create run directories. 3) Generate TSIG key using tsig-keygen -a hmac-sha256 transfer-key and extract the base64 secret; apply same secret to both primary and secondary key blocks and key files. 4) Complete DNSSEC signing for secure.example.com and ensure primary serves the newly signed zone. 5) Start primary/secondary/resolver and verify listeners. 6) Test AXFR from secondary for both zones, run all queries in /app/test_queries.txt against resolver, and verify DNSSEC validation (AD flag) for secure.example.com via resolver. 7) Write /app/dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/run /app/dns/secondary/run /app/dns/resolver/run\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#pid-file\\s+\"/var/run/named/named-primary\\.pid\";#pid-file \"/app/dns/primary/run/named.pid\";\\n    session-keyfile \"/app/dns/primary/run/session.key\";#g' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#pid-file\\s+\"/var/run/named/named-secondary\\.pid\";#pid-file \"/app/dns/secondary/run/named.pid\";\\n    session-keyfile \"/app/dns/secondary/run/session.key\";#g' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#pid-file\\s+\"/var/run/named/named-resolver\\.pid\";#pid-file \"/app/dns/resolver/run/named.pid\";\\n    session-keyfile \"/app/dns/resolver/run/session.key\";#g' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "grep -n 'controls' -n /app/dns/resolver/named.conf || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "printf '\\ncontrols { inet 127.0.0.1 port 9953 allow { 127.0.0.1; }; };\\n' >> /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "printf '\\ncontrols { inet 127.0.0.1 port 9954 allow { 127.0.0.1; }; };\\n' >> /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "printf '\\ncontrols { inet 127.0.0.1 port 9955 allow { 127.0.0.1; }; };\\n' >> /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "TSIG_BLOCK=$(tsig-keygen -a hmac-sha256 transfer-key); echo \"$TSIG_BLOCK\" > /app/dns/primary/keys/transfer.key; echo \"$TSIG_BLOCK\" > /app/dns/secondary/keys/transfer.key; TSIG_SECRET=$(echo \"$TSIG_BLOCK\" | awk -F'\"' '/secret/{print $2}'); echo \"TSIG_SECRET_len=${#TSIG_SECRET}\"\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[\\s\\S]*?\\};/key \"transfer-key\" {\\n    algorithm hmac-sha256;\\n    secret \"'\"$TSIG_SECRET\"'\";\\n};/m' /app/dns/primary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/key\\s+\"transfer-key\"\\s*\\{[\\s\\S]*?\\};/key \"transfer-key\" {\\n    algorithm hmac-sha256;\\n    secret \"'\"$TSIG_SECRET\"'\";\\n};/m' /app/dns/secondary/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSK=$(ls Ksecure.example.com.*KSK*.key | sed 's/\\.key$//' | head -n1); ZSK=$(ls Ksecure.example.com.*.key | grep -v KSK | sed 's/\\.key$//' | head -n1); dnssec-signzone -o secure.example.com -N increment -t -k \"$KSK\" secure.example.com.zone \"$ZSK\"\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | egrep 'status:|flags:|secure\\.example\\.com\\.|RRSIG|DNSKEY' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named-secondary.log\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named-resolver.log\n",
+      "duration": 0.2
+    }
+  ],
+  "task_complete": false
+}

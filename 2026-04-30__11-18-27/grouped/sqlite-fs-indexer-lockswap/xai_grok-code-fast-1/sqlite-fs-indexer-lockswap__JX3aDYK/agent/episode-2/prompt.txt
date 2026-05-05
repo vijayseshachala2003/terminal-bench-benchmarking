@@ -1,0 +1,145 @@
+Current terminal state:
+New Terminal Output:
+
+root@cf20e805edb6:/app# cat > app/indexer.py << 'EOF'
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import fcntl
+> from typing import List, Tuple
+>
+> IGNORE_PATH = '/data/ignore.txt'
+>
+> class IgnoreMatcher:
+>     def __init__(self, ignore_path: str):
+>         self.patterns = []
+>         if os.path.exists(ignore_path):
+>             with open(ignore_path, 'r', encoding='utf-8', errors='ignore') as f:
+>                 for line in f:
+>                     line = line.strip()
+>                     if not line or line.startswith('#'):
+>                         continue
+>                     self.patterns.append(unicodedata.normalize('NFC', line))
+>
+>     def matches(self, rel_path: str) -> bool:
+>         if not self.patterns:
+>             return False
+>         for pattern in self.patterns:
+>             if self._match_pattern(rel_path, pattern):
+>                 return True
+>         return False
+>
+>     def _match_pattern(self, path: str, pattern: str) -> bool:
+>         if pattern.startswith('/'):
+>             return self._fnmatch(path, pattern[1:])
+>         elif '/' not in pattern:
+>             return any(self._fnmatch(comp, pattern) for comp in path.split('/'))
+>         else:
+>             if self._fnmatch(path, pattern):
+>                 return True
+>             for i in range(len(path)):
+>                 if path[i] == '/' and self._fnmatch(path[i+1:], pattern):
+>                     return True
+>             return False
+>
+>     def _fnmatch(self, text: str, pattern: str) -> bool:
+>         # Simple implementation: replace ** with \*\* to treat as literal, * with [^/]*
+>         import re
+>         pattern = re.escape(pattern).replace(r'\*\*', '\*\*')  # ** literal
+>         pattern = pattern.replace(r'\*', '[^/]*')
+>         return bool(re.fullmatch(pattern, text))
+>
+> def normalize_path(p: str) -> str:
+>     return unicodedata.normalize('NFC', p)
+>
+> def get_relative_path(full_path: str, root: str) -> str:
+>     rel = os.path.relpath(full_path, root)
+>     if os.sep == '\\':
+>         rel = rel.replace('\\', '/')
+>     return rel
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     root_dir = os.path.abspath(root_dir)
+>     db_path = os.path.abspath(db_path)
+>     matcher = IgnoreMatcher(IGNORE_PATH)
+>
+>     # Collect all entries
+>     entries = []
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         for name in filenames + dirnames:
+>             full_path = os.path.join(dirpath, name)
+>             if os.path.islink(full_path):
+>                 continue  # Ignore symlinks
+>             rel_path = get_relative_path(full_path, root_dir)
+>             if rel_path == '.':
+>                 continue
+>             if os.path.isdir(full_path) and name in dirnames:
+>                 continue  # Handled by walk
+>             entries.append((rel_path, full_path))
+>
+>     # Normalize and group by NFC path
+>     groups = {}
+>     for rel_path, full_path in entries:
+>         nfc_path = normalize_path(rel_path)
+>         if nfc_path not in groups:
+>             groups[nfc_path] = []
+>         groups[nfc_path].append((rel_path, full_path))
+>
+>     # For each group, select the one with largest original rel_path
+>     selected = []
+>     for nfc_path, items in groups.items():
+>         if os.path.isfile(items[0][1]):
+>             # Only files
+>             selected_rel = max(items, key=lambda x: x[0])[0]
+>             selected_full = next(full for rel, full in items if rel == selected_rel)
+>             selected.append((nfc_path, selected_full))
+>
+>     # Filter ignores
+>     filtered = []
+>     for nfc_path, full_path in selected:
+>         if not matcher.matches(nfc_path):
+>             filtered.append((nfc_path, full_path))
+>
+>     # Sort by path for determinism
+>     filtered.sort(key=lambda x: x[0])
+>
+>     # Build index
+>     with open(db_path, 'a'):  # Create if not exists
+>         pass
+>     conn = sqlite3.connect(db_path)
+>     try:
+>         conn.execute('PRAGMA journal_mode=WAL')
+>         conn.execute('PRAGMA synchronous=NORMAL')
+>         conn.execute('PRAGMA temp_store=MEMORY')
+>         conn.execute('PRAGMA mmap_size=268435456')
+>         conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')
+>
+>         # Lock the db file for exclusive access
+>         with open(db_path, 'r+b') as f:
+>             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+>
+>             for nfc_path, full_path in filtered:
+>                 try:
+>                     with open(full_path, 'rb') as file:
+>                         hasher = hashlib.sha256()
+>                         size = 0
+>                         while chunk := file.read(8192):
+>                             hasher.update(chunk)
+>                             size += len(chunk)
+>                         sha256 = hasher.hexdigest()
+>                         conn.execute('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)', (nfc_path, sha256, size))
+>                 except (OSError, IOError):
+>                     continue  # Skip unreadable files
+>             conn.commit()
+>     finally:
+>         conn.close()
+> EOF
+root@cf20e805edb6:/app# python3 -c "import app.indexer; print('Import successful')"
+/app/app/indexer.py:45: SyntaxWarning: invalid escape sequence '\*'
+  pattern = re.escape(pattern).replace(r'\*\*', '\*\*')  # ** literal
+Import successful
+root@cf20e805edb6:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

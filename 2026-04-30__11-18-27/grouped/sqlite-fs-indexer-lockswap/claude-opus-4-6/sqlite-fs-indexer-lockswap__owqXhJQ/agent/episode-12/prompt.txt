@@ -1,0 +1,255 @@
+New Terminal Output:
+
+root@9ab2e6980c83:/app# python3 << 'TESTEOF'
+> import os, sys, sqlite3, tempfile, shutil
+> sys.path.insert(0, '/app')
+> from app.indexer import build_index
+>
+> def test_determinism():
+>     """Two runs produce identical results."""
+>     d = tempfile.mkdtemp()
+>     out = tempfile.mkdtemp()
+>     try:
+>         os.makedirs(os.path.join(d, 'b'))
+>         os.makedirs(os.path.join(d, 'a'))
+>         with open(os.path.join(d, 'b', 'z.txt'), 'w') as f:
+>             f.write('z')
+>         with open(os.path.join(d, 'a', 'y.txt'), 'w') as f:
+>             f.write('y')
+>         with open(os.path.join(d, 'c.txt'), 'w') as f:
+>             f.write('c')
+>
+>         db1 = os.path.join(out, 'test1.db')
+>         db2 = os.path.join(out, 'test2.db')
+>         build_index(d, db1)
+>         build_index(d, db2)
+>
+>         conn1 = sqlite3.connect(db1)
+>         conn2 = sqlite3.connect(db2)
+>         rows1 = conn1.execute('SELECT * FROM files ORDER BY path').fetchall()
+>         rows2 = conn2.execute('SELECT * FROM files ORDER BY path').fetchall()
+>         conn1.close()
+>         conn2.close()
+>
+>         assert rows1 == rows2, f'Runs differ:\n{rows1}\n{rows2}'
+>         print(f'PASS: determinism test ({len(rows1)} rows)')
+>     finally:
+>         shutil.rmtree(d)
+>         shutil.rmtree(out)
+>
+> test_determinism()
+> TESTEOF
+PASS: determinism test (3 rows)
+root@9ab2e6980c83:/app# cat /app/app/indexer.py
+import os
+import hashlib
+import sqlite3
+import unicodedata
+import tempfile
+
+
+def _load_ignore_patterns(ignore_path="/data/ignore.txt"):
+    """Load ignore patterns from file. Returns list of NFC-normalized pattern strings."""
+    patterns = []
+    try:
+        with open(ignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n").rstrip("\r")
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pat = unicodedata.normalize("NFC", line.strip())
+                patterns.append(pat)
+    except (FileNotFoundError, OSError):
+        pass
+    return patterns
+
+
+def _glob_match(text, pat, ti, pi):
+    """
+    Glob match where single '*' matches zero or more non-'/' characters.
+    '**' in the pattern matches two literal '*' characters in the text.
+    No other wildcards are recognized.
+    """
+    while pi < len(pat) and ti < len(text):
+        if pat[pi] == '*':
+            if pi + 1 < len(pat) and pat[pi + 1] == '*':
+                # '**' matches literal '**' in text
+                if text[ti] == '*' and ti + 1 < len(text) and text[ti + 1] == '*':
+                    ti += 2
+                    pi += 2
+                    continue
+                else:
+                    return False
+            else:
+                # Single '*' - matches zero or more non-'/' chars
+                for k in range(ti, len(text) + 1):
+                    if k > ti and text[k - 1] == '/':
+                        break
+                    if _glob_match(text, pat, k, pi + 1):
+                        return True
+                return False
+        elif text[ti] == pat[pi]:
+            ti += 1
+            pi += 1
+        else:
+            return False
+
+    # Consume trailing single '*' that can match empty
+    while pi < len(pat) and pat[pi] == '*':
+        if pi + 1 < len(pat) and pat[pi + 1] == '*':
+            break
+        pi += 1
+
+    return ti == len(text) and pi == len(pat)
+
+
+def _match_pattern(rel_path, pattern):
+    """
+    Match a relative path against a single ignore pattern.
+    """
+    if pattern.startswith('/'):
+        clean_pattern = pattern[1:]
+        return _glob_match(rel_path, clean_pattern, 0, 0)
+    elif '/' not in pattern:
+        components = rel_path.split('/')
+        for comp in components:
+            if _glob_match(comp, pattern, 0, 0):
+                return True
+        return False
+    else:
+        if _glob_match(rel_path, pattern, 0, 0):
+            return True
+        idx = 0
+        while True:
+            idx = rel_path.find('/', idx)
+            if idx == -1:
+                break
+            suffix = rel_path[idx + 1:]
+            if _glob_match(suffix, pattern, 0, 0):
+                return True
+            idx += 1
+        return False
+
+
+def _should_ignore(rel_path_nfc, patterns):
+    """Check if a NFC-normalized relative path should be ignored."""
+    for pattern in patterns:
+        if _match_pattern(rel_path_nfc, pattern):
+            return True
+    return False
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash of a file. Returns lowercase hex string."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+
+    ignore_patterns = _load_ignore_patterns()
+
+    root_dir = os.path.abspath(root_dir)
+
+    # Collect all files: {nfc_rel_path: (original_rel_path, full_path)}
+    file_entries = {}
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Filter out symlinked directories
+        dirnames[:] = [
+            d for d in dirnames
+            if not os.path.islink(os.path.join(dirpath, d))
+        ]
+        # Sort dirnames for deterministic traversal
+        dirnames.sort()
+
+        for filename in sorted(filenames):
+            full_path = os.path.join(dirpath, filename)
+
+            # Skip symlinks
+            if os.path.islink(full_path):
+                continue
+
+            # Compute relative path with forward slashes
+            rel_path = os.path.relpath(full_path, root_dir)
+            rel_path = rel_path.replace(os.sep, '/')
+
+            # NFC normalize
+            rel_path_nfc = unicodedata.normalize('NFC', rel_path)
+
+            # Check ignore patterns
+            if _should_ignore(rel_path_nfc, ignore_patterns):
+                continue
+
+            # Handle Unicode collisions: keep lexicographically largest original path
+            if rel_path_nfc in file_entries:
+                existing_orig = file_entries[rel_path_nfc][0]
+                if rel_path > existing_orig:
+                    file_entries[rel_path_nfc] = (rel_path, full_path)
+            else:
+                file_entries[rel_path_nfc] = (rel_path, full_path)
+
+    # Hash all files and prepare rows
+    rows = []
+    for nfc_path in sorted(file_entries.keys()):
+        orig_rel, abs_path = file_entries[nfc_path]
+        try:
+            file_size = os.path.getsize(abs_path)
+            file_hash = _hash_file(abs_path)
+            rows.append((nfc_path, file_hash, file_size))
+        except (OSError, IOError):
+            continue
+
+    # Write to SQLite with concurrency safety via temp file + atomic rename
+    db_path_abs = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_path_abs)
+    os.makedirs(db_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db.tmp')
+    os.close(fd)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            # Use DELETE journal mode to avoid WAL/SHM sidecar files
+            conn.execute('PRAGMA journal_mode=DELETE')
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute(
+                'CREATE TABLE files ('
+                '  path TEXT PRIMARY KEY,'
+                '  sha256 TEXT NOT NULL,'
+                '  size INTEGER NOT NULL'
+                ')'
+            )
+            conn.executemany(
+                'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+                rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Atomic rename to target path
+        os.replace(tmp_path, db_path_abs)
+
+        # Clean up any stale WAL/SHM files from previous runs at the target
+        for suffix in ('-wal', '-shm'):
+            try:
+                os.unlink(db_path_abs + suffix)
+            except OSError:
+                pass
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+root@9ab2e6980c83:/app#

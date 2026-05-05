@@ -1,0 +1,157 @@
+Current terminal state:
+New Terminal Output:
+
+root@f08509cd3bf1:/app# cat << 'EOF' > /app/solve.py
+> import json
+> import glob
+> import math
+> import os
+>
+> def process_devices():
+>     files = sorted(glob.glob('/app/device_*.json'))
+>     devices = []
+>
+>     for f in files:
+>         with open(f, 'r') as file:
+>             data = json.load(file)
+>
+>         device_id = data['device_id']
+>         hw_type = data['hardware_type']
+>         caps = data['capabilities']
+>         storage_mb = caps['storage_mb']
+>         memory_mb = caps['memory_mb']
+>         compute_tflops = caps['compute_tflops']
+>
+>         net = data['network']
+>         bandwidth_mbps = net['bandwidth_mbps']
+>         latency_ms = net['latency_ms']
+>
+>         req = data['model_requirements']
+>         model_size_mb = req['model_size_mb']
+>         inf_target = req['inference_time_target_ms']
+>         acc_thresh = req['accuracy_threshold']
+>
+>         # 1. Compression
+>         comp_ratio = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+>         comp_needed = comp_ratio > 0.3
+>         target_comp_size = storage_mb * 0.25
+>
+>         # 2. Quantization
+>         if acc_thresh >= 0.95:
+>             q_level = "FP32"
+>             bits = 32
+>         elif acc_thresh >= 0.90:
+>             q_level = "FP16"
+>             bits = 16
+>         elif acc_thresh >= 0.80:
+>             q_level = "INT8"
+>             bits = 8
+>         else:
+>             q_level = "INT4"
+>             bits = 4
+>
+>         q_eff = (32 / bits) * acc_thresh
+>
+>         # 3. FL Score
+>         net_qual = (bandwidth_mbps / 100.0) * (1.0 - latency_ms / 1000.0)
+>         comp_fac = min(compute_tflops / 5.0, 1.0)
+>         mem_fac = min(memory_mb / 4096.0, 1.0)
+>         fl_score = (net_qual * 0.4) + (comp_fac * 0.3) + (mem_fac * 0.3)
+>         fl_score = max(0.0, min(fl_score, 1.0))
+>         fl_ready = fl_score >= 0.6
+>
+>         # 4. Inference Score
+>         storage_util = model_size_mb / storage_mb if storage_mb != 0 else 0.0
+>         mem_adeq = memory_mb / (model_size_mb * 2.0) if model_size_mb != 0 else 0.0
+>         mem_adeq = min(mem_adeq, 1.0)
+>         comp_adeq = compute_tflops / (model_size_mb * 0.001) if model_size_mb != 0 else 0.0
+>         comp_adeq = min(comp_adeq, 1.0)
+>
+>         inf_score = (1.0 - storage_util) * 0.3 + mem_adeq * 0.4 + comp_adeq * 0.3
+>         inf_score = max(0.0, min(inf_score, 1.0))
+>
+>         devices.append({
+>             'device_id': device_id,
+>             'hardware_type': hw_type,
+>             'comp_ratio': comp_ratio,
+>             'compression_needed': comp_needed,
+>             'target_compressed_size_mb': round(target_comp_size, 2),
+>             'quantization_level': q_level,
+>             'quantization_efficiency': round(q_eff, 4),
+>             'fl_score': round(fl_score, 4),
+>             'fl_ready': fl_ready,
+>             'inference_score': round(inf_score, 4)
+>         })
+>
+>     # Sort devices by inference score desc
+>     devices.sort(key=lambda x: x['inference_score'], reverse=True)
+>
+>     # Stats
+>     total_devices = len(devices)
+>     mean_comp_ratio = sum(d['comp_ratio'] for d in devices) / total_devices if total_devices > 0 else 0.0
+>
+>     if total_devices > 0:
+>         mean_fl = sum(d['fl_score'] for d in devices) / total_devices
+>         var_fl = sum((d['fl_score'] - mean_fl)**2 for d in devices) / total_devices
+>         std_dev_fl = math.sqrt(var_fl)
+>     else:
+>         std_dev_fl = 0.0
+>
+>     fl_ready_count = sum(1 for d in devices if d['fl_ready'])
+>
+>     # Generate JSON
+>     output_devices = []
+>     for i, d in enumerate(devices):
+>         output_devices.append({
+>             "rank": i + 1,
+>             "device_id": d['device_id'],
+>             "hardware_type": d['hardware_type'],
+>             "compression_needed": d['compression_needed'],
+>             "target_compressed_size_mb": float(f"{d['target_compressed_size_mb']:.2f}"),
+>             "quantization_level": d['quantization_level'],
+>             "quantization_efficiency": float(f"{d['quantization_efficiency']:.4f}"),
+>             "fl_score": float(f"{d['fl_score']:.4f}"),
+>             "fl_ready": d['fl_ready'],
+>             "inference_score": float(f"{d['inference_score']:.4f}")
+>         })
+>
+>     out_json = {
+>         "summary": {
+>             "total_devices": total_devices,
+>             "mean_compression_ratio": float(f"{mean_comp_ratio:.3f}"),
+>             "std_dev_fl_score": float(f"{std_dev_fl:.4f}"),
+>             "fl_ready_devices": fl_ready_count
+>         },
+>         "devices": output_devices
+>     }
+>
+>     with open('/app/deployment_analysis.json', 'w') as f:
+>         json.dump(out_json, f, indent=2)
+>
+>     # Generate Report
+>     with open('/app/deployment_report.txt', 'w') as f:
+>         f.write("EDGE AI DEPLOYMENT ANALYSIS\n")
+>         f.write("============================\n\n")
+>         f.write("Summary Statistics:\n")
+>         f.write(f"- Total Devices: {total_devices}\n")
+>         f.write(f"- Mean Compression Ratio: {mean_comp_ratio:.3f}\n")
+>         f.write(f"- Std Dev FL Score: {std_dev_fl:.4f}\n")
+>         f.write(f"- FL-Ready Devices: {fl_ready_count}\n\n")
+>         f.write("Device Rankings (by Inference Score):\n")
+>
+>         for d in output_devices:
+>             comp_str = "needed" if d['compression_needed'] else "not needed"
+>             ready_str = "ready" if d['fl_ready'] else "not ready"
+>             f.write(f"{d['rank']}. {d['device_id']} ({d['hardware_type']})\n")
+>             f.write(f"   Compression: {comp_str}, Target Size: {d['target_compressed_size_mb']:.2f} MB\n")
+>             f.write(f"   Quantization: {d['quantization_level']}, Efficiency: {d['quantization_efficiency']:.4f}\n")
+>             f.write(f"   FL Score: {d['fl_score']:.4f}, Status: {ready_str}\n")
+>             f.write(f"   Inference Score: {d['inference_score']:.4f}\n")
+>
+> process_devices()
+> EOF
+root@f08509cd3bf1:/app# python3 /app/solve.py
+root@f08509cd3bf1:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

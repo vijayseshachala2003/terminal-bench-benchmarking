@@ -1,0 +1,215 @@
+Current terminal state:
+New Terminal Output:
+
+root@d7bbc4eb0ea3:/app# grep -n "Temporal correlations" -n /app/optimize.py
+305:    # Temporal correlations (60s window)
+root@d7bbc4eb0ea3:/app# nl -ba /app/optimize.py | sed -n '180,280p'
+   180
+   181
+   182  def index_cost_single(meta, table, col):
+   183      dv = meta['tables'][table]['columns'][col]['distinct_values']
+   184      base = 100.0
+   185      mult = math.log(dv + 1.0) / 10.0
+   186      return r1(base * (1.0 + mult))
+   187
+   188
+   189  def index_cost_composite(meta, table, cols):
+   190      base = 100.0
+   191      dvs = [meta['tables'][table]['columns'][c]['distinct_values'] for c in cols]
+   192      avg_dv = sum(dvs) / len(dvs)
+   193      mult = math.log(avg_dv + 1.0) / 10.0
+   194      return r1(base * len(cols) * (1.0 + mult))
+   195
+   196  # ---------------- Main analysis ----------------
+   197
+   198  def main():
+   199      meta = json.load(open(META_PATH))
+   200      budget = float(meta.get('budget', 0))
+   201
+   202      logs = sorted(glob.glob('/app/mysql_slow_*.log'))
+   203      entries = parse_slow_logs(logs)
+   204
+   205      # Filter slow (>1.0)
+   206      slow = [e for e in entries if e['query_time'] > 1.0]
+   207
+   208      # Normalize and group
+   209      groups = defaultdict(list)
+   210      for e in slow:
+   211          pat = normalize_sql(e['sql'])
+   212          groups[pat].append(e)
+   213
+   214      patterns = []
+   215      for pat, es in groups.items():
+   216          freq = len(es)
+   217          total = sum(x['query_time'] for x in es)
+   218          avg = total / freq
+   219          patterns.append({
+   220              'pattern': pat,
+   221              'frequency': freq,
+   222              'avg_execution_time': r1(avg),
+   223              'total_time': r1(total),
+   224              '_avg_raw': avg,
+   225              '_total_raw': total,
+   226              '_entries': es,
+   227          })
+   228
+   229      patterns.sort(key=lambda d: (-d['_total_raw'], d['pattern']))
+   230
+   231      # Build index candidates (single)
+   232      best_single = {}  # (table,col) -> candidate with max impact
+   233      # Track per-table pattern totals for composite rule
+   234      table_pattern_best = {}  # table -> pattern dict with largest total_time among patterns referencing table
+   235      table_indexable_cols = defaultdict(set)
+   236
+   237      for p in patterns:
+   238          cols_by_table = indexable_columns(p['pattern'])
+   239          # validate tables exist
+   240          for t in list(cols_by_table.keys()):
+   241              if t.lower() not in meta['tables']:
+   242                  cols_by_table.pop(t, None)
+   243          # normalize table names to metadata case (lower)
+   244          cols_by_table2 = defaultdict(set)
+   245          for t, cols in cols_by_table.items():
+   246              tl = t.lower()
+   247              for c in cols:
+   248                  if c in meta['tables'][tl]['columns']:
+   249                      cols_by_table2[tl].add(c)
+   250                      table_indexable_cols[tl].add(c)
+   251          cols_by_table = cols_by_table2
+   252
+   253          referenced_tables = set(cols_by_table.keys())
+   254          for t in referenced_tables:
+   255              cur = table_pattern_best.get(t)
+   256              if (cur is None) or (p['_total_raw'] > cur['_total_raw']) or (p['_total_raw'] == cur['_total_raw'] and p['pattern'] < cur['pattern']):
+   257                  table_pattern_best[t] = p
+   258
+   259          for t, cols in cols_by_table.items():
+   260              for c in cols:
+   261                  sel = selectivity(meta, t, c)
+   262                  sel2 = r2(sel)
+   263                  impact = p['frequency'] * p['_avg_raw'] * max(sel, 0.1)
+   264                  cand = {
+   265                      'table': t,
+   266                      'columns': [c],
+   267                      'impact_score': r1(impact),
+   268                      'selectivity': sel2,
+   269                      'cost': index_cost_single(meta, t, c),
+   270                  }
+   271                  key = (t, c)
+   272                  prev = best_single.get(key)
+   273                  if prev is None or cand['impact_score'] > prev['impact_score'] or (cand['impact_score'] == prev['impact_score'] and (t, [c]) < (prev['ta
+ble'], prev['columns'])):
+   274                      best_single[key] = cand
+   275
+   276      index_candidates = list(best_single.values())
+   277
+   278      # Composite candidates: one per table if >=2 distinct indexable columns
+   279      composite_candidates = []
+   280      for t, cols in table_indexable_cols.items():
+root@d7bbc4eb0ea3:/app# apply_patch <<'PATCH'
+> *** Begin Patch
+> *** Update File: optimize.py
+> @@
+> -    # Temporal correlations (60s window)
+> -    # Build list of (ts, pattern)
+> -    events = []
+> -    for p in patterns:
+> -        for e in p['_entries']:
+> -            events.append((e['timestamp'], p['pattern']))
+> -    events.sort()
+> -
+> -    # Window buckets by floor(ts/60)
+> -    buckets = defaultdict(list)
+> -    for ts, pat in events:
+> -        buckets[ts // 60].append((ts, pat))
+> -
+> -    pair_counts = defaultdict(int)
+> -    pair_deltas = defaultdict(list)
+> -
+> -    for _b, evs in buckets.items():
+> -        # group by pattern timestamps
+> -        by_pat = defaultdict(list)
+> -        for ts, pat in evs:
+> -            by_pat[pat].append(ts)
+> -        pats = sorted(by_pat.keys())
+> -        for p1, p2 in combinations(pats, 2):
+> -            # count co-occurrence once per bucket if both present
+> -            pair_counts[(p1, p2)] += 1
+> -            # avg_time_delta: use minimal absolute delta between any occurrences in this bucket
+> -            deltas = []
+> -            for t1 in by_pat[p1]:
+> -                for t2 in by_pat[p2]:
+> -                    deltas.append(abs(t1 - t2))
+> -            if deltas:
+> -                pair_deltas[(p1, p2)].append(min(deltas))
+> -
+> -    correlations = []
+> -    for (p1, p2), cnt in pair_counts.items():
+> -        if cnt >= 3:
+> -            ds = pair_deltas.get((p1, p2), [])
+> -            avgd = sum(ds) / len(ds) if ds else 0.0
+> -            correlations.append({
+> -                'pattern1': p1,
+> -                'pattern2': p2,
+> -                'correlation_strength': int(cnt),
+> -                'avg_time_delta': r1(avgd),
+> -            })
+> -
+> -    correlations.sort(key=lambda d: (-d['correlation_strength'], d['pattern1'], d['pattern2']))
+> -    top_corr = correlations[:3]
+> +    # Temporal correlations (60s window)
+> +    # Requirement: pattern pairs that occur within the same 60-second window at least 3 times.
+> +    # Implement as a sliding window over event timestamps, counting every cross-pattern pair
+> +    # within +60s (using query start timestamps).
+> +    events = []
+> +    for p in patterns:
+> +        for e in p['_entries']:
+> +            events.append((e['timestamp'], p['pattern']))
+> +    events.sort()
+> +
+> +    pair_counts = defaultdict(int)
+> +    pair_deltas = defaultdict(list)
+> +
+> +    n = len(events)
+> +    for i in range(n):
+> +        t1, pat1 = events[i]
+> +        j = i + 1
+> +        while j < n and events[j][0] - t1 <= 60:
+> +            t2, pat2 = events[j]
+> +            if pat1 != pat2:
+> +                a, b = (pat1, pat2) if pat1 < pat2 else (pat2, pat1)
+> +                pair_counts[(a, b)] += 1
+> +                pair_deltas[(a, b)].append(abs(t2 - t1))
+> +            j += 1
+> +
+> +    correlations = []
+> +    for (p1, p2), cnt in pair_counts.items():
+> +        if cnt >= 3:
+> +            ds = pair_deltas.get((p1, p2), [])
+> +            avgd = sum(ds) / len(ds) if ds else 0.0
+> +            correlations.append({
+> +                'pattern1': p1,
+> +                'pattern2': p2,
+> +                'correlation_strength': int(cnt),
+> +                'avg_time_delta': r1(avgd),
+> +            })
+> +
+> +    correlations.sort(key=lambda d: (-d['correlation_strength'], d['pattern1'], d['pattern2']))
+> +    top_corr = correlations[:3]
+> *** End Patch
+> PATCH
+bash: apply_patch: command not found
+root@d7bbc4eb0ea3:/app# python3 /app/optimize.py
+root@d7bbc4eb0ea3:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('corr',d['temporal_correlations'])"
+corr [{'pattern1': 'SELECT * FROM ORDERS WHERE ID = ?', 'pattern2': 'SELECT * FROM ORDERS WHERE STATUS IN (?)', 'correlation_strength': 5, 'avg_time_delta': 20.
+4}, {'pattern1': 'SELECT * FROM USERS WHERE ID = ?', 'pattern2': 'SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?', 'correlation_strength': 5, 'avg_time_de
+lta': 33.0}, {'pattern1': 'SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID', 'pattern2': 'SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREATED_AT'
+, 'correlation_strength': 4, 'avg_time_delta': 10.3}]
+root@d7bbc4eb0ea3:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('budget',d['total_budget_used'],'reco',len(d['recommended_inde
+xes']));from collections import Counter;print('per_table',Counter([r['table'] for r in d['recommended_indexes']]))"
+budget 973.9 reco 5
+per_table Counter({'users': 2, 'orders': 2, 'products': 1})
+root@d7bbc4eb0ea3:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

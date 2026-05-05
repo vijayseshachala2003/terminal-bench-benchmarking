@@ -1,0 +1,55 @@
+{
+  "analysis": "Resolver log shows 'broken trust chain resolving ...' for both example.com and secure.example.com. That means dnssec-validation is enabled and resolver is trying to validate but cannot build a chain from a trust anchor. Our attempt to add a trusted-keys stanza did not persist in resolver named.conf (it is not present now), so resolver only has built-in root trust anchors and is trying to validate internal zones as if they were under the real DNS root, which fails (no access to internet/root, forward-only to primary). For this lab, to make validation pass we must either (A) disable dnssec-validation on the resolver (then queries work but dnssec_valid would be false), or (B) configure the resolver to treat example.com (or secure.example.com) as a trust anchor and also stop trying to validate against '.' managed keys. Best: set dnssec-validation yes; and add 'trust-anchors { example.com static-key ...; };' or 'secure.example.com static-key ...; };' using the KSK DNSKEY. Additionally, disable managed-keys for '.' by setting 'dnssec-validation yes;' but with 'managed-keys-directory' local; still it will try to refresh root; but if forward-only to primary and primary isn't recursive, it can't fetch '.', causing noise but might still validate internal if trust anchor is local. We'll implement trust-anchors for secure.example.com from the KSK .key file and set dnssec-validation yes explicitly. Then restart resolver and retest; expect NOERROR and AD flag for secure.example.com, and example.com should resolve (unsigned, no AD).",
+  "plan": "1) Extract the secure.example.com KSK DNSKEY record from the K*.key file (flags 257). 2) Insert a trust-anchors block into resolver named.conf (outside options) using 'static-key' with that DNSKEY. (If syntax differs, use 'trusted-keys' as fallback.) 3) Ensure resolver options include 'dnssec-validation yes;' (or auto) and keep forward-only. 4) Restart resolver and test: dig secure.example.com A +dnssec should return NOERROR and include 'ad' flag. Also rerun /app/test_queries.txt to ensure all resolve. 5) Update /app/dns_health.json dnssec_valid accordingly.",
+  "commands": [
+    {
+      "keystrokes": "cd /app/dns/primary/zones\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSK_KEYFILE=$(awk '$4==257{print FILENAME; exit}' Ksecure.example.com.*.key); echo \"KSK_KEYFILE=$KSK_KEYFILE\"; KSK_DNSKEY=$(awk '$4==257{print; exit}' \"$KSK_KEYFILE\"); echo \"$KSK_DNSKEY\"\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\n\\s*include \"\\/app\\/dns\\/resolver\\/run\\/rndc\\.key\";/\\ntrust-anchors {\\n    secure.example.com. static-key '\"$KSK_DNSKEY\"'\\n};\\n\\ninclude \"\\/app\\/dns\\/resolver\\/run\\/rndc.key\";/s' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(forward only;\\n)/$1    dnssec-validation yes;\\n/s' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/status:/{print} /flags:/{print; exit}'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "DNSSEC_VALID=$(dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/flags:/{if($0~ / ad[ ;]/) print \"true\"; else print \"false\"; exit}'); echo \"dnssec_valid=$DNSSEC_VALID\"; jq --argjson v \"$DNSSEC_VALID\" '.dnssec_valid=$v' /app/dns_health.json > /app/dns_health.json.tmp && mv /app/dns_health.json.tmp /app/dns_health.json\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cat /app/dns_health.json\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

@@ -1,0 +1,83 @@
+{
+  "analysis": "Primary and secondary named.conf are now syntactically broken (syntax error near '}' at line ~29/31) due to the regex-based logging removal leaving unmatched braces. Resolver config also failed because trust-anchors requires a full DNSKEY record, but we only captured the first line of a multi-line DNSKEY (with '('). Need to rebuild primary and secondary named.conf cleanly from scratch (minimal configs, no logging, controls disabled, pid-file under /app). For resolver, either embed the DNSKEY on one line (remove parentheses) or include the full multi-line record. Easiest: extract the complete DNSKEY 257 record block until closing ')' line and include that in trust-anchors.",
+  "plan": "1) Recreate /app/dns/primary/named.conf and /app/dns/secondary/named.conf as minimal known-good files with required options, TSIG key, zones, and controls disabled. 2) Extract the full KSK DNSKEY record (including continuation lines) from the signed zone and write a clean resolver named.conf with trust-anchors containing that full record. 3) Validate all configs with named-checkconf. 4) Restart all named processes and verify ports. 5) Test authoritative queries, AXFR, resolver validation, and then run /app/test_queries.txt. 6) If test queries include sub.example.com delegation, adjust zone accordingly later.",
+  "commands": [
+    {
+      "keystrokes": "cat > /app/dns/primary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/primary/cache\";\n    listen-on port 5301 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation no;\n    allow-transfer { key \"transfer-key\"; };\n    pid-file \"/app/dns/primary/named-primary.pid\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=\";\n};\n\nzone \"example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/example.com.zone\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\nzone \"secure.example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/secure.example.com.zone.signed\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/secondary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/secondary/cache\";\n    listen-on port 5302 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation no;\n    pid-file \"/app/dns/secondary/named-secondary.pid\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=\";\n};\n\nserver 127.0.0.1 {\n    keys { transfer-key; };\n};\n\nzone \"example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nzone \"secure.example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/secure.example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'BEGIN{in=0} $0~/(^|[[:space:]])DNSKEY[[:space:]]+257[[:space:]]+3[[:space:]]+8/{in=1} in{print} in && /\\)/{exit}' /app/dns/primary/zones/secure.example.com.zone.signed > /tmp/secure-ksk-full.rr\nwc -l /tmp/secure-ksk-full.rr\nhead -n 5 /tmp/secure-ksk-full.rr\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<EOF\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation yes;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named-resolver.pid\";\n};\n\ntrust-anchors {\n$(cat /tmp/secure-ksk-full.rr)\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 60 /tmp/named-primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 60 /tmp/named-secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

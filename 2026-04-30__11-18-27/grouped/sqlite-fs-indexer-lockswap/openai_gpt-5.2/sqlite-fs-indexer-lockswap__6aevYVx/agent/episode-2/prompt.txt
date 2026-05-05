@@ -1,0 +1,256 @@
+New Terminal Output:
+
+root@e4e86a37e8ea:/app# cat > /app/app/indexer.py <<'PY'
+> import fnmatch
+> import hashlib
+> import os
+> import re
+> import sqlite3
+> import tempfile
+> import time
+> import unicodedata
+> from typing import Dict, Iterable, List, Optional, Tuple
+>
+>
+> def _to_posix_relpath(path: str) -> str:
+>     # Ensure forward slashes regardless of platform.
+>     return path.replace(os.sep, "/")
+>
+>
+r> def _nfc(s: str) -> str:
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> def _compile_pattern(pat: str) -> re.Pattern:
+>     """Compile a glob-like pattern to a regex.
+>
+ >     Rules:
+>     - '*' matches 0+ chars except '/'
+>     - '**' is NOT special; it means two literal '*' characters.
+>     """
+>     # We cannot use fnmatch.translate directly because it treats '*' as matching '/'.
+>     # Implement our own minimal glob -> regex.
+>     out = ["^"]
+>     i = 0
+>     while i < len(pat):
+>         c = pat[i]
+>         if c == "*":
+>             # '**' is literal two '*' characters.
+>             if i + 1 < len(pat) and pat[i + 1] == "*":
+>                 out.append(re.escape("**"))
+>                 i += 2
+>                 continue
+>             out.append("[^/]*")
+>             i += 1
+>             continue
+>         out.append(re.escape(c))
+>         i += 1
+>     out.append("$")
+>     return re.compile("".join(out))
+>
+n>
+> class _Ignore:
+>     def __init__(self, patterns: Iterable[str]):
+>         self._items: List[Tuple[str, bool, bool, re.Pattern]] = []
+>         # (pattern_nfc, anchored, has_slash, compiled_regex)
+>         for raw in patterns:
+>             try:
+>                 p = _nfc(raw)
+>             except Exception:
+>                 # Malformed unicode should not crash.
+>                 continue
+>             anchored = p.startswith("/")
+>             if anchored:
+>                 p2 = p[1:]
+>             else:
+>                 p2 = p
+>             has_slash = "/" in p2
+>             try:
+>                 rx = _compile_pattern(p2)
+>             except re.error:
+>                 continue
+>             self._items.append((p2, anchored, has_slash, rx))
+>
+>     def match(self, rel_nfc_posix: str) -> bool:
+>         # rel_nfc_posix must be NFC and use '/'.
+>         if rel_nfc_posix == "":
+>             return False
+>         components = rel_nfc_posix.split("/")
+>         for _p2, anchored, has_slash, rx in self._items:
+>             if anchored:
+>                 if rx.match(rel_nfc_posix):
+>                     return True
+>                 continue
+>
+>             if not has_slash:
+>                 # Match against each component.
+>                 for comp in components:
+>                     if rx.match(comp):
+>                         return True
+>                 continue
+>
+>             # Contains '/' but not anchored: match full path OR any suffix starting at a '/' boundary.
+>             if rx.match(rel_nfc_posix):
+>                 return True
+>             # Try suffixes after each boundary.
+>             # e.g. a/b/c -> test b/c and c
+>             for i in range(1, len(components)):
+>                 suffix = "/".join(components[i:])
+>                 if rx.match(suffix):
+>                     return True
+>         return False
+>
+>
+> def _read_ignore_file(path: str = "/data/ignore.txt") -> List[str]:
+>     try:
+>         with open(path, "r", encoding="utf-8", errors="replace") as f:
+>             lines = f.read().splitlines()
+>     except FileNotFoundError:
+>         return []
+>     except OSError:
+>         return []
+>
+>     pats: List[str] = []
+>     for line in lines:
+>         s = line.strip("\n\r")
+>         if not s.strip():
+>             continue
+>         # Comment if first non-whitespace is '#'
+>         stripped = s.lstrip()
+>         if stripped.startswith("#"):
+>             continue
+>         # Use the line as-is (minus trailing newline), but strip only trailing CR if present.
+>         pats.append(s.rstrip("\r"))
+>     return pats
+>
+>
+> def _hash_file(path: str) -> Tuple[str, int]:
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(path, "rb") as f:
+>         for chunk in iter(lambda: f.read(1024 * 1024), b""):
+>             size += len(chunk)
+>             h.update(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     root_dir = os.path.abspath(root_dir)
+>     ignore = _Ignore(_read_ignore_file())
+>
+>     # Map NFC relative path -> (original_rel_posix, abs_path)
+>     chosen: Dict[str, Tuple[str, str]] = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, topdown=True, followlinks=False):
+>         # Deterministic traversal order.
+>         dirnames.sort()
+>         filenames.sort()
+>
+>         # Remove symlinked directories from traversal.
+>         pruned: List[str] = []
+>         for d in dirnames:
+>             full = os.path.join(dirpath, d)
+>             try:
+>                 if os.path.islink(full):
+>                     continue
+>             except OSError:
+>                 continue
+>             pruned.append(d)
+>         dirnames[:] = pruned
+>
+>         for name in filenames:
+>             abs_path = os.path.join(dirpath, name)
+>             try:
+>                 if os.path.islink(abs_path):
+>                     continue
+>             except OSError:
+>                 continue
+>
+>             try:
+>                 rel = os.path.relpath(abs_path, root_dir)
+>             except ValueError:
+>                 # If relpath fails for any reason, skip.
+>                 continue
+>
+>             rel_posix = _to_posix_relpath(rel)
+>             rel_nfc = _nfc(rel_posix)
+>
+>             # Ignore rules apply to NFC path.
+>             if ignore.match(rel_nfc):
+>                 continue
+>
+>             prev = chosen.get(rel_nfc)
+>             if prev is None or rel_posix > prev[0]:
+>                 chosen[rel_nfc] = (rel_posix, abs_path)
+>
+>     # Compute hashes and sizes; deterministic order by NFC path.
+>     rows: List[Tuple[str, str, int]] = []
+>     for rel_nfc in sorted(chosen.keys()):
+>         _orig_rel, abs_path = chosen[rel_nfc]
+>         try:
+>             sha, size = _hash_file(abs_path)
+>         except OSError:
+>             # File disappeared or unreadable; skip.
+>             continue
+>         rows.append((rel_nfc, sha, size))
+>
+>     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     # Write to a temp DB in the same directory, then atomically replace.
+>     tmp_fd: Optional[int] = None
+>     tmp_path: Optional[str] = None
+>     try:
+>         tmp_fd, tmp_path = tempfile.mkstemp(prefix=".indexer-", suffix=".sqlite", dir=db_dir)
+>         os.close(tmp_fd)
+>         tmp_fd = None
+>
+>         con = sqlite3.connect(tmp_path, timeout=30.0, isolation_level=None)
+>         try:
+>             con.execute("PRAGMA journal_mode=WAL;")
+>             con.execute("PRAGMA synchronous=NORMAL;")
+>             con.execute("PRAGMA temp_store=MEMORY;")
+>             con.execute("PRAGMA foreign_keys=OFF;")
+>
+>             con.execute("BEGIN IMMEDIATE;")
+>             con.execute(
+>                 "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL);"
+>             )
+>             con.execute("DELETE FROM files;")
+>             con.executemany("INSERT INTO files(path, sha256, size) VALUES (?, ?, ?);", rows)
+>             con.execute("COMMIT;")
+>         finally:
+>             con.close()
+>
+>         # Atomic replace; retry a bit for transient contention.
+>         last_exc: Optional[BaseException] = None
+>         for attempt in range(50):
+>             try:
+>                 os.replace(tmp_path, db_path)
+>                 tmp_path = None
+>                 last_exc = None
+>                 break
+>             except OSError as e:
+>                 last_exc = e
+>                 time.sleep(0.02 * (attempt + 1))
+>         if last_exc is not None:
+>             raise last_exc
+>     finally:
+>         if tmp_fd is not None:
+>             try:
+>                 os.close(tmp_fd)
+>             except OSError:
+>                 pass
+>         if tmp_path is not None:
+>             try:
+>                 os.unlink(tmp_path)
+>             except OSError:
+>                 pass
+> PY
+root@e4e86a37e8ea:/app# python -c "import app.indexer; import inspect; print(app.indexer.build_index);"
+<function build_index at 0x7fa4cac7eac0>
+root@e4e86a37e8ea:/app# pytest -q /tests/test_outputs.py
+bash: pytest: command not found
+root@e4e86a37e8ea:/app#

@@ -1,0 +1,295 @@
+New Terminal Output:
+
+root@b789ee18e664:/app# cat > /app/app/indexer.py <<'PY'
+("NFC", s)
+
+
+def _to_posix_relpath(rel_parts: Sequence[str]) -> str:
+    # Join path components with '/', never backslashes.
+    return "/".join(rel_parts)
+
+
+# ---------------------------
+# Ignore handling
+# ---------------------------
+
+@dataclass(frozen=True)
+class _IgnorePattern:
+    raw: str
+    nfc: str
+    anchored: bool  # pattern started with '/'
+    has_slash: bool
+
+
+def _read_ignore_patterns(ignore_file: str = "/data/ignore.txt") -> List[_IgnorePattern]:
+    patterns: List[_IgnorePattern] = []
+    try:
+        with open(ignore_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # Skip empty and comment lines (first non-whitespace is '#').
+                stripped = line.strip("\r\n")
+                if not stripped.strip():
+                    continue
+                lstripped = stripped.lstrip()
+                if lstripped.startswith("#"):
+                    continue
+
+                # Normalize pattern to NFC. Matching uses '/' only.
+                # If malformed, just treat as a literal-ish pattern; never crash.
+                pat = _nfc(stripped)
+                anchored = pat.startswith("/")
+                if anchored:
+                    pat2 = pat[1:]
+                else:
+                    pat2 = pat
+                patterns.append(
+                    _IgnorePattern(raw=stripped, nfc=pat2, anchored=anchored, has_slash=("/" in pat2))
+                )
+    except FileNotFoundError:
+        return []
+    except OSError:
+        # If ignore file is unreadable, treat as no patterns.
+        return []
+    return patterns
+
+
+def _component_matches(pattern: str, component: str) -> bool:
+    # '*' should not match '/'; fnmatch on a single component satisfies that.
+    # '**' is not special; fnmatch treats it as two '*' which is fine.
+    return fnmatch.fnmatchcase(component, pattern)
+
+
+def _fullpath_matches(pattern: str, rel_path: str) -> bool:
+    # fnmatchcase will let '*' match any char including '/', which we must prevent.
+    # So we implement a saf> """Filesystem to SQLite indexer.
+>
+> The build_index() function walks a directory tree, hashes regular files, and
+> stores results in a SQLite database.
+>
+e> Key requirements:
+> - Deterministic traversal.
+> - Unicode NFC normalization for stored paths and ignore matching.
+> - Do not follow symlinks (ignore them entirely).
+> - Handle Unicode normalization collisions by keeping only the entry whose
+>   *original* relative path string is lexicographically largest.
+> - Concurrency-safe: many processes may build the same db_path concurrently
+>   without corrupting the database.
+> """
+>
+> from __future__ import annotations
+>
+> import fnmatch
+> import hashlib
+> import os
+> import sqlite3
+> import time
+> import unicodedata
+> from dataclasses import dataclass
+> from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+>
+>
+> # ---------------------------
+> # Unicode / path helpers
+> # ---------------------------
+>
+> def _nfc(s: str) -> str:
+>     # Normalize to NFC for all comparisons and stored paths.
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> def _to_posix_relpath(rel_parts: Sequence[str]) -> str:
+>     # Join path components with '/', never backslashes.
+>     return "/".join(rel_parts)
+>
+>
+> # ---------------------------
+> # Ignore handling
+> # ---------------------------
+>
+> @dataclass(frozen=True)
+> class _IgnorePattern:
+>     raw: str
+>     nfc: str
+>     anchored: bool  # pattern started with '/'
+>     has_slash: bool
+>
+>
+i> def _read_ignore_patterns(ignore_file: str = "/data/ignore.txt") -> List[_IgnorePattern]:
+>     patterns: List[_IgnorePattern] = []
+>     try:
+>         with open(ignore_file, "r", encoding="utf-8", errors="replace") as f:
+>             for line in f:
+>                 # Skip empty and comment lines (first non-whitespace is '#').
+>                 stripped = line.strip("\r\n")
+>                 if not stripped.strip():
+>                     continue
+>                 lstripped = stripped.lstrip()
+>                 if lstripped.startswith("#"):
+>                     continue
+>
+>                 # Normalize pattern to NFC. Matching uses '/' only.
+>                 # If malformed, just treat as a literal-ish pattern; never crash.
+>                 pat = _nfc(stripped)
+>                 anchored = pat.startswith("/")
+>                 if anchored:
+>                     pat2 = pat[1:]
+>                 else:
+>                     pat2 = pat
+>                 patterns.append(
+>                     _IgnorePattern(raw=stripped, nfc=pat2, anchored=anchored, has_slash=("/" in pat2))
+>                 )
+>     except FileNotFoundError:
+>         return []
+>     except OSError:
+>         # If ignore file is unreadable, treat as no patterns.
+>         return []
+>     return patterns
+>
+>
+> def _component_matches(pattern: str, component: str) -> bool:
+>     # '*' should not match '/'; fnmatch on a sin
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+oot_dir = os.path.abspath(root_dir)
+>
+>     # Stack of (abs_dir, rel_parts_original)
+>     stack: List[Tuple[str, List[str]]] = [(root_dir, [])]
+>
+>     while stack:
+>         abs_dir, rel_parts = stack.pop()
+>
+>         try:
+>             with os.scandir(abs_dir) as it:
+>                 entries = list(it)
+>         except OSError:
+>             continue
+>
+>         # Deterministic traversal order.
+>         entries.sort(key=lambda e: e.name)
+>
+.>         # Traverse directories after files? Doesn't matter as long as deterministic.
+>         # We'll push dirs in reverse so that pop() processes them in sorted order.
+>         dirs_to_push: List[Tuple[str, List[str]]] = []
+>
+>         for e in entries:
+>             try:
+>                 if e.is_symlink():
+>                     continue
+>             except OSError:
+>                 continue
+>
+>             name = e.name
+>             rel_parts_child = rel_parts + [name]
+>             rel_original = _to_posix_relpath(rel_parts_child)
+>             rel_nfc = _nfc(rel_original)
+>
+>             # Apply ignore rules using NFC path.
+>             if _is_ignored(rel_nfc, patterns):
+>                 continue
+>
+>             try:
+>                 if e.is_dir(follow_symlinks=False):
+>                     dirs_to_push.append((e.path, rel_parts_child))
+>                 elif e.is_file(follow_symlinks=False):
+>                     yield (e.path, rel_original, rel_nfc)
+>                 else:
+>                     continue
+>             except OSError:
+>                 continue
+>
+>         for item in reversed(dirs_to_push):
+>             stack.append(item)
+>
+>
+> def _sha256_file(path: str) -> Tuple[str, int]:
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(path, "rb") as f:
+>         while True:
+>             b = f.read(1024 * 1024)
+>             if not b:
+>                 break
+>             size += len(b)
+>             h.update(b)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     patterns = _read_ignore_patterns("/data/ignore.txt")
+>
+>     # First pass: resolve NFC collisions by choosing lexicographically largest original path.
+>     # Map nfc_rel_path -> (original_rel_path, abs_path)
+>     chosen: Dict[str, Tuple[str, str]] = {}
+>     for abs_path, rel_original, rel_nfc in _iter_files(root_dir, patterns):
+>         prev = chosen.get(rel_nfc)
+>         if prev is None or rel_original > prev[0]:
+>             chosen[rel_nfc] = (rel_original, abs_path)
+>
+>     # Deterministic insertion order by NFC path.
+>     items: List[Tuple[str, str]] = sorted(((k, v[1]) for k, v in chosen.items()), key=lambda x: x[0])
+>
+>     # Build a temp DB in the same directory as the target so os.replace is atomic.
+>     db_path = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_path) or "."
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     tmp_db = os.path.join(db_dir, f".{os.path.basename(db_path)}.tmp.{os.getpid()}")
+>     lock_path = db_path + ".lock"
+>
+>     # Ensure we don't reuse a stale temp file.
+>     try:
+>         os.unlink(tmp_db)
+>     except FileNotFoundError:
+>         pass
+>     except OSError:
+>         pass
+>
+>     conn = sqlite3.connect(tmp_db, timeout=60.0)
+>     try:
+>         conn.execute("PRAGMA journal_mode=WAL;")
+>         conn.execute("PRAGMA synchronous=NORMAL;")
+>         conn.execute("PRAGMA temp_store=MEMORY;")
+>         conn.execute("PRAGMA busy_timeout=60000;")
+>
+>         conn.execute(
+>             "CREATE TABLE IF NOT EXISTS files ("
+>             "path TEXT PRIMARY KEY, "
+>             "sha256 TEXT NOT NULL, "
+>             "size INTEGER NOT NULL"
+>             ");"
+>         )
+>         conn.execute("DELETE FROM files;")
+>
+>         with conn:
+>             for rel_nfc, abs_path in items:
+>                 sha, size = _sha256_file(abs_path)
+>                 # Store NFC path, with forward slashes already.
+>                 conn.execute(
+>                     "INSERT OR REPLACE INTO files(path, sha256, size) VALUES(?, ?, ?);",
+>                     (rel_nfc, sha, int(size)),
+>                 )
+>
+>         # Validate temp DB is readable before replacing.
+>         row = conn.execute("PRAGMA integrity_check;").fetchone()
+>         if not row or row[0] != "ok":
+>             raise RuntimeError("SQLite integrity_check failed for temp db")
+>     finally:
+>         conn.close()
+>
+>     # Replace under a simple lock to avoid concurrent replace races.
+>     lock = _FileLock(lock_path)
+>     with lock:
+>         os.replace(tmp_db, db_path)
+>
+>     # Best-effort cleanup if something went wrong before replace.
+>     try:
+>         if os.path.exists(tmp_db):
+>             os.unlink(tmp_db)
+>     except OSError:
+>         pass
+> PY
+root@b789ee18e664:/app# python -m py_compile /app/app/indexer.py
+root@b789ee18e664:/app# pytest -q /tests/test_outputs.py
+bash: pytest: command not found
+root@b789ee18e664:/app#

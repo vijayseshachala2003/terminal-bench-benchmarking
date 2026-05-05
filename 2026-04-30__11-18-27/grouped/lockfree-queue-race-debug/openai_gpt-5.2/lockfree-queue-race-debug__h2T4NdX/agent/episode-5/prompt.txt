@@ -1,0 +1,270 @@
+New Terminal Output:
+
+root@0f3eca341fe0:/app# apply_patch<<'PATCH'
+> *** Begin Patch
+> *** Update File: lockfree_queue.h
+> @@
+>  #include <atomic>
+>  #include <cstdint>
+> +#include <cstddef>
+>
+>  class LockFreeQueue {
+>  public:
+>      LockFreeQueue();
+>      ~LockFreeQueue();
+> @@
+>  private:
+>      struct Node {
+>          uint64_t value;
+>          std::atomic<Node*> next;
+>          Node() : value(0), next(nullptr) {}
+>          explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>      };
+> -
+> -    struct TaggedPtr {
+> -        Node* ptr;
+> -        uint64_t tag;
+> -
+> -        TaggedPtr() : ptr(nullptr), tag(0) {}
+> -        TaggedPtr(Node* p, uint64_t t) : ptr(p), tag(t) {}
+> -
+> -        bool operator==(const TaggedPtr& other) const {
+> -            return ptr == other.ptr && tag == other.tag;
+> -        }
+> -    };
+> +
+> +    // Hazard pointers for safe memory reclamation.
+> +    // This prevents use-after-free and also prevents ABA due to pointer reuse,
+> +    // because nodes are not deleted until no thread can still hold a reference.
+> +    struct HazardRecord {
+> +        std::atomic<std::uintptr_t> hazard;
+> +    };
+> +
+> +    static constexpr std::size_t kMaxThreads = 128;
+> +    static constexpr std::size_t kHazardsPerThread = 2; // (head/tail) and next
+> +    static HazardRecord hazards_[kMaxThreads * kHazardsPerThread];
+> +    static std::atomic<std::size_t> next_thread_id_;
+> +
+> +    static std::size_t thread_id();
+> +    static void set_hazard(std::size_t slot, Node* p);
+> +    static void clear_hazard(std::size_t slot);
+> +    static bool any_hazard_points_to(Node* p);
+> +
+> +    struct RetiredNode {
+> +        Node* node;
+> +        RetiredNode* next;
+> +    };
+> +    static thread_local RetiredNode* retired_;
+> +    static thread_local std::size_t retired_count_;
+> +    static void retire_node(Node* n);
+> +    static void try_reclaim();
+> @@
+>      std::atomic<Node*> head_;
+>      std::atomic<Node*> tail_;
+> -
+> -    std::atomic<Node*> free_list_;
+> -
+> -    Node* allocate_node(uint64_t value);
+> -    void free_node(Node* node);
+> +
+> +    Node* allocate_node(uint64_t value);
+>  };
+>
+>  #endif
+> *** End Patch
+> PATCH
+bash: apply_patch: command not found
+root@0f3eca341fe0:/app# apply_patch<<'PATCH'
+> *** Begin Patch
+> *** Update File: lockfree_queue.cpp
+> @@
+>  #include "lockfree_queue.h"
+>  #include <new>
+> +
+> +LockFreeQueue::HazardRecord LockFreeQueue::hazards_[LockFreeQueue::kMaxThreads * LockFreeQueue::kHazardsPerThread]{};
+> +std::atomic<std::size_t> LockFreeQueue::next_thread_id_{0};
+> +thread_local LockFreeQueue::RetiredNode* LockFreeQueue::retired_ = nullptr;
+> +thread_local std::size_t LockFreeQueue::retired_count_ = 0;
+> +
+> +std::size_t LockFreeQueue::thread_id() {
+> +    static thread_local std::size_t id = next_thread_id_.fetch_add(1, std::memory_order_relaxed);
+> +    // In this kata environment we expect only a small number of threads.
+> +    // If exceeded, fall back to a bounded id (still safe but may reduce reclamation).
+> +    if (id >= kMaxThreads) id = id % kMaxThreads;
+> +    return id;
+> +}
+> +
+> +void LockFreeQueue::set_hazard(std::size_t slot, Node* p) {
+> +    hazards_[slot].hazard.store(reinterpret_cast<std::uintptr_t>(p), std::memory_order_release);
+> +}
+> +
+> +void LockFreeQueue::clear_hazard(std::size_t slot) {
+> +    hazards_[slot].hazard.store(0, std::memory_order_release);
+> +}
+> +
+> +bool LockFreeQueue::any_hazard_points_to(Node* p) {
+> +    const std::uintptr_t target = reinterpret_cast<std::uintptr_t>(p);
+> +    for (std::size_t i = 0; i < kMaxThreads * kHazardsPerThread; ++i) {
+> +        if (hazards_[i].hazard.load(std::memory_order_acquire) == target) {
+> +            return true;
+> +        }
+> +    }
+> +    return false;
+> +}
+> +
+> +void LockFreeQueue::retire_node(Node* n) {
+> +    auto* r = new RetiredNode{n, retired_};
+> +    retired_ = r;
+> +    ++retired_count_;
+> +    // Scan occasionally to amortize cost.
+> +    if (retired_count_ >= 256) {
+> +        try_reclaim();
+> +    }
+> +}
+> +
+> +void LockFreeQueue::try_reclaim() {
+> +    RetiredNode** cur = &retired_;
+> +    std::size_t new_count = 0;
+> +    while (*cur) {
+> +        RetiredNode* r = *cur;
+> +        if (!any_hazard_points_to(r->node)) {
+> +            *cur = r->next;
+> +            delete r->node;
+> +            delete r;
+> +        } else {
+> +            cur = &r->next;
+> +            ++new_count;
+> +        }
+> +    }
+> +    retired_count_ = new_count;
+> +}
+> @@
+>  LockFreeQueue::LockFreeQueue() {
+>      Node* dummy = new Node();
+> -    head_.store(dummy, std::memory_order_relaxed);
+> -    tail_.store(dummy, std::memory_order_relaxed);
+> -    free_list_.store(nullptr, std::memory_order_relaxed);
+> +    head_.store(dummy, std::memory_order_relaxed);
+> +    tail_.store(dummy, std::memory_order_relaxed);
+>  }
+> @@
+>  LockFreeQueue::~LockFreeQueue() {
+>      uint64_t dummy;
+>      while (dequeue(dummy)) {}
+>
+> -    Node* head = head_.load(std::memory_order_relaxed);
+> -  
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+r_acquire)) {
+>              if (next == nullptr) {
+> -                // BUG 1 & 3: Using relaxed for the critical CAS
+> -                // The store to next should use release semantics
+> -                if (tail->next.compare_exchange_weak(next, new_node,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+> +                // Publish the new node with release so consumers acquiring next
+> +                // also see initialized value.
+> +                if (tail->next.compare_exchange_weak(next, new_node,
+> +                        std::memory_order_release, std::memory_order_relaxed)) {
+>                      // Try to move tail forward (don't care if it fails)
+>                      tail_.compare_exchange_weak(tail, new_node,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed);
+> +                        std::memory_order_release, std::memory_order_relaxed);
+> +                    clear_hazard(hz1);
+> +                    clear_hazard(hz0);
+>                      return;
+>                  }
+>              } else {
+>                  // Tail is behind, try to advance it
+>                  tail_.compare_exchange_weak(tail, next,
+> -                    std::memory_order_relaxed, std::memory_order_relaxed);
+> +                    std::memory_order_release, std::memory_order_relaxed);
+>              }
+>          }
+>      }
+>  }
+> @@
+>  bool LockFreeQueue::dequeue(uint64_t& value) {
+> +    const std::size_t tid = thread_id();
+> +    const std::size_t hz0 = tid * kHazardsPerThread;
+> +    const std::size_t hz1 = hz0 + 1;
+> +
+>      while (true) {
+> -        // BUG 1: Using relaxed where acquire is needed
+> -        Node* head = head_.load(std::memory_order_relaxed);
+> -        Node* tail = tail_.load(std::memory_order_relaxed);
+> -
+> -        // BUG 3: Reading next with wrong ordering
+> -        // Should synchronize with release store in enqueue
+> -        Node* next = head->next.load(std::memory_order_relaxed);
+> +        Node* head = head_.load(std::memory_order_acquire);
+> +        set_hazard(hz0, head);
+> +        if (head != head_.load(std::memory_order_acquire)) {
+> +            continue;
+> +        }
+> +
+> +        Node* tail = tail_.load(std::memory_order_acquire);
+> +        Node* next = head->next.load(std::memory_order_acquire);
+> +        set_hazard(hz1, next);
+>
+>          // Consistency check
+> -        if (head == head_.load(std::memory_order_relaxed)) {
+> +        if (head == head_.load(std::memory_order_acquire)) {
+>              if (head == tail) {
+>                  if (next == nullptr) {
+> +                    clear_hazard(hz1);
+> +                    clear_hazard(hz0);
+>                      return false;  // Queue is empty
+>                  }
+>                  // Tail is behind, advance it
+>                  tail_.compare_exchange_weak(tail, next,
+> -                    std::memory_order_relaxed, std::memory_order_relaxed);
+> +                    std::memory_order_release, std::memory_order_relaxed);
+>              } else {
+> -                // BUG 3: Reading value before successful CAS
+> -                // and with no memory ordering guarantee
+> -                value = next->value;
+> -
+> -                // BUG 1: Using relaxed for dequeue CAS
+> -                if (head_.compare_exchange_weak(head, next,
+> -                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+> -                    // BUG 4: Immediately freeing the old head
+> -                    // Race with other threads that might still see this node
+> -                    free_node(head);
+> +                // next was linked with release; our acquire load of next ensures
+> +                // we see the correct value.
+> +                uint64_t v = next->value;
+> +
+> +                if (head_.compare_exchange_weak(head, next,
+> +                        std::memory_order_release, std::memory_order_relaxed)) {
+> +                    value = v;
+> +                    clear_hazard(hz1);
+> +                    clear_hazard(hz0);
+> +                    retire_node(head);
+>                      return true;
+>                  }
+>                  // CAS failed, value might be stale, retry
+>              }
+>          }
+>      }
+>  }
+> *** End Patch
+> PATCH
+bash: apply_patch: command not found
+root@0f3eca341fe0:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@0f3eca341fe0:/app# time -p /app/stress_test | tail -n 20
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+real 4.57
+user 0.44
+sys 0.06
+root@0f3eca341fe0:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@0f3eca341fe0:/app# /app/stress_test_tsan 2>&1 | tail -n 50
+

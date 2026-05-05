@@ -1,0 +1,22 @@
+
+
+Let me reconsider and run a few more edge case tests before marking complete, particularly around the `**` pattern handling and Unicode collision behavior.
+
+{
+  "analysis": "I want to verify a few more edge cases before finalizing: ** pattern handling (should be literal two stars, not recursive glob), Unicode NFC collision handling, and ensure the rooted pattern `/build` correctly handles files inside build/ directory.",
+  "plan": "Run additional edge case tests to be thorough before marking complete.",
+  "commands": [
+    {
+      "keystrokes": "python3 << 'TEST_EOF'\nfrom app.indexer import _custom_match\n\n# ** should match literal ** in text, not be a recursive glob\nassert _custom_match('**', '**') == True, 'literal ** should match **'\nassert _custom_match('**', 'abc') == False, '** should not match abc'\nassert _custom_match('a/**/b', 'a/**/b') == True\nassert _custom_match('a/**/b', 'a/x/y/b') == False  # ** is literal, not recursive\n\n# Single * should not match /\nassert _custom_match('*.txt', 'hello.txt') == True\nassert _custom_match('*.txt', 'a/hello.txt') == False  # * can't match /\nassert _custom_match('*/*', 'a/b') == True\nassert _custom_match('*/*', 'a/b/c') == False\n\nprint('Pattern matching PASS')\nTEST_EOF\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 << 'TEST_EOF'\nimport os, tempfile, sqlite3, unicodedata\nfrom app.indexer import build_index\n\n# Test Unicode NFC collision\n# e-acute can be represented as U+00E9 (NFC) or U+0065 U+0301 (NFD)\ntd = tempfile.mkdtemp()\n\n# Create two files that normalize to the same NFC path\nnfc_name = 'caf\\u00e9.txt'  # NFC form\nnfd_name = 'cafe\\u0301.txt'  # NFD form\n\nprint('NFC name:', repr(nfc_name))\nprint('NFD name:', repr(nfd_name))\nprint('NFC of NFC:', repr(unicodedata.normalize('NFC', nfc_name)))\nprint('NFC of NFD:', repr(unicodedata.normalize('NFC', nfd_name)))\nprint('Same after NFC?', unicodedata.normalize('NFC', nfc_name) == unicodedata.normalize('NFC', nfd_name))\n\n# Write both files\nwith open(os.path.join(td, nfc_name), 'w') as f:\n    f.write('nfc content')\nwith open(os.path.join(td, nfd_name), 'w') as f:\n    f.write('nfd content')\n\n# Check what files exist\nfor entry in sorted(os.listdir(td)):\n    print('Entry:', repr(entry), 'NFC:', repr(unicodedata.normalize('NFC', entry)))\n\ndb = os.path.join(tempfile.mkdtemp(), 'test.db')\nbuild_index(td, db)\n\nconn = sqlite3.connect(db)\nrows = conn.execute('SELECT path, sha256, size FROM files ORDER BY path').fetchall()\nfor r in rows:\n    print('Row:', r)\n\n# On Linux, both files may actually exist as separate entries\n# The collision handling should keep the lexicographically largest original\nprint(f'Row count: {len(rows)}')\nconn.close()\nprint('Unicode collision test done')\nTEST_EOF\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "python3 << 'TEST_EOF'\nimport os, tempfile, sqlite3\nfrom app.indexer import build_index\n\n# Test: rooted pattern /build should match file 'build' at root\n# but also test if it matches 'build/obj/out.o' - it shouldn't because\n# the pattern 'build' (after stripping /) is matched against full path 'build/obj/out.o'\n# and * doesn't match /, so 'build' won't match 'build/obj/out.o'\ntd = tempfile.mkdtemp()\nos.makedirs(os.path.join(td, 'build', 'obj'))\nwith open(os.path.join(td, 'build', 'obj', 'out.o'), 'w') as f:\n    f.write('object')\nwith open(os.path.join(td, 'build', 'output.bin'), 'w') as f:\n    f.write('binary')\nwith open(os.path.join(td, 'README.md'), 'w') as f:\n    f.write('readme')\n\nwith open('/data/ignore.txt', 'w') as f:\n    f.write('/build/*\\n')  # rooted: match build/* at root level only\n\ndb = os.path.join(tempfile.mkdtemp(), 'test.db')\nbuild_index(td, db)\n\nconn = sqlite3.connect(db)\nrows = conn.execute('SELECT path FROM files ORDER BY path').fetchall()\nprint('With /build/*:', rows)\n# /build/* should match build/output.bin (full path) but NOT build/obj/out.o (* can't match /)\nconn.close()\n\nos.remove('/data/ignore.txt')\nprint('Rooted pattern test done')\nTEST_EOF\n",
+      "duration": 2.0
+    }
+  ]
+}

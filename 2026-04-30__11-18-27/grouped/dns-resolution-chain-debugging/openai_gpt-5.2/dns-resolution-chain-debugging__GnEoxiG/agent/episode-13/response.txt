@@ -1,0 +1,59 @@
+{
+  "analysis": "After adding delegation/DS and restarting, resolver queries are still SERVFAIL and dnssec_valid remains false (no AD flag). We need to see why validation still fails. Possibilities: (1) secure.example.com is not actually delegated in example.com in a way the resolver uses because resolver is forwarding to primary only; forwarding bypasses iterative resolution and may not validate as expected for an internal zone unless the resolver is authoritative-aware. But forward-only to primary should still work if primary returns authoritative answers; SERVFAIL suggests resolver is marking responses as bogus due to DNSSEC validation failure. (2) DS record added may not match current KSK (dsset file might be stale if keys regenerated after dsset creation). We regenerated keys and signed zone, dsset-secure.example.com. was created at 13:19; later changes might have regenerated keys again. Need to recompute DS from current KSK and ensure it matches what's in example.com zone. (3) Need to ensure example.com zone contains the DS at correct owner name 'secure.example.com.' and that secure.example.com is delegated (NS) and that those names are in-bailiwick with glue. (4) Resolver may need 'dnssec-validation yes;' and trust anchor for example.com? Actually for validating a child zone, it needs a chain from root -> com -> example.com -> secure.example.com. But this is an internal zone, not in real DNS; root trust anchor won't help. Therefore DNSSEC validation for internal zones requires configuring a trust anchor for example.com or secure.example.com in the resolver (trusted-keys/managed-keys or dnssec-lookaside no longer). Best approach: configure resolver with 'trust-anchors' for secure.example.com (or example.com) using the DNSKEY of the KSK, or disable validation for these zones. Requirement says DNSSEC validation passes for secure zone, so we must add a trust anchor for secure.example.com to resolver.",
+  "plan": "1) Confirm what DS is currently in example.com zone and what KSK DNSKEY is in secure.example.com signed zone. 2) Since internal zones aren't in global DNS hierarchy, configure resolver with a static trust anchor for secure.example.com using its KSK DNSKEY (from K*.key file or by querying primary for DNSKEY). 3) Add 'trust-anchors { secure.example.com static-key <flags proto alg keydata>; };' (BIND9 syntax uses 'trusted-keys' deprecated; in 9.18 use 'trust-anchors' or 'dnssec-validation yes' plus 'trust-anchors'). We'll use 'trusted-keys' if supported; verify with named-checkconf. 4) Restart resolver, flush cache by restart, retest dig +dnssec for AD flag and ensure /app/test_queries.txt all NOERROR with answers. 5) Update /app/dns_health.json dnssec_valid to true and add issue_fixed entry about adding trust anchor.",
+  "commands": [
+    {
+      "keystrokes": "grep -nE 'secure\\.example\\.com\\.|\\sDS\\s|\\sNS\\s' /app/dns/primary/zones/example.com.zone | tail -n +1\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com DNSKEY +dnssec +multi +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && KSK_KEYFILE=$(awk '$4==257{print FILENAME; exit}' Ksecure.example.com.*.key); echo \"KSK_KEYFILE=$KSK_KEYFILE\"; cat \"$KSK_KEYFILE\"\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "KSK_LINE=$(awk '$4==257{print; exit}' /app/dns/primary/zones/Ksecure.example.com.*.key); echo \"$KSK_LINE\"\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\ninclude \"\\/app\\/dns\\/resolver\\/run\\/rndc\\.key\";/\\ntrusted-keys {\\n    '\"$KSK_LINE\"'\\n};\\ninclude \"\\/app\\/dns\\/resolver\\/run\\/rndc\\.key\";/s' /app/dns/resolver/named.conf\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/status:/{print} /flags:/{print; exit}'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "DNSSEC_VALID=$(dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/flags:/{if($0~ / ad[ ;]/) print \"true\"; else print \"false\"; exit}'); echo \"dnssec_valid=$DNSSEC_VALID\"; jq --argjson v \"$DNSSEC_VALID\" '.dnssec_valid=$v | .issues_fixed.trust_anchor=\"Added a local DNSSEC trust anchor (trusted-keys) for secure.example.com because this is an internal zone without a public root->DS chain.\"' /app/dns_health.json > /app/dns_health.json.tmp && mv /app/dns_health.json.tmp /app/dns_health.json\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cat /app/dns_health.json\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

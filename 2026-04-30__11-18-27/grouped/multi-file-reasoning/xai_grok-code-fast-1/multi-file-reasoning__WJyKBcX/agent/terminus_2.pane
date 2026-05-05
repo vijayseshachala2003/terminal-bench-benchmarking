@@ -1,0 +1,2027 @@
+[?2004hroot@a66f5f15a741:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@a66f5f15a741:/app# clear
+[?2004l[H[J[3J[?2004hroot@a66f5f15a741:/app# cat > analyze_deps.py << 'EOF'
+[?2004l[?2004h> import ast
+[?2004l[?2004h> import json
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import argparse
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> from collections import defaultdict, deque
+[?2004l[?2004h> import builtins
+[?2004l[?2004h> 
+[?2004l[?2004h> class StaticAnalyzer:
+[?2004l[?2004h>     def __init__(self, project_dir):
+[?2004l[?2004h>         self.project_dir = Path(project_dir)
+[?2004l[?2004h>         self.py_files = list(self.project_dir.rglob('*.py'))
+[?2004l[?2004h>         self.modules = {}  # filename -> module info
+[?2004l[?2004h>         self.import_graph = defaultdict(set)
+[?2004l[?2004h>         self.reverse_graph = defaultdict(set)
+[?2004l[?2004h>         self.errors = []
+[?2004l[?2004h>         self.defined_names = {}  # file -> scope -> set of names
+[?2004l[?2004h>         self.used_names = {}  # file -> set of used names
+[?2004l[?2004h>         self.exports = {}  # module -> set of exported names
+[?2004l[?2004h>         self.function_sigs = {}  # module -> func_name -> (min_args, max_args)
+[?2004l[?2004h>         self.builtins = set(dir(builtins))
+[?2004l[?2004h> 
+[?2004l[?2004h>     def run(self):
+[?2004l[?2004h>         if not self.project_dir.exists():
+[?2004l[?2004h>             self.errors.append({
+[?2004l[?2004h>                 'type': 'invalid_import',
+[?2004l[?2004h>                 'file': '/app/project',
+[?2004l[?2004h>                 'message': 'Project directory does not exist'
+[?2004l[?2004h>             })
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         if not self.py_files:
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content, filename=str(file))
+[?2004l[?2004h>                 self.analyze_file(file, tree)
+[?2004l[?2004h>             except SyntaxError:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Unparseable file: {file.name}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Error parsing {file.name}: {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>         self.check_categories()
+[?2004l[?2004h>         return self.report()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def to_app_path(self, path):
+[?2004l[?2004h>         rel = path.relative_to(self.project_dir)
+[?2004l[?2004h>         return '/app/' + str(rel).replace(os.sep, '/')
+[?2004l[?2004h> 
+[?2004l[?2004h>     def analyze_file(self, file, tree):
+[?2004l[?2004h>         rel_file = file.relative_to(self.project_dir)
+[?2004l[?2004h>         module_name = '.'.join(rel_file.with_suffix('').parts)
+[?2004l[?2004h>         self.modules[str(rel_file)] = module_name
+[?2004l[?2004h>         self.defined_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.used_names[str(rel_file)] = set()
+[?2004l[?2004h>         self.exports[module_name] = set()
+[?2004l[?2004h>         visitor = AnalyzerVisitor(self, file, module_name)
+[?2004l[?2004h>         visitor.visit(tree)
+[?2004l[?2004h>         self.exports[module_name] = visitor.exports
+[?2004l[?2004h>         self.function_sigs[module_name] = visitor.function_sigs
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_categories(self):
+[?2004l[?2004h>         # 1. Valid Imports
+[?2004l[?2004h>         valid_imports = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = file.relative_to(self.project_dir)
+[?2004l[?2004h>             visitor = ImportVisitor(self, str(rel_file))
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content)
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for imp in visitor.imports:
+[?2004l[?2004h>                     if not self.resolve_import(imp, str(rel_file)):
+[?2004l[?2004h>                         valid_imports = False
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'invalid_import',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Unresolvable import: {imp}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 2. No Circular Deps
+[?2004l[?2004h>         no_circular_deps = True
+[?2004l[?2004h>         visited = set()
+[?2004l[?2004h>         rec_stack = set()
+[?2004l[?2004h>         for node in self.import_graph:
+[?2004l[?2004h>             if node not in visited:
+[?2004l[?2004h>                 if self.has_cycle(node, visited, rec_stack):
+[?2004l[?2004h>                     no_circular_deps = False
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 3. No Unused Imports
+[?2004l[?2004h>         no_unused_imports = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             visitor = ImportVisitor(self, rel_file)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content)
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 used = self.used_names[rel_file]
+[?2004l[?2004h>                 for imp in visitor.imports:
+[?2004l[?2004h>                     if imp not in used:
+[?2004l[?2004h>                         no_unused_imports = False
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'unused_import',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Unused import: {imp}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 4. All Refs Defined
+[?2004l[?2004h>         all_refs_defined = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             if rel_file not in self.defined_names:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             for scope, defs in self.defined_names[rel_file].items():
+[?2004l[?2004h>                 for name in self.used_names[rel_file]:
+[?2004l[?2004h>                     if name not in defs and name not in self.builtins:
+[?2004l[?2004h>                         all_refs_defined = False
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'undefined_reference',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Undefined reference: {name}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 5. Valid Attribute Access
+[?2004l[?2004h>         valid_attribute_access = True
+[?2004l[?2004h>         # This would require more AST traversal, simplified for now
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 6. Type Consistency
+[?2004l[?2004h>         type_consistent = True
+[?2004l[?2004h>         # Check function calls
+[?2004l[?2004h> 
+[?2004l[?2004h>         self.results = {
+[?2004l[?2004h>             'valid_imports': valid_imports,
+[?2004l[?2004h>             'no_circular_deps': no_circular_deps,
+[?2004l[?2004h>             'no_unused_imports': no_unused_imports,
+[?2004l[?2004h>             'all_refs_defined': all_refs_defined,
+[?2004l[?2004h>             'valid_attribute_access': True,  # Placeholder
+[?2004l[?2004h>             'type_consistent': True,  # Placeholder
+[?2004l[?2004h>             'errors': self.errors
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h>     def has_cycle(self, node, visited, rec_stack):
+[?2004l[?2004h>         visited.add(node)
+[?2004l[?2004h>         rec_stack.add(node)
+[?2004l[?2004h>         for neighbor in self.import_graph[node]:
+[?2004l[?2004h>             if neighbor not in visited:
+[?2004l[?2004h>                 if self.has_cycle(neighbor, visited, rec_stack):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>             elif neighbor in rec_stack:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'circular_dependency',
+[?2004l[?2004h>                     'file': '/app/project',
+[?2004l[?2004h>                     'message': f'Cycle: {node} -> {neighbor}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         rec_stack.remove(node)
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h>     def resolve_import(self, imp, from_file):
+[?2004l[?2004h>         # Simplified: check if file exists
+[?2004l[?2004h>         parts = imp.split('.')
+[?2004l[?2004h>         path = self.project_dir
+[?2004l[?2004h>         for part in parts:
+[?2004l[?2004h>             path = path / part
+[?2004l[?2004h>         if (path / '__init__.py').exists() or (path.with_suffix('.py')).exists():
+[?2004l[?2004h>             return True
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h>     def report(self):
+[?2004l[?2004h>         return {
+[?2004l[?2004h>             'valid_imports': True if not self.errors else False,
+[?2004l[?2004h>             'no_circular_deps': True if not any(e['type'] == 'circular_dependency' for e in self.errors) else False,
+[?2004l[?2004h>             'no_unused_imports': True if not any(e['type'] == 'unused_import' for e in self.errors) else False,
+[?2004l[?2004h>             'all_refs_defined': True if not any(e['type'] == 'undefined_reference' for e in self.errors) else False,
+[?2004l[?2004h>             'valid_attribute_access': True,
+[?2004l[?2004h>             'type_consistent': True,
+[?2004l[?2004h>             'errors': self.errors
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> class ImportVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>             self.analyzer.import_graph[self.file].add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             if alias.name == '*':
+[?2004l[?2004h>                 # Handle wildcard
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AnalyzerVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.scope = []
+[?2004l[?2004h>         self.exports = set()
+[?2004l[?2004h>         self.function_sigs = {}
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_FunctionDef(self, node):
+[?2004l[?2004h>         self.analyzer.defined_names[str(self.file.relative_to(self.analyzer.project_dir))]['global'].add(node.name)
+[?2004l[?2004h>         self.scope.append(node.name)
+[?2004l[?2004h>         self.function_sigs[node.name] = (len([a for a in node.args.args if not a.annotation]), len(node.args.args))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h>         self.scope.pop()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Name(self, node):
+[?2004l[?2004h>         if isinstance(node.ctx, ast.Load):
+[?2004l[?2004h>             rel_file = str(self.file.relative_to(self.analyzer.project_dir))
+[?2004l[?2004h>             self.analyzer.used_names[rel_file].add(node.id)
+[?2004l[?2004h>         elif isinstance(node.ctx, ast.Store):
+[?2004l[?2004h>             rel_file = str(self.file.relative_to(self.analyzer.project_dir))
+[?2004l[?2004h>             scope = 'global' if not self.scope else self.scope[-1]
+[?2004l[?2004h>             self.analyzer.defined_names[rel_file][scope].add(node.id)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     parser = argparse.ArgumentParser()
+[?2004l[?2004h>     parser.add_argument('--project-dir', required=True)
+[?2004l[?2004h>     parser.add_argument('--out', required=True)
+[?2004l[?2004h>     args = parser.parse_args()
+[?2004l[?2004h>     analyzer = StaticAnalyzer(args.project_dir)
+[?2004l[?2004h>     result = analyzer.run()
+[?2004l[?2004h>     with open(args.out, 'w') as f:
+[?2004l[?2004h>         json.dump(result, f, indent=2)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a66f5f15a741:/app# python -m py_compile analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004lTraceback (most recent call last):
+  File [35m"/app/analyze_deps.py"[0m, line [35m249[0m, in [35m<module>[0m
+    result = analyzer.run()
+  File [35m"/app/analyze_deps.py"[0m, line [35m52[0m, in [35mrun[0m
+    [31mself.check_categories[0m[1;31m()[0m
+    [31m~~~~~~~~~~~~~~~~~~~~~[0m[1;31m^^[0m
+  File [35m"/app/analyze_deps.py"[0m, line [35m97[0m, in [35mcheck_categories[0m
+    for node in [1;31mself.import_graph[0m:
+                [1;31m^^^^^^^^^^^^^^^^^[0m
+[1;35mRuntimeError[0m: [35mdictionary changed size during iteration[0m
+[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004lcat: report.json: No such file or directory
+[?2004hroot@a66f5f15a741:/app# cat > analyze_deps.py << 'EOF'
+[?2004l[?2004h> import ast
+[?2004l[?2004h> import json
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import argparse
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> from collections import defaultdict, deque
+[?2004l[?2004h> import builtins
+[?2004l[?2004h> 
+[?2004l[?2004h> class StaticAnalyzer:
+[?2004l[?2004h>     def __init__(self, project_dir):
+[?2004l[?2004h>         self.project_dir = Path(project_dir)
+[?2004l[?2004h>         self.py_files = list(self.project_dir.rglob('*.py'))
+[?2004l[?2004h>         self.modules = {}  # filename -> module info
+[?2004l[?2004h>         self.import_graph = defaultdict(set)
+[?2004l[?2004h>         self.reverse_graph = defaultdict(set)
+[?2004l[?2004h>         self.errors = []
+[?2004l[?2004h>         self.defined_names = {}  # file -> {scope_path: set}
+[?2004l[?2004h>         self.used_names = {}  # file -> {scope_path: set}
+[?2004l[?2004h>         self.imported_names = {}  # file -> {name: source}
+[?2004l[?2004h>         self.exports = {}  # module -> set
+[?2004l[?2004h>         self.function_sigs = {}  # module -> func -> (min_args, max_args)
+[?2004l[?2004h>         self.builtins = set(dir(builtins))
+[?2004l[?2004h>         self.all_exports = {}  # module -> __all__ or public names
+[?2004l[?2004h> 
+[?2004l[?2004h>     def run(self):
+[?2004l[?2004h>         if not self.project_dir.exists():
+[?2004l[?2004h>             self.errors.append({
+[?2004l[?2004h>                 'type': 'invalid_import',
+[?2004l[?2004h>                 'file': '/app/project',
+[?2004l[?2004h>                 'message': 'Project directory does not exist'
+[?2004l[?2004h>             })
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         if not self.py_files:
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content, filename=str(file))
+[?2004l[?2004h>                 self.analyze_file(file, tree)
+[?2004l[?2004h>             except SyntaxError:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Unparseable file: {file.name}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Error parsing {file.name}: {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>         self.check_categories()
+[?2004l[?2004h>         return self.report()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def to_app_path(self, path):
+[?2004l[?2004h>         rel = path.relative_to(self.project_dir)
+[?2004l[?2004h>         return '/app/' + str(rel).replace(os.sep, '/')
+[?2004l[?2004h> 
+[?2004l[?2004h>     def analyze_file(self, file, tree):
+[?2004l[?2004h>         rel_file = file.relative_to(self.project_dir)
+[?2004l[?2004h>         module_name = '.'.join(rel_file.with_suffix('').parts)
+[?2004l[?2004h>         self.modules[str(rel_file)] = module_name
+[?2004l[?2004h>         self.defined_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.used_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.imported_names[str(rel_file)] = {}
+[?2004l[?2004h>         self.exports[module_name] = set()
+[?2004l[?2004h>         self.all_exports[module_name] = self.get_all_exports(file)
+[?2004l[?2004h>         visitor = AnalyzerVisitor(self, file, module_name)
+[?2004l[?2004h>         visitor.visit(tree)
+[?2004l[?2004h>         self.exports[module_name] = visitor.exports
+[?2004l[?2004h>         self.function_sigs[module_name] = visitor.function_sigs
+[?2004l[?2004h>         # Update import graph
+[?2004l[?2004h>         for imp in visitor.imports:
+[?2004l[?2004h>             if imp in self.modules:
+[?2004l[?2004h>                 self.import_graph[str(rel_file)].add(self.modules[imp])
+[?2004l[?2004h> 
+[?2004l[?2004h>     def get_all_exports(self, file):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, ast.Assign):
+[?2004l[?2004h>                     for target in node.targets:
+[?2004l[?2004h>                         if isinstance(target, ast.Name) and target.id == '__all__':
+[?2004l[?2004h>                             if isinstance(node.value, ast.List):
+[?2004l[?2004h>                                 return {elt.s for elt in node.value.elts if isinstance(elt, ast.Str)}
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         # Fallback: public names
+[?2004l[?2004h>         public = set()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign)):
+[?2004l[?2004h>                     if isinstance(node, ast.Assign):
+[?2004l[?2004h>                         for target in node.targets:
+[?2004l[?2004h>                             if isinstance(target, ast.Name) and not target.id.startswith('_'):
+[?2004l[?2004h>                                 public.add(target.id)
+[?2004l[?2004h>                     elif not node.name.startswith('_'):
+[?2004l[?2004h>                         public.add(node.name)
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         return public
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_categories(self):
+[?2004l[?2004h>         # 1. Valid Imports
+[?2004l[?2004h>         valid_imports = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             for name, source in self.imported_names[rel_file].items():
+[?2004l[?2004h>                 if not self.resolve_import(source, rel_file):
+[?2004l[?2004h>                     valid_imports = False
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'invalid_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unresolvable import: {source}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 2. No Circular Deps
+[?2004l[?2004h>         no_circular_deps = True
+[?2004l[?2004h>         visited = set()
+[?2004l[?2004h>         rec_stack = set()
+[?2004l[?2004h>         nodes = list(self.import_graph.keys())
+[?2004l[?2004h>         for node in nodes:
+[?2004l[?2004h>             if node not in visited:
+[?2004l[?2004h>                 if self.has_cycle(node, visited, rec_stack):
+[?2004l[?2004h>                     no_circular_deps = False
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 3. No Unused Imports
+[?2004l[?2004h>         no_unused_imports = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             used = set()
+[?2004l[?2004h>             for scope in self.used_names[rel_file].values():
+[?2004l[?2004h>                 used.update(scope)
+[?2004l[?2004h>             for name in self.imported_names[rel_file]:
+[?2004l[?2004h>                 if name not in used:
+[?2004l[?2004h>                     no_unused_imports = False
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'unused_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unused import: {name}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 4. All Refs Defined
+[?2004l[?2004h>         all_refs_defined = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             if rel_file not in self.defined_names:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             for scope, defs in self.defined_names[rel_file].items():
+[?2004l[?2004h>                 for name in self.used_names[rel_file][scope]:
+[?2004l[?2004h>                     if name not in defs and name not in self.imported_names[rel_file] and name not in self.builtins:
+[?2004l[?2004h>                         all_refs_defined = False
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'undefined_reference',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Undefined reference: {name}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 5. Valid Attribute Access
+[?2004l[?2004h>         valid_attribute_access = True
+[?2004l[?2004h>         # Simplified: check module attributes
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             visitor = AttributeVisitor(self, rel_file)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for mod, attr in visitor.accesses:
+[?2004l[?2004h>                     if mod in self.all_exports and attr not in self.all_exports[mod]:
+[?2004l[?2004h>                         valid_attribute_access = False
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'invalid_attribute_access',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Invalid attribute access: {mod}.{attr}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 6. Type Consistency
+[?2004l[?2004h>         type_consistent = True
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             module = self.modules[rel_file]
+[?2004l[?2004h>             visitor = CallVisitor(self, module)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for func, arg_count in visitor.calls:
+[?2004l[?2004h>                     if func in self.function_sigs[module]:
+[?2004l[?2004h>                         min_a, max_a = self.function_sigs[module][func]
+[?2004l[?2004h>                         if arg_count < min_a or (max_a is not None and arg_count > max_a):
+[?2004l[?2004h>                             type_consistent = False
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'type_error',
+[?2004l[?2004h>                                 'file': self.to_app_path(file),
+[?2004l[?2004h>                                 'message': f'Argument count mismatch for {func}: expected {min_a}-{max_a}, got {arg_count}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     def has_cycle(self, node, visited, rec_stack):
+[?2004l[?2004h>         visited.add(node)
+[?2004l[?2004h>         rec_stack.add(node)
+[?2004l[?2004h>         for neighbor in self.import_graph[node]:
+[?2004l[?2004h>             if neighbor not in visited:
+[?2004l[?2004h>                 if self.has_cycle(neighbor, visited, rec_stack):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>             elif neighbor in rec_stack:
+[?2004l[?2004h>                 cycle = [node, neighbor]
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'circular_dependency',
+[?2004l[?2004h>                     'file': '/app/project',
+[?2004l[?2004h>                     'message': f'Cycle: {" -> ".join(cycle)}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         rec_stack.remove(node)
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h>     def resolve_import(self, imp, from_file):
+[?2004l[?2004h>         # Resolve relative to from_file
+[?2004l[?2004h>         from_parts = from_file.split('/')
+[?2004l[?2004h>         if imp.startswith('.'):
+[?2004l[?2004h>             levels = len([c for c in imp if c == '.'])
+[?2004l[?2004h>             imp = imp[levels:]
+[?2004l[?2004h>             base = from_parts[:-levels] if levels < len(from_parts) else []
+[?2004l[?2004h>             parts = base + imp.split('.')
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             parts = imp.split('.')
+[?2004l[?2004h>         path = self.project_dir
+[?2004l[?2004h>         for part in parts:
+[?2004l[?2004h>             path = path / part
+[?2004l[?2004h>         return (path / '__init__.py').exists() or (path.with_suffix('.py')).exists()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def report(self):
+[?2004l[?2004h>         return {
+[?2004l[?2004h>             'valid_imports': not any(e['type'] == 'invalid_import' for e in self.errors),
+[?2004l[?2004h>             'no_circular_deps': not any(e['type'] == 'circular_dependency' for e in self.errors),
+[?2004l[?2004h>             'no_unused_imports': not any(e['type'] == 'unused_import' for e in self.errors),
+[?2004l[?2004h>             'all_refs_defined': not any(e['type'] == 'undefined_reference' for e in self.errors),
+[?2004l[?2004h>             'valid_attribute_access': not any(e['type'] == 'invalid_attribute_access' for e in self.errors),
+[?2004l[?2004h>             'type_consistent': not any(e['type'] == 'type_error' for e in self.errors),
+[?2004l[?2004h>             'errors': self.errors
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> class ImportVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.analyzer.imported_names[self.file][name] = alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             if alias.name == '*':
+[?2004l[?2004h>                 # Assume all from __all__
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.analyzer.imported_names[self.file][name] = f'{module}.{alias.name}'
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AnalyzerVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.scope_stack = ['global']
+[?2004l[?2004h>         self.exports = set()
+[?2004l[?2004h>         self.function_sigs = {}
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_FunctionDef(self, node):
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         self.analyzer.defined_names[str(self.file.relative_to(self.analyzer.project_dir))][scope].add(node.name)
+[?2004l[?2004h>         self.scope_stack.append(node.name)
+[?2004l[?2004h>         args = node.args.args
+[?2004l[?2004h>         min_args = len([a for a in args if a.default is None])
+[?2004l[?2004h>         max_args = len(args) if not node.args.vararg else None
+[?2004l[?2004h>         self.function_sigs[node.name] = (min_args, max_args)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h>         self.scope_stack.pop()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Name(self, node):
+[?2004l[?2004h>         rel_file = str(self.file.relative_to(self.analyzer.project_dir))
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         if isinstance(node.ctx, ast.Load):
+[?2004l[?2004h>             self.analyzer.used_names[rel_file][scope].add(node.id)
+[?2004l[?2004h>         elif isinstance(node.ctx, ast.Store):
+[?2004l[?2004h>             self.analyzer.defined_names[rel_file][scope].add(node.id)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             if alias.name != '*':
+[?2004l[?2004h>                 self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AttributeVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.accesses = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Attribute(self, node):
+[?2004l[?2004h>         if isinstance(node.value, ast.Name) and node.value.id in self.analyzer.imported_names[self.file]:
+[?2004l[?2004h>             mod = self.analyzer.imported_names[self.file][node.value.id]
+[?2004l[?2004h>             self.accesses.append((mod, node.attr))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class CallVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.calls = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Call(self, node):
+[?2004l[?2004h>         if isinstance(node.func, ast.Name):
+[?2004l[?2004h>             self.calls.append((node.func.id, len(node.args)))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     parser = argparse.ArgumentParser()
+[?2004l[?2004h>     parser.add_argument('--project-dir', required=True)
+[?2004l[?2004h>     parser.add_argument('--out', required=True)
+[?2004l[?2004h>     args = parser.parse_args()
+[?2004l[?2004h>     analyzer = StaticAnalyzer(args.project_dir)
+[?2004l[?2004h>     result = analyzer.run()
+[?2004l[?2004h>     with open(args.out, 'w') as f:
+[?2004l[?2004h>         json.dump(result, f, indent=2)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": false,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": true,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "invalid_import",
+      "file": "/app/analyze_deps.py",
+      "message": "Error parsing analyze_deps.py: 'arg' object has no attribute 'default'"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# sed -i 's/min_args = len(\[a for a in args if a.default is None\])/min_args = len(args) - len(defaults)/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i 's/args = node.args.args/args = node.args.args\ndefaults = node.args.defaults/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i 's/return {elt.s for elt in node.value.elts if isinstance(elt, ast.Str)}/return {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i "s/except SyntaxError:/except SyntaxError as e:\n                self.errors.append({\n                    'type': 'invalid_import',\n                    'file': self.to_app_path(file),\n                    'message': f'Unparseable file: {file.name} - {e}'\n                })\n                continue/" analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i "s/except Exception as e:/except Exception as e:\n                self.errors.append({\n                    'type': 'invalid_import',\n                    'file': self.to_app_path(file),\n                    'message': f'Error parsing {file.name}: {e}'\n                })\n                continue/" analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l  File [35m"/app/analyze_deps.py"[0m, line [35m304[0m
+    min_args = len(args) - len(defaults)
+[1;35mIndentationError[0m: [35munexpected indent[0m
+[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": false,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": true,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "invalid_import",
+      "file": "/app/analyze_deps.py",
+      "message": "Error parsing analyze_deps.py: 'arg' object has no attribute 'default'"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# cat > analyze_deps.py << 'EOF'
+[?2004l[?2004h> import ast
+[?2004l[?2004h> import json
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import argparse
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> from collections import defaultdict, deque
+[?2004l[?2004h> import builtins
+[?2004l[?2004h> 
+[?2004l[?2004h> class StaticAnalyzer:
+[?2004l[?2004h>     def __init__(self, project_dir):
+[?2004l[?2004h>         self.project_dir = Path(project_dir)
+[?2004l[?2004h>         self.py_files = list(self.project_dir.rglob('*.py'))
+[?2004l[?2004h>         self.modules = {}  # filename -> module info
+[?2004l[?2004h>         self.import_graph = defaultdict(set)
+[?2004l[?2004h>         self.reverse_graph = defaultdict(set)
+[?2004l[?2004h>         self.errors = []
+[?2004l[?2004h>         self.defined_names = {}  # file -> {scope_path: set}
+[?2004l[?2004h>         self.used_names = {}  # file -> {scope_path: set}
+[?2004l[?2004h>         self.imported_names = {}  # file -> {name: source}
+[?2004l[?2004h>         self.exports = {}  # module -> set
+[?2004l[?2004h>         self.function_sigs = {}  # module -> func -> (min_args, max_args)
+[?2004l[?2004h>         self.builtins = set(dir(builtins))
+[?2004l[?2004h>         self.all_exports = {}  # module -> __all__ or public names
+[?2004l[?2004h> 
+[?2004l[?2004h>     def run(self):
+[?2004l[?2004h>         if not self.project_dir.exists():
+[?2004l[?2004h>             self.errors.append({
+[?2004l[?2004h>                 'type': 'invalid_import',
+[?2004l[?2004h>                 'file': '/app/project',
+[?2004l[?2004h>                 'message': 'Project directory does not exist'
+[?2004l[?2004h>             })
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         if not self.py_files:
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content, filename=str(file))
+[?2004l[?2004h>                 self.analyze_file(file, tree)
+[?2004l[?2004h>             except SyntaxError as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Unparseable file: {file.name} - {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Error parsing {file.name}: {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>         self.check_categories()
+[?2004l[?2004h>         return self.report()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def to_app_path(self, path):
+[?2004l[?2004h>         rel = path.relative_to(self.project_dir)
+[?2004l[?2004h>         return '/app/' + str(rel).replace(os.sep, '/')
+[?2004l[?2004h> 
+[?2004l[?2004h>     def analyze_file(self, file, tree):
+[?2004l[?2004h>         rel_file = file.relative_to(self.project_dir)
+[?2004l[?2004h>         module_name = '.'.join(rel_file.with_suffix('').parts)
+[?2004l[?2004h>         self.modules[str(rel_file)] = module_name
+[?2004l[?2004h>         self.defined_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.used_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.imported_names[str(rel_file)] = {}
+[?2004l[?2004h>         self.exports[module_name] = set()
+[?2004l[?2004h>         self.all_exports[module_name] = self.get_all_exports(file)
+[?2004l[?2004h>         visitor = AnalyzerVisitor(self, file, module_name)
+[?2004l[?2004h>         visitor.visit(tree)
+[?2004l[?2004h>         self.exports[module_name] = visitor.exports
+[?2004l[?2004h>         self.function_sigs[module_name] = visitor.function_sigs
+[?2004l[?2004h>         # Update import graph
+[?2004l[?2004h>         for imp in visitor.imports:
+[?2004l[?2004h>             if imp in self.modules:
+[?2004l[?2004h>                 self.import_graph[str(rel_file)].add(self.modules[imp])
+[?2004l[?2004h> 
+[?2004l[?2004h>     def get_all_exports(self, file):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, ast.Assign):
+[?2004l[?2004h>                     for target in node.targets:
+[?2004l[?2004h>                         if isinstance(target, ast.Name) and target.id == '__all__':
+[?2004l[?2004h>                             if isinstance(node.value, ast.List):
+[?2004l[?2004h>                                 return {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         # Fallback: public names
+[?2004l[?2004h>         public = set()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign)):
+[?2004l[?2004h>                     if isinstance(node, ast.Assign):
+[?2004l[?2004h>                         for target in node.targets:
+[?2004l[?2004h>                             if isinstance(target, ast.Name) and not target.id.startswith('_'):
+[?2004l[?2004h>                                 public.add(target.id)
+[?2004l[?2004h>                     elif not node.name.startswith('_'):
+[?2004l[?2004h>                         public.add(node.name)
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         return public
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_categories(self):
+[?2004l[?2004h>         # 1. Valid Imports
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             for name, source in self.imported_names[rel_file].items():
+[?2004l[?2004h>                 if not self.resolve_import(source, rel_file):
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'invalid_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unresolvable import: {source}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 2. No Circular Deps
+[?2004l[?2004h>         visited = set()
+[?2004l[?2004h>         rec_stack = set()
+[?2004l[?2004h>         nodes = list(self.import_graph.keys())
+[?2004l[?2004h>         for node in nodes:
+[?2004l[?2004h>             if node not in visited:
+[?2004l[?2004h>                 self.has_cycle(node, visited, rec_stack)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 3. No Unused Imports
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             used = set()
+[?2004l[?2004h>             for scope in self.used_names[rel_file].values():
+[?2004l[?2004h>                 used.update(scope)
+[?2004l[?2004h>             for name in self.imported_names[rel_file]:
+[?2004l[?2004h>                 if name not in used:
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'unused_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unused import: {name}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 4. All Refs Defined
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             if rel_file not in self.defined_names:
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             for scope, defs in self.defined_names[rel_file].items():
+[?2004l[?2004h>                 for name in self.used_names[rel_file][scope]:
+[?2004l[?2004h>                     if name not in defs and name not in self.imported_names[rel_file] and name not in self.builtins:
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'undefined_reference',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Undefined reference: {name}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 5. Valid Attribute Access
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             visitor = AttributeVisitor(self, rel_file)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for mod, attr in visitor.accesses:
+[?2004l[?2004h>                     if mod in self.all_exports and attr not in self.all_exports[mod]:
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'invalid_attribute_access',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Invalid attribute access: {mod}.{attr}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l:[?2004h>         # 6. Type Consistency
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             module = self.modules[rel_file]
+[?2004l[?2004h>             visitor = CallVisitor(self, module)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for func, arg_count in visitor.calls:
+[?2004l[?2004h>                     if func in self.function_sigs[module]:
+[?2004l[?2004h>                         min_a, max_a = self.function_sigs[module][func]
+[?2004l[?2004h>                         if arg_count < min_a or (max_a is not None and arg_count > max_a):
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'type_error',
+[?2004l[?2004h>                                 'file': self.to_app_path(file),
+[?2004l[?2004h>                                 'message': f'Argument count mismatch for {func}: expected {min_a}-{max_a if max_a else "inf"}, got {arg_count}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     def has_cycle(self, node, visited, rec_stack):
+[?2004l[?2004h>         visited.add(node)
+[?2004l[?2004h>         rec_stack.add(node)
+[?2004l[?2004h>         for neighbor in self.import_graph[node]:
+[?2004l[?2004h>             if neighbor not in visited:
+[?2004l[?2004h>                 if self.has_cycle(neighbor, visited, rec_stack):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>             elif neighbor in rec_stack:
+[?2004l[?2004h>                 cycle = [node, neighbor]
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'circular_dependency',
+[?2004l[?2004h>                     'file': '/app/project',
+[?2004l[?2004h>                     'message': f'Cycle: {" -> ".join(cycle)}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         rec_stack.remove(node)
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h>     def resolve_import(self, imp, from_file):
+[?2004l[?2004h>         # Resolve relative to from_file
+[?2004l[?2004h>         from_parts = from_file.split('/')
+[?2004l[?2004h>         if imp.startswith('.'):
+[?2004l[?2004h>             levels = len([c for c in imp if c == '.'])
+[?2004l[?2004h>             imp = imp[levels:]
+[?2004l[?2004h>             base = from_parts[:-levels] if levels < len(from_parts) else []
+[?2004l[?2004h>             parts = base + imp.split('.')
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             parts = imp.split('.')
+[?2004l[?2004h>         path = self.project_dir
+[?2004l[?2004h>         for part in parts:
+[?2004l[?2004h>             path = path / part
+[?2004l[?2004h>         return (path / '__init__.py').exists() or (path.with_suffix('.py')).exists()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def report(self):
+[?2004l[?2004h>         return {
+[?2004l[?2004h>             'valid_imports': not any(e['type'] == 'invalid_import' for e in self.errors),
+[?2004l[?2004h>             'no_circular_deps': not any(e['type'] == 'circular_dependency' for e in self.errors),
+[?2004l[?2004h>             'no_unused_imports': not any(e['type'] == 'unused_import' for e in self.errors),
+[?2004l[?2004h>             'all_refs_defined': not any(e['type'] == 'undefined_reference' for e in self.errors),
+[?2004l[?2004h>             'valid_attribute_access': not any(e['type'] == 'invalid_attribute_access' for e in self.errors),
+[?2004l[?2004h>             'type_consistent': not any(e['type'] == 'type_error' for e in self.errors),
+[?2004l[?2004h>             'errors': self.errors
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> class ImportVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.analyzer.imported_names[self.file][name] = alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             if alias.name == '*':
+[?2004l[?2004h>                 # Assume all from __all__
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.analyzer.imported_names[self.file][name] = f'{module}.{alias.name}'
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AnalyzerVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.scope_stack = ['global']
+[?2004l[?2004h>         self.exports = set()
+[?2004l[?2004h>         self.function_sigs = {}
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_FunctionDef(self, node):
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         self.analyzer.defined_names[str(self.file.relative_to(self.analyzer.project_dir))][scope].add(node.name)
+[?2004l[?2004h>         self.scope_stack.append(node.name)
+[?2004l[?2004h>         args = node.args.args
+[?2004l[?2004h>         defaults = node.args.defaults
+[?2004l[?2004h>         min_args = len(args) - len(defaults)
+[?2004l[?2004h>         max_args = len(args) if not node.args.vararg else None
+[?2004l[?2004h>         self.function_sigs[node.name] = (min_args, max_args)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h>         self.scope_stack.pop()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Name(self, node):
+[?2004l[?2004h>         rel_file = str(self.file.relative_to(self.analyzer.project_dir))
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         if isinstance(node.ctx, ast.Load):
+[?2004l[?2004h>             self.analyzer.used_names[rel_file][scope].add(node.id)
+[?2004l[?2004h>         elif isinstance(node.ctx, ast.Store):
+[?2004l[?2004h>             self.analyzer.defined_names[rel_file][scope].add(node.id)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             if alias.name != '*':
+[?2004l[?2004h>                 self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AttributeVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.accesses = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Attribute(self, node):
+[?2004l[?2004h>         if isinstance(node.value, ast.Name) and node.value.id in self.analyzer.imported_names[self.file]:
+[?2004l[?2004h>             mod = self.analyzer.imported_names[self.file][node.value.id]
+[?2004l[?2004h>             self.accesses.append((mod, node.attr))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class CallVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.calls = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Call(self, node):
+[?2004l[?2004h>         if isinstance(node.func, ast.Name):
+[?2004l[?2004h>             self.calls.append((node.func.id, len(node.args)))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     parser = argparse.ArgumentParser()
+[?2004l[?2004h>     parser.add_argument('--project-dir', required=True)
+[?2004l[?2004h>     parser.add_argument('--out', required=True)
+[?2004l[?2004h>     args = parser.parse_args()
+[?2004l[?2004h>     analyzer = StaticAnalyzer(args.project_dir)
+[?2004l[?2004h>     result = analyzer.run()
+[?2004l[?2004h>     with open(args.out, 'w') as f:
+[?2004l[?2004h>         json.dump(result, f, indent=2)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": true,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": false,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: StaticAnalyzer"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: argparse"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: json"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: e"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: os"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: path"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AnalyzerVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: tree"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: CallVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AttributeVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: rec_stack"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: visited"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: from_file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# sed -i 's/visitor.visit(tree)/visitor.visit(tree)\n        self.defined_names[str(rel_file)]["global"].update(self.imported_names[str(rel_file)].keys())/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i 's/        for scope, defs in self.defined_names[rel_file].items():/        def get_cumulative_defs(file, scope):\n            parts = scope.split(".")\n            cum_defs = set()\n            for i in range(len(parts)):\n                s = ".".join(parts[:i+1])\n                cum_defs.update(self.defined_names[file].get(s, set()))\n            return cum_defs\n\n        for scope, defs in self.defined_names[rel_file].items():/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i 's/                for name in self.used_names[rel_file][scope]:\n                    if name not in defs and name not in self.imported_names[rel_file] and name not in self.builtins:/                for name in self.used_names[rel_file][scope]:\n                    cum_defs = get_cumulative_defs(rel_file, scope)\n                    if name not in cum_defs and name not in self.imported_names[rel_file] and name not in self.builtins:/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l  File [35m"/app/analyze_deps.py"[0m, line [35m167[0m
+    self.defined_names[str(rel_file)]["global"].update(self.imported_names[str(rel_file)].keys())
+[1;35mSyntaxError[0m: [35mexpected 'except' or 'finally' block[0m
+[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": true,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": false,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: StaticAnalyzer"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: argparse"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: json"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: e"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: os"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: path"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AnalyzerVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: tree"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: CallVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AttributeVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: rec_stack"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: visited"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: from_file"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: self"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: node"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# cat > analyze_deps.py << 'EOF'
+[?2004l[?2004h> import ast
+[?2004l    })
+                continue
+        self.check_categories()
+        return self.report()
+
+    def to_app_path(self, path):
+        rel = path.relative_to(self.project_dir)
+        return '/app/' + str(rel).replace(os.sep, '/')
+
+    def analyze_file(self, file, tree):
+        rel_file = file.relative_to(self.project_dir)
+        module_name = '.'.join(rel_file.with_suffix('').parts)
+        self.modules[str(rel_file)] = module_name
+        self.defined_names[str(rel_file)] = defaultdict(set)
+        self.used_names[str(rel_file)] = defaultdict(set)
+        self.imported_names[str(rel_file)] = {}
+        self.exports[module_name] = set()
+        self.all_exports[module_name] = self.get_all_exports(file)
+        visitor = AnalyzerVisitor(self, file, module_name)
+        visitor.visit(tree)
+        self.exports[module_name] = visitor.exports
+        self.function_sigs[module_name] = visitor.function_sigs
+        # Add imported names to global scope
+        self.defined_names[str(rel_file)]['global'].update(se[?2004h> import json
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import argparse
+[?2004l[?2004h> from pathlib import Path
+[?2004l[?2004h> from collections import defaultdict, deque
+[?2004l[?2004h> import builtins
+[?2004l[?2004h> 
+[?2004l[?2004h> class StaticAnalyzer:
+[?2004l[?2004h>     def __init__(self, project_dir):
+[?2004l[?2004h>         self.project_dir = Path(project_dir)
+[?2004l[?2004h>         self.py_files = list(self.project_dir.rglob('*.py'))
+[?2004l[?2004h>         self.modules = {}  # filename -> module info
+[?2004l[?2004h>         self.import_graph = defaultdict(set)
+[?2004l[?2004h>         self.reverse_graph = defaultdict(set)
+[?2004l[?2004h>         self.errors = []
+[?2004l[?2004h>         self.defined_names = {}  # file -> {scope: set}
+[?2004l[?2004h>         self.used_names = {}  # file -> {scope: set}
+[?2004l[?2004h>         self.imported_names = {}  # file -> {name: source}
+[?2004l[?2004h>         self.exports = {}  # module -> set
+[?2004l[?2004h>         self.function_sigs = {}  # module -> func -> (min_args, max_args)
+[?2004l[?2004h>         self.builtins = set(dir(builtins))
+[?2004l[?2004h>         self.all_exports = {}  # module -> __all__ or public names
+[?2004l[?2004h> 
+[?2004l)[?2004h>     def run(self):
+[?2004l[?2004h>         if not self.project_dir.exists():
+[?2004l[?2004h>             self.errors.append({
+[?2004l[?2004h>                 'type': 'invalid_import',
+[?2004l[?2004h>                 'file': '/app/project',
+[?2004l[?2004h>                 'message': 'Project directory does not exist'
+[?2004l[?2004h>             })
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         if not self.py_files:
+[?2004l[?2004h>             return self.report()
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>                     content = f.read()
+[?2004l[?2004h>                 tree = ast.parse(content, filename=str(file))
+[?2004l[?2004h>                 self.analyze_file(file, tree)
+[?2004l[?2004h>             except SyntaxError as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Unparseable file: {file.name} - {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             except Exception as e:
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'invalid_import',
+[?2004l[?2004h>                     'file': self.to_app_path(file),
+[?2004l[?2004h>                     'message': f'Error parsing {file.name}: {e}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>         self.check_categories()
+[?2004l[?2004h>         return self.report()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def to_app_path(self, path):
+[?2004l[?2004h>         rel = path.relative_to(self.project_dir)
+[?2004l[?2004h>         return '/app/' + str(rel).replace(os.sep, '/')
+[?2004l[?2004h> 
+[?2004l[?2004h>     def analyze_file(self, file, tree):
+[?2004l[?2004h>         rel_file = file.relative_to(self.project_dir)
+[?2004l[?2004h>         module_name = '.'.join(rel_file.with_suffix('').parts)
+[?2004l[?2004h>         self.modules[str(rel_file)] = module_name
+[?2004l[?2004h>         self.defined_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.used_names[str(rel_file)] = defaultdict(set)
+[?2004l[?2004h>         self.imported_names[str(rel_file)] = {}
+[?2004l[?2004h>         self.exports[module_name] = set()
+[?2004l[?2004h>         self.all_exports[module_name] = self.get_all_exports(file)
+[?2004l[?2004h>         visitor = AnalyzerVisitor(self, file, module_name)
+[?2004l[?2004h>         visitor.visit(tree)
+[?2004l[?2004h>         self.exports[module_name] = visitor.exports
+[?2004l[?2004h>         self.function_sigs[module_name] = visitor.function_sigs
+[?2004l[?2004h>         # Add imported names to global scope
+[?2004l[?2004h>         self.defined_names[str(rel_file)]['global'].update(self.imported_names[str(rel_file)].keys())
+[?2004l[?2004h>         # Update import graph
+[?2004l[?2004h>         for imp in visitor.imports:
+[?2004l[?2004h>             if imp in self.modules:
+[?2004l[?2004h>                 self.import_graph[str(rel_file)].add(self.modules[imp])
+[?2004l[?2004h> 
+[?2004l[?2004h>     def get_all_exports(self, file):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, ast.Assign):
+[?2004l[?2004h>                     for target in node.targets:
+[?2004l[?2004h>                         if isinstance(target, ast.Name) and target.id == '__all__':
+[?2004l[?2004h>                             if isinstance(node.value, ast.List):
+[?2004l[?2004h>                                 return {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)}
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         # Fallback: public names
+[?2004l[?2004h>         public = set()
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             with open(file, 'r') as f:
+[?2004l[?2004h>                 tree = ast.parse(f.read())
+[?2004l[?2004h>             for node in ast.walk(tree):
+[?2004l[?2004h>                 if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Assign)):
+[?2004l[?2004h>                     if isinstance(node, ast.Assign):
+[?2004l[?2004h>                         for target in node.targets:
+[?2004l[?2004h>                             if isinstance(target, ast.Name) and not target.id.startswith('_'):
+[?2004l[?2004h>                                 public.add(target.id)
+[?2004l[?2004h>                     elif not node.name.startswith('_'):
+[?2004l[?2004h>                         public.add(node.name)
+[?2004l[?2004h>         except:
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         return public
+[?2004l[?2004h> 
+[?2004l[?2004h>     def check_categories(self):
+[?2004l[?2004h>         # 1. Valid Imports
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             for name, source in self.imported_names[rel_file].items():
+[?2004l[?2004h>                 if not self.resolve_import(source, rel_file):
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'invalid_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unresolvable import: {source}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 2. No Circular Deps
+[?2004l[?2004h>         visited = set()
+[?2004l[?2004h>         rec_stack = set()
+[?2004l[?2004h>         nodes = list(self.import_graph.keys())
+[?2004l[?2004h>         for node in nodes:
+[?2004l[?2004h>             if node not in visited:
+[?2004l[?2004h>                 self.has_cycle(node, visited, rec_stack)
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 3. No Unused Imports
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             used = set()
+[?2004l[?2004h>             for scope in self.used_names[rel_file].values():
+[?2004l[?2004h>                 used.update(scope)
+[?2004l[?2004h>             for name in self.imported_names[rel_file]:
+[?2004l[?2004h>                 if name not in used:
+[?2004l[?2004h>                     self.errors.append({
+[?2004l[?2004h>                         'type': 'unused_import',
+[?2004l[?2004h>                         'file': self.to_app_path(file),
+[?2004l[?2004h>                         'message': f'Unused import: {name}'
+[?2004l[?2004h>                     })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 4. All Refs Defined
+[?2004l[?2004h>         def get_cumulative_defs(file, scope):
+[?2004l[?2004h>             parts = scope.split('.')
+[?2004l[?2004h>             cum_defs = set()
+[?2004l[?2004h>             for i in range(len(parts)):
+[?2004l[?2004h>                 s = '.'.join(parts[:i+1])
+[?2004l[?2004h>                 cum_defs.update(self.defined_names[file].get(s, set()))
+[?2004l[?2004h>             return cum_defs
+[?2004l[?2004h> 
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             for scope in self.used_names[rel_file]:
+[?2004l[?2004h>                 for name in self.used_names[rel_file][scope]:
+[?2004l[?2004h>                     cum_defs = get_cumulative_defs(rel_file, scope)
+[?2004l[?2004h>                     if name not in cum_defs and name not in self.imported_names[rel_file] and name not in self.builtins:
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'undefined_reference',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Undefined reference: {name}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h> 
+[?2004l[?2004h>         # 5. Valid Attribute Access
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             visitor = AttributeVisitor(self, rel_file)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for mod, attr in visitor.accesses:
+[?2004l[?2004h>                     if mod in self.all_exports and attr not in self.all_exports[mod]:
+[?2004l[?2004h>                         self.errors.append({
+[?2004l[?2004h>                             'type': 'invalid_attribute_access',
+[?2004l[?2004h>                             'file': self.to_app_path(file),
+[?2004l[?2004h>                             'message': f'Invalid attribute access: {mod}.{attr}'
+[?2004l[?2004h>                         })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l:[?2004h>         # 6. Type Consistency
+[?2004l[?2004h>         for file in self.py_files:
+[?2004l[?2004h>             rel_file = str(file.relative_to(self.project_dir))
+[?2004l[?2004h>             module = self.modules[rel_file]
+[?2004l[?2004h>             visitor = CallVisitor(self, module)
+[?2004l[?2004h>             try:
+[?2004l[?2004h>                 with open(file, 'r') as f:
+[?2004l[?2004h>                     tree = ast.parse(f.read())
+[?2004l[?2004h>                 visitor.visit(tree)
+[?2004l[?2004h>                 for func, arg_count in visitor.calls:
+[?2004l[?2004h>                     if func in self.function_sigs[module]:
+[?2004l[?2004h>                         min_a, max_a = self.function_sigs[module][func]
+[?2004l[?2004h>                         if arg_count < min_a or (max_a is not None and arg_count > max_a):
+[?2004l[?2004h>                             self.errors.append({
+[?2004l[?2004h>                                 'type': 'type_error',
+[?2004l[?2004h>                                 'file': self.to_app_path(file),
+[?2004l[?2004h>                                 'message': f'Argument count mismatch for {func}: expected {min_a}-{max_a if max_a else "inf"}, got {arg_count}'
+[?2004l[?2004h>                             })
+[?2004l[?2004h>             except:
+[?2004l[?2004h>                 pass
+[?2004l[?2004h> 
+[?2004l[?2004h>     def has_cycle(self, node, visited, rec_stack):
+[?2004l[?2004h>         visited.add(node)
+[?2004l[?2004h>         rec_stack.add(node)
+[?2004l[?2004h>         for neighbor in self.import_graph[node]:
+[?2004l[?2004h>             if neighbor not in visited:
+[?2004l[?2004h>                 if self.has_cycle(neighbor, visited, rec_stack):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>             elif neighbor in rec_stack:
+[?2004l[?2004h>                 cycle = [node, neighbor]
+[?2004l[?2004h>                 self.errors.append({
+[?2004l[?2004h>                     'type': 'circular_dependency',
+[?2004l[?2004h>                     'file': '/app/project',
+[?2004l[?2004h>                     'message': f'Cycle: {" -> ".join(cycle)}'
+[?2004l[?2004h>                 })
+[?2004l[?2004h>                 return True
+[?2004l[?2004h>         rec_stack.remove(node)
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h>     def resolve_import(self, imp, from_file):
+[?2004l[?2004h>         # Resolve relative to from_file
+[?2004l[?2004h>         from_parts = from_file.split('/')
+[?2004l[?2004h>         if imp.startswith('.'):
+[?2004l[?2004h>             levels = len([c for c in imp if c == '.'])
+[?2004l[?2004h>             imp = imp[levels:]
+[?2004l[?2004h>             base = from_parts[:-levels] if levels < len(from_parts) else []
+[?2004l[?2004h>             parts = base + imp.split('.')
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             parts = imp.split('.')
+[?2004l[?2004h>         path = self.project_dir
+[?2004l[?2004h>         for part in parts:
+[?2004l[?2004h>             path = path / part
+[?2004l[?2004h>         return (path / '__init__.py').exists() or (path.with_suffix('.py')).exists()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def report(self):
+[?2004l[?2004h>         return {
+[?2004l[?2004h>             'valid_imports': not any(e['type'] == 'invalid_import' for e in self.errors),
+[?2004l[?2004h>             'no_circular_deps': not any(e['type'] == 'circular_dependency' for e in self.errors),
+[?2004l[?2004h>             'no_unused_imports': not any(e['type'] == 'unused_import' for e in self.errors),
+[?2004l[?2004h>             'all_refs_defined': not any(e['type'] == 'undefined_reference' for e in self.errors),
+[?2004l[?2004h>             'valid_attribute_access': not any(e['type'] == 'invalid_attribute_access' for e in self.errors),
+[?2004l[?2004h>             'type_consistent': not any(e['type'] == 'type_error' for e in self.errors),
+[?2004l[?2004h>             'errors': self.errors
+[?2004l[?2004h>         }
+[?2004l[?2004h> 
+[?2004l[?2004h> class ImportVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.analyzer.imported_names[self.file][name] = alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             if alias.name == '*':
+[?2004l[?2004h>                 # Assume all from __all__
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.analyzer.imported_names[self.file][name] = f'{module}.{alias.name}'
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AnalyzerVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.scope_stack = ['global']
+[?2004l[?2004h>         self.exports = set()
+[?2004l[?2004h>         self.function_sigs = {}
+[?2004l[?2004h>         self.imports = set()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_FunctionDef(self, node):
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         self.analyzer.defined_names[str(self.file.relative_to(self.analyzer.project_dir))][scope].add(node.name)
+[?2004l[?2004h>         self.scope_stack.append(node.name)
+[?2004l[?2004h>         current_scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         args = node.args.args
+[?2004l[?2004h>         defaults = node.args.defaults
+[?2004l[?2004h>         min_args = len(args) - len(defaults)
+[?2004l[?2004h>         max_args = len(args) if not node.args.vararg else None
+[?2004l[?2004h>         self.function_sigs[node.name] = (min_args, max_args)
+[?2004l[?2004h>         # Add parameters to current scope
+[?2004l[?2004h>         for arg in args:
+[?2004l[?2004h>             self.analyzer.defined_names[str(self.file.relative_to(self.analyzer.project_dir))][current_scope].add(arg.arg)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h>         self.scope_stack.pop()
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Name(self, node):
+[?2004l[?2004h>         rel_file = str(self.file.relative_to(self.analyzer.project_dir))
+[?2004l[?2004h>         scope = '.'.join(self.scope_stack)
+[?2004l[?2004h>         if isinstance(node.ctx, ast.Load):
+[?2004l[?2004h>             self.analyzer.used_names[rel_file][scope].add(node.id)
+[?2004l[?2004h>         elif isinstance(node.ctx, ast.Store):
+[?2004l[?2004h>             self.analyzer.defined_names[rel_file][scope].add(node.id)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Import(self, node):
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             name = alias.asname or alias.name
+[?2004l[?2004h>             self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_ImportFrom(self, node):
+[?2004l[?2004h>         module = node.module or ''
+[?2004l[?2004h>         for alias in node.names:
+[?2004l[?2004h>             if alias.name != '*':
+[?2004l[?2004h>                 self.imports.add(alias.name)
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class AttributeVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, file):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.file = file
+[?2004l[?2004h>         self.accesses = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Attribute(self, node):
+[?2004l[?2004h>         if isinstance(node.value, ast.Name) and node.value.id in self.analyzer.imported_names[self.file]:
+[?2004l[?2004h>             mod = self.analyzer.imported_names[self.file][node.value.id]
+[?2004l[?2004h>             self.accesses.append((mod, node.attr))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> class CallVisitor(ast.NodeVisitor):
+[?2004l[?2004h>     def __init__(self, analyzer, module):
+[?2004l[?2004h>         self.analyzer = analyzer
+[?2004l[?2004h>         self.module = module
+[?2004l[?2004h>         self.calls = []
+[?2004l[?2004h> 
+[?2004l[?2004h>     def visit_Call(self, node):
+[?2004l[?2004h>         if isinstance(node.func, ast.Name):
+[?2004l[?2004h>             self.calls.append((node.func.id, len(node.args)))
+[?2004l[?2004h>         self.generic_visit(node)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     parser = argparse.ArgumentParser()
+[?2004l[?2004h>     parser.add_argument('--project-dir', required=True)
+[?2004l[?2004h>     parser.add_argument('--out', required=True)
+[?2004l[?2004h>     args = parser.parse_args()
+[?2004l[?2004h>     analyzer = StaticAnalyzer(args.project_dir)
+[?2004l[?2004h>     result = analyzer.run()
+[?2004l[?2004h>     with open(args.out, 'w') as f:
+[?2004l[?2004h>         json.dump(result, f, indent=2)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": true,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": false,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: builtins"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: Path"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: e"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: os"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AnalyzerVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: CallVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AttributeVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: json"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: argparse"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: StaticAnalyzer"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# sed -i 's/self.analyzer.imported_names\[self.file\]/rel_file = str(self.file.relative_to(self.analyzer.project_dir))\n            self.analyzer.imported_names[rel_file]/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# sed -i 's/            for name, source in self.imported_names\[rel_file\].items():/            stdlib = {"ast", "json", "os", "sys", "argparse", "pathlib", "collections", "builtins"}\n            for name, source in self.imported_names[rel_file].items():\n                if source in stdlib:\n                    continue/' analyze_deps.py
+[?2004l[?2004hroot@a66f5f15a741:/app# python analyze_deps.py --project-dir /app --out report.json
+[?2004l  File [35m"/app/analyze_deps.py"[0m, line [35m333[0m
+    if isinstance(node.value, ast.Name) and node.value.id in rel_file [1;31m=[0m str(self.file.relative_to(self.analyzer.project_dir))
+                                                                      [1;31m^[0m
+[1;35mSyntaxError[0m: [35minvalid syntax[0m
+[?2004hroot@a66f5f15a741:/app# cat report.json
+[?2004l{
+  "valid_imports": true,
+  "no_circular_deps": true,
+  "no_unused_imports": true,
+  "all_refs_defined": false,
+  "valid_attribute_access": true,
+  "type_consistent": true,
+  "errors": [
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: builtins"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: Path"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: e"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: os"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: defaultdict"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AnalyzerVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: CallVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: AttributeVisitor"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: json"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: argparse"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: StaticAnalyzer"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    },
+    {
+      "type": "undefined_reference",
+      "file": "/app/analyze_deps.py",
+      "message": "Undefined reference: ast"
+    }
+  ]
+}[?2004hroot@a66f5f15a741:/app# 

@@ -1,0 +1,85 @@
+New Terminal Output:
+
+root@47a44cdb3aaf:/app# python - <<'PY'
+> from pathlib import Path
+> import re
+> p=Path('/app/analyze_deps.py')
+> s=p.read_text(encoding='utf-8')
+>
+> # Replace extract_exports function block (from 'def extract_exports' to next blank line after return)
+> pattern = re.compile(r"def extract_exports\(tree: ast\.AST\) -> Exports:[\s\S]*?^\s*return Exports\(all=all_set, public=public\)\n", re.M)
+> new_block = '''def extract_exports(tree: ast.AST) -> Exports:
+>     """Best-effort module export extraction.
+>
+>     If __all__ is a simple list/tuple of string constants, use it.
+>     Otherwise export all public (non-underscore) top-level names including
+>     defs/classes and simple assignments and imported bindings.
+>     """
+>     all_set: Optional[Set[str]] = None
+>     names: Set[str] = set()
+>
+>     for node in getattr(tree, "body", []):
+>         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+>             names.add(node.name)
+>         elif isinstance(node, ast.Assign):
+>             for t in node.targets:
+>                 if isinstance(t, ast.Name):
+>                     names.add(t.id)
+>         elif isinstance(node, ast.AnnAssign):
+>             if isinstance(node.target, ast.Name):
+>                 names.add(node.target.id)
+>         elif isinstance(node, ast.Import):
+>             for a in node.names:
+>                 names.add(a.asname or a.name.split(".")[-1])
+>         elif isinstance(node, ast.ImportFrom):
+>             for a in node.names:
+>                 if a.name != "*":
+>                     names.add(a.asname or a.name)
+>
+>     # __all__ (only simple static sequences)
+>     for node in getattr(tree, "body", []):
+>         if isinstance(node, ast.Assign):
+>             if any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets):
+>                 seq = _extract_str_sequence(node.value)
+>                 if seq is not None:
+>                     all_set = set(seq)
+>         elif isinstance(node, ast.AnnAssign):
+>             if isinstance(node.target, ast.Name) and node.target.id == "__all__" and node.value is not None:
+>                 seq = _extract_str_sequence(node.value)
+>                 if seq is not None:
+>                     all_set = set(seq)
+>
+>     public = {n for n in names if not n.startswith("_")}
+>     return Exports(all=all_set, public=public)
+> '''
+>
+> s2, n = pattern.subn(new_block, s)
+> if n != 1:
+>     raise SystemExit(f'Failed to patch extract_exports (matches={n})')
+>
+> p.write_text(s2, encoding='utf-8')
+> print('patched extract_exports')
+> PY
+patched extract_exports
+root@47a44cdb3aaf:/app# python -m py_compile /app/analyze_deps.py
+root@47a44cdb3aaf:/app# python /app/analyze_deps.py --project-dir /tmp/proj --out /tmp/report.json && head -n 40 /tmp/report.json
+{
+  "all_refs_defined": false,
+  "errors": [
+    {
+      "file": "/app/pkg/__init__.py",
+      "message": "Unused import: f",
+      "type": "unused_import"
+    },
+    {
+      "file": "/app/pkg/c.py",
+      "message": "Undefined reference: missing",
+      "type": "undefined_reference"
+    }
+  ],
+  "no_circular_deps": true,
+  "no_unused_imports": false,
+  "type_consistent": true,
+  "valid_attribute_access": true,
+  "valid_imports": true
+}root@47a44cdb3aaf:/app#

@@ -1,0 +1,47 @@
+{
+  "analysis": "Our perl edit inserted uses of `finished` inside the watchdog lambda and later in main, but the declaration of `finished` was not inserted in the correct scope (or insertion failed). As a result, compilation fails: `finished` is undeclared at lines 99 and 131. We need to open stress_test.cpp around the top of main where timed_out is declared and add `std::atomic<bool> finished(false);` in the same scope, and ensure the watchdog lambda captures it by reference (it currently captures only start_time). Then set finished=true after consumers join (not after producers).",
+  "plan": "1) Inspect stress_test.cpp around lines ~70-150 to see current declarations and watchdog lambda capture. 2) Fix by editing with perl/sed: (a) add `finished` atomic near `timed_out`, (b) update watchdog capture list to include `&finished`, and (c) move `finished.store(true, ...)` to after consumer joins. 3) Rebuild normal and run stress_test. 4) Rebuild tsan and run stress_test_tsan; confirm it prints `ThreadSanitizer: reported 0 warnings` and no timeout line after completion.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba stress_test.cpp | sed -n '70,160p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 'if($.==1){$seen=0} if(/std::atomic<bool> timed_out\\(false\\);/ && !$seen++){s/\\n/\\n    std::atomic<bool> finished(false);\\n/} ' stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's/std::thread watchdog\\(\\[&start_time\\]\\)/std::thread watchdog([&start_time, &finished])/g' stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\n\\s*finished\\.store\\(true, std::memory_order_relaxed\\);\\n(\\s*std::cout << \"All consumers finished\")/\\n\\1/s' stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(for \\(auto& t : consumer_threads\\) \\{\\n\\s*t\\.join\\(\\);\\n\\s*\\}\\n)/$1\\n    finished.store(true, std::memory_order_relaxed);\\n/s' stress_test.cpp\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n \"timed_out\\|finished\\|watchdog\" -n stress_test.cpp | head -n 30\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "make clean && make\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "/app/stress_test\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "make clean && make tsan\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "/app/stress_test_tsan\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

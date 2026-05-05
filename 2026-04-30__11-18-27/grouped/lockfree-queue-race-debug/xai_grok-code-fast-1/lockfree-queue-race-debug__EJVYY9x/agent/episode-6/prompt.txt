@@ -1,0 +1,102 @@
+New Terminal Output:
+
+root@898325fa2541:/app# cp lockfree_queue.h lockfree_queue.h.bak
+root@898325fa2541:/app# sed -i 's/std::atomic<Node\*> head_;/std::atomic<TaggedPtr> head_;/g' lockfree_queue.h
+root@898325fa2541:/app# sed -i 's/std::atomic<Node\*> tail_;/std::atomic<TaggedPtr> tail_;/g' lockfree_queue.h
+root@898325fa2541:/app# sed -i '/std::atomic<Node\*> free_list_;/d' lockfree_queue.h
+root@898325fa2541:/app# sed -i '/Node\* allocate_node(uint64_t value);/d' lockfree_queue.h
+root@898325fa2541:/app# sed -i '/void free_node(Node\* node);/d' lockfree_queue.h
+root@898325fa2541:/app# cat > lockfree_queue.cpp << 'EOF'
+> #include "lockfree_queue.h"
+>
+> LockFreeQueue::LockFreeQueue() {
+>     head_.store(TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+>     tail_.store(TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = new Node(value);
+>     while (true) {
+>         TaggedPtr tail_tagged = tail_.load(std::memory_order_acquire);
+>         Node* tail = tail_tagged.ptr;
+>         if (tail == nullptr) {
+>             TaggedPtr null_head(nullptr, 0);
+>             TaggedPtr new_head(new_node, 1);
+>             if (head_.compare_exchange_weak(null_head, new_head, std::memory_order_acq_rel)) {
+>                 tail_.store(TaggedPtr(new_node, 0), std::memory_order_release);
+>                 return;
+>             }
+>         } else {
+>             Node* next = tail->next.load(std::memory_order_acquire);
+>             TaggedPtr tail_check = tail_.load(std::memory_order_acquire);
+>             if (tail_tagged == tail_check) {
+>                 if (next == nullptr) {
+>                     if (tail->next.compare_exchange_weak(next, new_node, std::memory_order_release)) {
+>                         TaggedPtr new_tail(new_node, tail_tagged.tag + 1);
+>                         tail_.compare_exchange_weak(tail_tagged, new_tail, std::memory_order_acq_rel);
+>                         return;
+>                     }
+>                 } else {
+>                     TaggedPtr new_tail(next, tail_tagged.tag + 1);
+>                     tail_.compare_exchange_weak(tail_tagged, new_tail, std::memory_order_acq_rel);
+>                 }
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         TaggedPtr head_tagged = head_.load(std::memory_order_acquire);
+>         TaggedPtr tail_tagged = tail_.load(std::memory_order_acquire);
+>         Node* head = head_tagged.ptr;
+>         if (head == nullptr) return false;
+>         Node* next = head->next.load(std::memory_order_acquire);
+>         TaggedPtr head_check = head_.load(std::memory_order_acquire);
+>         if (head_tagged == head_check) {
+>             if (head == tail_tagged.ptr) {
+>                 if (next == nullptr) return false;
+>                 TaggedPtr new_tail(next, tail_tagged.tag + 1);
+>                 tail_.compare_exchange_weak(tail_tagged, new_tail, std::memory_order_acq_rel);
+>             } else {
+>                 value = head->value;
+>                 TaggedPtr new_head(next, head_tagged.tag + 1);
+>                 if (head_.compare_exchange_weak(head_tagged, new_head, std::memory_order_acq_rel)) {
+>                     delete head;
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> EOF
+root@898325fa2541:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+/app/stress_test
+/usr/bin/ld: /tmp/lockfree_queue-c27f73.o: in function `LockFreeQueue::LockFreeQueue()':
+lockfree_queue.cpp:(.text+0x25): undefined reference to `__atomic_store'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x3e): undefined reference to `__atomic_store'
+/usr/bin/ld: /tmp/lockfree_queue-c27f73.o: in function `LockFreeQueue::dequeue(unsigned long&)':
+lockfree_queue.cpp:(.text+0xd2): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0xef): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x10e): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x13b): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x197): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: /tmp/lockfree_queue-c27f73.o: in function `LockFreeQueue::enqueue(unsigned long)':
+lockfree_queue.cpp:(.text+0x232): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x24f): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x280): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x2ca): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x310): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x334): undefined reference to `__atomic_store'
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+make: *** [Makefile:13: stress_test] Error 1
+root@898325fa2541:/app# /app/stress_test
+bash: /app/stress_test: No such file or directory
+root@898325fa2541:/app#

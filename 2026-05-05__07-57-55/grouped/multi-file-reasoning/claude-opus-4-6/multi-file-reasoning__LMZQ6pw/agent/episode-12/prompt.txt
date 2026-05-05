@@ -1,0 +1,169 @@
+New Terminal Output:
+
+root@cffa7beb3964:/app# cat >> /app/analyze_deps.py << 'ENDOFFILE'
+>
+>
+}> def analyze_project(project_dir):
+>     result = {
+>         "valid_imports": True,
+>         "no_circular_deps": True,
+>         "no_unused_imports": True,
+>         "all_refs_defined": True,
+>         "valid_attribute_access": True,
+>         "type_consistent": True,
+>         "errors": [],
+>     }
+>     project_path = Path(project_dir).resolve()
+>     if not project_path.exists():
+>         result["valid_imports"] = False
+>         result["errors"].append({"type": "invalid_import", "file": "/app/", "message": "Project directory does not exist"})
+>         return result
+>
+>     py_files = collect_py_files(project_dir)
+>     if not py_files:
+>         return result
+>
+>     file_asts = {}
+>     for f in py_files:
+>         file_asts[str(f)] = parse_file(f)
+>
+>     file_imports = {}
+>     for fp, tree in file_asts.items():
+>         file_imports[fp] = extract_imports(tree, fp, project_dir) if tree else []
+>
+>     # 1. Valid Imports
+>     for fp, imports in file_imports.items():
+>         for imp in imports:
+>             mn = imp["module"]
+>             if not mn:
+>                 continue
+>             if imp["level"] == 0 and is_stdlib_module(mn):
+>                 continue
+>             target = resolve_module_file(mn, project_dir)
+>             if target is None:
+>                 if imp["type"] == "from" and imp["name"] and imp["name"] != "*":
+>                     submod = mn + "." + imp["name"]
+>                     if resolve_module_file(submod, project_dir):
+>                         continue
+>                 result["valid_imports"] = False
+>                 result["errors"].append({"type": "invalid_import", "file": to_app_path(fp, project_dir), "message": "Unresolvable import: '" + mn + "'"})
+>
+>     # 2. Circular Dependencies
+>     graph = build_import_graph(file_asts, file_imports, project_dir)
+>     cycles = find_cycles(graph)
+>     if cycles:
+>         result["no_circular_deps"] = False
+>         seen_c = set()
+>         for cycle in cycles:
+>             cp = [to_app_path(c, project_dir) for c in cycle]
+>             mi = cp.index(min(cp[:-1]))
+>             norm = cp[mi:-1] + cp[:mi] + [cp[mi]]
+>             ck = " -> ".join(norm)
+>             if ck not in seen_c:
+>                 seen_c.add(ck)
+>                 result["errors"].append({"type": "circular_dependency", "file": norm[0], "message": "Circular dependency: " + ck})
+>
+>     # 3. Unused Imports
+>     for fp, imports in file_imports.items():
+>         tree = file_asts.get(fp)
+>         if tree is None:
+>             continue
+>         used = set()
+>         for node in ast.walk(tree):
+>             if isinstance(node, ast.Name):
+>                 used.add(node.id)
+>             elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+>                 used.add(node.value.id)
+>         for imp in imports:
+>             if imp["type"] == "import":
+>                 ln = imp["alias"] if imp["alias"] else imp["module"].split(".")[0]
+>                 if ln not in used:
+>                     result["no_unused_imports"] = False
+>                     result["errors"].append({"type": "unused_import", "file": to_app_path(fp, project_dir), "message": "Unused import: '" + ln + "'"})
+>             elif imp["type"] == "from":
+>                 if imp["name"] == "*":
+>                     mn = imp["module"]
+>                     tf = resolve_module_file(mn, project_dir)
+>                     exported = set()
+>                     if tf and str(tf) in file_asts and file_asts[str(tf)]:
+>                         exported = get_module_exports(file_asts[str(tf)])
+>                     if not exported or not any(n in used for n in exported):
+>                         result["no_unused_imports"] = False
+>                         result["errors"].append({"type": "unused_import", "file": to_app_path(fp, project_dir), "message": "Unused wildcard import from '" + m
+n + "'"})
+>                 else:
+>                     ln = imp["alias"] if imp["alias"] else imp["name"]
+>                     if ln not in used:
+>                         result["no_unused_imports"] = False
+>                         result["errors"].append({"type": "unused_import", "file": to_app_path(fp, project_dir), "message": "Unused import: '" + ln + "'"})
+>
+>     # 4. All References Defined
+>     wildcard_exports = {}
+>     for fp, imports in file_imports.items():
+>         for imp in imports:
+>             if imp["type"] == "from" and imp["name"] == "*":
+>                 mn = imp["module"]
+>                 tf = resolve_module_file(mn, project_dir)
+>                 if tf and str(tf) in file_asts and file_asts[str(tf)]:
+>                     wildcard_exports[mn] = get_module_exports(file_asts[str(tf)])
+>
+>     for fp, tree in file_asts.items():
+>         if tree is None:
+>             continue
+>         imports = file_imports.get(fp, [])
+>         undef = check_refs_defined(tree, fp, imports, wildcard_exports, project_dir, file_asts)
+>         for name in undef:
+>             result["all_refs_defined"] = False
+>             result["errors"].append({"type": "undefined_reference", "file": to_app_path(fp, project_dir), "message": "Undefined reference: '" + name + "'"})
+>
+>     # 5. Valid Attribute Access
+>     for fp, tree in file_asts.items():
+>         if tree is None:
+>             continue
+>         imports = file_imports.get(fp, [])
+>         ae = check_valid_attribute_access(tree, fp, imports, project_dir, file_asts)
+>         for err in ae:
+>             result["valid_attribute_access"] = False
+>             result["errors"].append({"type": "invalid_attribute_access", "file": to_app_path(fp, project_dir), "message": "Invalid attribute access: '" + err[
+"attr"] + "' not found in module '" + err["module"] + "'"})
+>
+>     # 6. Type Consistency
+>     for fp, tree in file_asts.items():
+>         if tree is None:
+>             continue
+>         imports = file_imports.get(fp, [])
+>         te = check_type_consistency(tree, fp, imports, project_dir, file_asts)
+>         for err in te:
+>             result["type_consistent"] = False
+>             mx = str(err["expected_max"]) if err["expected_max"] is not None else "inf"
+>             result["errors"].append({"type": "type_error", "file": to_app_path(fp, project_dir), "message": "Type error: function '" + err["func"] + "' expect
+ed " + str(err["expected_min"]) + "-" + mx + " args, got " + str(err["got"])})
+>
+>     return result
+>
+>
+> def main():
+>     parser = argparse.ArgumentParser(description="Python Static Analyzer")
+>     parser.add_argument("--project-dir", required=True)
+>     parser.add_argument("--out", required=True)
+>     args = parser.parse_args()
+>     try:
+>         result = analyze_project(args.project_dir)
+>     except Exception as e:
+>         result = {
+>             "valid_imports": False,
+>             "no_circular_deps": True,
+>             "no_unused_imports": True,
+>             "all_refs_defined": True,
+>             "valid_attribute_access": True,
+>             "type_consistent": True,
+>             "errors": [{"type": "invalid_import", "file": "/app/", "message": "Analysis error: " + str(e)}],
+>         }
+>     with open(args.out, "w") as f:
+>         json.dump(result, f, indent=2)
+>
+>
+> if __name__ == "__main__":
+>     main()
+> ENDOFFILE
+root@cffa7beb3964:/app#

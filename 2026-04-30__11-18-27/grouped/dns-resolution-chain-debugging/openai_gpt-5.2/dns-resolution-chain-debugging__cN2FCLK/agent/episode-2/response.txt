@@ -1,0 +1,55 @@
+{
+  "analysis": "After changing the directory paths, named-checkconf now fails for all three configs: primary has an invalid TSIG secret (bad base64), secondary has a syntax error near ';' (likely from the multiline perl replacement corrupting formatting), and resolver expects a '}' near ';' (also likely corrupted). Services still cannot start. We need to repair the named.conf files: ensure options blocks are syntactically correct, add managed-keys-directory lines properly, fix pid/log paths to writable locations, and fix TSIG secret to valid base64 and matching on both primary and secondary.",
+  "plan": "1) Inspect the current (post-edit) named.conf files around the reported error lines to see what got mangled. 2) Rewrite each named.conf cleanly using heredocs to avoid further syntax issues: set directory to /app/dns/<role>/cache; set managed-keys-directory to /app/dns/<role>/dynamic; set pid-file and log file paths under /app/dns/<role>/ (writable). 3) Fix TSIG key: use a valid base64 secret and ensure it is identical on primary and secondary; keep algorithm hmac-sha256. 4) Run named-checkconf again for all three. 5) Restart named and confirm listeners on ports 5300/5301/5302.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba /app/dns/primary/named.conf | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/secondary/named.conf | sed -n '1,140p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,160p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/primary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/primary/cache\";\n    managed-keys-directory \"/app/dns/primary/dynamic\";\n    listen-on port 5301 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-transfer { key \"transfer-key\"; };\n    recursion no;\n    dnssec-validation auto;\n    pid-file \"/app/dns/primary/named.pid\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"cHJpbWFyeV90cmFuc2Zlcl9rZXlfc2VjcmV0XzEyMzQ=\";\n};\n\nzone \"example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/example.com.zone\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\nzone \"secure.example.com\" {\n    type master;\n    file \"/app/dns/primary/zones/secure.example.com.zone.signed\";\n    allow-transfer { key \"transfer-key\"; };\n    notify yes;\n};\n\nlogging {\n    channel default_log {\n        file \"/app/dns/primary/named.log\" versions 3 size 5m;\n        severity info;\n        print-time yes;\n    };\n    category default { default_log; };\n};\nEOF\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "cat > /app/dns/secondary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/secondary/cache\";\n    managed-keys-directory \"/app/dns/secondary/dynamic\";\n    listen-on port 5302 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation auto;\n    pid-file \"/app/dns/secondary/named.pid\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"cHJpbWFyeV90cmFuc2Zlcl9rZXlfc2VjcmV0XzEyMzQ=\";\n};\n\nserver 127.0.0.1 {\n    keys { transfer-key; };\n};\n\nzone \"example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nzone \"secure.example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/secure.example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nlogging {\n    channel default_log {\n        file \"/app/dns/secondary/named.log\" versions 3 size 5m;\n        severity info;\n        print-time yes;\n    };\n    category default { default_log; };\n};\nEOF\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/resolver/cache\";\n    managed-keys-directory \"/app/dns/resolver/dynamic\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation auto;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named.pid\";\n};\n\nlogging {\n    channel default_log {\n        file \"/app/dns/resolver/named.log\" versions 3 size 5m;\n        severity info;\n        print-time yes;\n    };\n    category default { default_log; };\n};\nEOF\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf && named-checkconf /app/dns/secondary/named.conf && named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g >/tmp/named_primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g >/tmp/named_secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g >/tmp/named_resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 0.5; ss -lntup | grep -E '(:5300|:5301|:5302)'\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

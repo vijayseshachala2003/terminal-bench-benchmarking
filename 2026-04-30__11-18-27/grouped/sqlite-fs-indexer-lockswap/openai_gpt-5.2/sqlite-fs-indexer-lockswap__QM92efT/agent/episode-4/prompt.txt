@@ -1,0 +1,267 @@
+New Terminal Output:
+
+root@71a978a6c362:/app# python3 -m py_compile /app/app/indexer.py
+root@71a978a6c362:/app# sed -n '1,120p' /app/app/indexer.py
+"""Filesystem to SQLite indexer.
+
+This module exposes build_index(root_dir, db_path) which walks a directory tree,
+hashes files, and stores results in a SQLite database.
+
+Key requirements:
+- Deterministic traversal
+- Unicode NFC normalization for stored paths and ignore matching
+- Ignore rules from /data/ignore.txt
+- Skip symlinks entirely (do not traverse, do not index)
+- Resolve NFC collisions by keeping the entry with lexicographically largest
+  *original* relative path
+- Concurrency safety when multiple processes write the same db_path
+
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import os
+import re
+import sqlite3
+import tempfile
+import unicodedata
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+_IGNORE_FILE = "/data/ignore.txt"
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+def _to_posix_relpath(path: str) -> str:
+    # Ensure forward slashes only.
+    if os.sep != "/":
+        path = path.replace(os.sep, "/")
+    # Also normalize any accidental backslashes.
+    path = path.replace("\\", "/")
+    return path
+
+
+def _read_ignore_patterns() -> List[str]:
+    try:
+        with open(_IGNORE_FILE, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+    patterns: List[str] = []
+    for line in lines:
+        # Skip empty lines
+        if not line.strip():
+            continue
+        # Skip comments: first non-whitespace is '#'
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Keep as-is (except newline), normalize to NFC.
+        try:
+            patterns.append(_nfc(line.strip("\r\n")))
+        except Exception:
+            # Malformed line must not crash indexer
+            continue
+    return patterns
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Convert a restricted glob pattern to a regex.
+
+    Rules:
+    - '*' matches zero or more chars except '/'
+    - '/' is path separator
+    - '**' is NOT special; it means two literal '*' characters.
+
+    We implement this by treating every '*' as a wildcard, except when it is part
+    of a consecutive "**" sequence, in which case each '*' is literal.
+    """
+
+    parts: List[str] = ["^"]
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            if i + 1 < len(pattern) and pattern[i + 1] == "*":
+                # Two literal '*' characters.
+                parts.append(re.escape("**"))
+                i += 2
+                continue
+            # Single '*' wildcard (not matching '/')
+            parts.append("[^/]*")
+            i += 1
+            continue
+        parts.append(re.escape(c))
+        i += 1
+    parts.append("$")
+    return re.compile("".join(parts))
+
+
+@dataclass(frozen=True)
+class _IgnoreRule:
+    raw: str
+    anchored: bool
+    has_slash: bool
+    regex: re.Pattern[str]
+
+
+def _compile_ignore_rules(patterns: Iterable[str]) -> List[_IgnoreRule]:
+    rules: List[_IgnoreRule] = []
+    for p in patterns:
+        if not p:
+            continue
+        anchored = p.startswith("/")
+        pat = p[1:] if anchored else p
+        has_slash = "/" in pat
+        try:
+root@71a978a6c362:/app# sed -n '120,260p' /app/app/indexer.py
+        try:
+            rx = _glob_to_regex(pat)
+        except re.error:
+            continue
+        rules.append(_IgnoreRule(raw=pat, anchored=anchored, has_slash=has_slash, regex=rx))
+    return rules
+
+
+def _ignored(rel_nfc_posix: str, rules: List[_IgnoreRule]) -> bool:
+    # rel_nfc_posix is NFC and uses '/'
+    if rel_nfc_posix == "":
+        return False
+
+    components = rel_nfc_posix.split("/")
+
+    for r in rules:
+        if r.anchored:
+            # Match only against full relative path
+            if r.regex.match(rel_nfc_posix):
+                return True
+            continue
+
+        if not r.has_slash:
+            # Match against each component
+            for comp in components:
+                if r.regex.match(comp):
+                    return True
+            continue
+
+        # Contains '/' and not anchored: match full path OR any suffix that starts
+        # immediately after a '/' boundary.
+        if r.regex.match(rel_nfc_posix):
+            return True
+        # Suffixes after boundaries
+        # e.g. rel=a/b/c.txt, test b/c.txt and c.txt? (only after '/' boundary,
+        # so includes b/c.txt and c.txt; c.txt is also a suffix boundary)
+        for i in range(1, len(components)):
+            suffix = "/".join(components[i:])
+            if r.regex.match(suffix):
+                return True
+
+    return False
+
+
+def _iter_files(root_dir: str) -> Iterable[Tuple[str, str]]:
+    """Yield (abs_path, rel_path_original_posix) for regular files under root_dir.
+
+    Deterministic order: lexicographic by directory entry name at each level.
+    Skips symlinks entirely.
+    """
+
+    root_dir_abs = os.path.abspath(root_dir)
+
+    # Stack of (abs_dir, rel_dir_posix)
+    stack: List[Tuple[str, str]] = [(root_dir_abs, "")]
+
+    while stack:
+        abs_dir, rel_dir = stack.pop()
+        try:
+            with os.scandir(abs_dir) as it:
+                entries = list(it)
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError:
+            continue
+        except PermissionError:
+            continue
+
+        # Deterministic: sort by entry.name (original string from OS)
+        entries.sort(key=lambda e: e.name)
+
+        subdirs: List[Tuple[str, str]] = []
+        for e in entries:
+            # Skip symlinks without following
+            try:
+                if e.is_symlink():
+                    continue
+            except OSError:
+                continue
+
+            name = e.name
+            rel = name if rel_dir == "" else f"{rel_dir}/{name}"
+            abs_path = os.path.join(abs_dir, name)
+
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    subdirs.append((abs_path, rel))
+                elif e.is_file(follow_symlinks=False):
+                    yield abs_path, rel
+                else:
+                    continue
+            except OSError:
+                continue
+
+        # DFS but preserve deterministic overall order by pushing in reverse
+        for item in reversed(subdirs):
+            stack.append(item)
+
+
+def _sha256_file(path: str) -> Tuple[str, int]:
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            size += len(chunk)
+            h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+
+    root_dir_abs = os.path.abspath(root_dir)
+    db_path_abs = os.path.abspath(db_path)
+    _ensure_parent_dir(db_path_abs)
+
+    # Compile ignore rules once.
+    rules = _compile_ignore_rules(_read_ignore_patterns())
+
+    # First pass: determine winner per NFC path using lexicographically largest
+    # original relative path.
+    # Map: nfc_relpath -> (orig_relpath, abs_path)
+    winners: Dict[str, Tuple[str, str]] = {}
+
+    for abs_path, rel_orig in _iter_files(root_dir_abs):
+        rel_orig_posix = _to_posix_relpath(rel_orig)
+        rel_nfc = _nfc(rel_orig_posix)
+
+        if _ignored(rel_nfc, rules):
+            continue
+
+        prev = winners.get(rel_nfc)
+        if prev is None or rel_orig_posix > prev[0]:
+            winners[rel_nfc] = (rel_orig_posix, abs_path)
+
+root@71a978a6c362:/app#

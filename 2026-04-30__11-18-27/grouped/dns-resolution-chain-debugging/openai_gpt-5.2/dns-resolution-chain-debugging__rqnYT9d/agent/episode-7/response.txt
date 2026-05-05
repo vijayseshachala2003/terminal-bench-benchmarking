@@ -1,0 +1,55 @@
+{
+  "analysis": "Task is not complete. Resolver is currently down because BIND 9.18 does not accept 'trust-anchors' inside the options block (named-checkconf: unknown option 'trust-anchors'), so named exits and all test queries fail (connection refused). Also, /app/dns_health.json was written with dnssec_valid=true, but DNSSEC validation has not been successfully demonstrated on the resolver. We must revert resolver config to a working state, then implement DNSSEC validation correctly (likely using 'trust-anchors' as a top-level statement, or using 'managed-keys'/'trusted-keys' syntax supported by this BIND version), restart resolver, confirm AD flag for secure.example.com, re-run /app/test_queries.txt successfully, and update dns_health.json accordingly.",
+  "plan": "1) Fix resolver named.conf: remove the invalid 'trust-anchors' stanza currently placed inside options. 2) Add a supported trust anchor configuration for BIND 9.18: use a top-level 'trust-anchors { secure.example.com. static-ds ...; };' (outside options) if supported; if not, use 'managed-keys { ... };' or 'trusted-keys { ... };' as appropriate. We'll test with named-checkconf iteratively. 3) Restart resolver and confirm it listens on 5300. 4) Verify secure.example.com resolves through resolver with DNSSEC validation enabled and AD flag set, and that all queries in /app/test_queries.txt resolve. 5) Update /app/dns_health.json: set dnssec_valid based on actual validation result, and fix the newline/wrapping in issue text if needed.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cp -a /app/dns/resolver/named.conf /app/dns/resolver/named.conf.bak.fix.$(date +%s)\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -pe 's/\\n\\s*trust-anchors\\s*\\{.*?\\};\\n/\\n/s' -i /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "DSLINE=$(KSKPUB=$(grep -l \" 257 3 13 \" /app/dns/primary/keys/Ksecure.example.com.+013+*.key | head -n 1); dnssec-dsfromkey -2 \"$KSKPUB\" | head -n 1)\nKEYTAG=$(echo \"$DSLINE\" | awk '{print $4}')\nALG=$(echo \"$DSLINE\" | awk '{print $5}')\nDT=$(echo \"$DSLINE\" | awk '{print $6}')\nDIGEST=$(echo \"$DSLINE\" | awk '{print $7}')\n# append top-level trust-anchors stanza (not inside options)\ngrep -q '^trust-anchors' /app/dns/resolver/named.conf || printf '\\ntrust-anchors {\\n    secure.example.com. static-ds %s %s %s \"%s\";\\n};\\n' \"$KEYTAG\" \"$ALG\" \"$DT\" \"$DIGEST\" >> /app/dns/resolver/named.conf\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "grep -nE 'dnssec-validation|trust-anchors|static-ds' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f \"named -c /app/dns/resolver/named.conf\" || true\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.8
+    },
+    {
+      "keystrokes": "ss -lntp | grep ':5300' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments | grep -E 'flags:' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "awk 'NF==2 && $1 !~ /^#/ {print $0}' /app/test_queries.txt | while read -r t n; do echo \"== $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1 +noall +answer +comments; done\n",
+      "duration": 8.0
+    }
+  ],
+  "task_complete": false
+}

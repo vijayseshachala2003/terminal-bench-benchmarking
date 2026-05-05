@@ -1,0 +1,417 @@
+[?2004hroot@22622e8366f1:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@22622e8366f1:/app# clear
+[?2004l[H[J[3J[?2004hroot@22622e8366f1:/app# chmod +x /app/svm
+[?2004lchmod: cannot access '/app/svm': No such file or directory
+[?2004hroot@22622e8366f1:/app# cat > /tmp/test1.svm << 'EOF'
+[?2004l[?2004h> PUSH 10
+[?2004l[?2004h> PUSH 20
+[?2004l[?2004h> ADD
+[?2004l[?2004h> PRINTLN
+[?2004l[?2004h> HALT
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@22622e8366f1:/app# /app/svm /tmp/test1.svm
+[?2004lbash: /app/svm: No such file or directory
+[?2004hroot@22622e8366f1:/app# python3 -c "
+[?2004l[?2004h> import os
+[?2004l[?2004h> code = '''#!/usr/bin/env python3
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import re
+[?2004l[?2004h> 
+[?2004l[?2004h> def main():
+[?2004l[?2004h>     if len(sys.argv) < 2:
+[?2004l[?2004h>         print('Usage: svm <program.svm>', file=sys.stderr)
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h>     with open(sys.argv[1], 'r') as f:
+[?2004l[?2004h>         source = f.read()
+[?2004l[?2004h>     vm = VM()
+[?2004l[?2004h>     vm.load(source)
+[?2004l[?2004h>     vm.run()
+[?2004l[?2004h> 
+[?2004l[?2004h> class VMException(Exception):
+[?2004l[?2004h>     def __init__(self, value):
+[?2004l[?2004h>         self.value = value
+[?2004l[?2004h> 
+[?2004l[?2004h> class VMFault(Exception):
+[?2004l[?2004h>     def __init__(self, message):
+[?2004l[?2004h>         self.message = message
+[?2004l[?2004h> 
+[?2004l[?2004h> class Closure:
+[?2004l[?2004h>     def __init__(self, proc_name, captures):
+[?2004l[?2004h>         self.proc_name = proc_name
+[?2004l[?2004h>         self.captures = captures
+[?2004l[?2004h>     def __repr__(self):
+[?2004l[?2004h>         return f'<closure {self.proc_name}>'
+[?2004l[?2004h> 
+[?2004l[?2004h> class ArrayRef:
+[?2004l[?2004h>     def __init__(self, data):
+[?2004l[?2004h>         self.data = data
+[?2004l[?2004h>     def __repr__(self):
+[?2004l[?2004h>         return str(self.data)
+[?2004l[?2004h> 
+[?2004l[?2004h> class VM:
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         self.stack = []
+[?2004l[?2004h>         self.instructions = []
+[?2004l[?2004h>         self.pc = 0
+[?2004l[?2004h>         self.labels = {}
+[?2004l[?2004h>         self.procs = {}
+[?2004l[?2004h>         self.heap = {}
+[?2004l[?2004h>         self.heap_allocs = {}
+[?2004l[?2004h>         self.freed = set()
+[?2004l[?2004h>         self.next_heap_addr = 1
+[?2004l[?2004h>         self.call_stack = []
+[?2004l[?2004h>         self.current_frame = None
+[?2004l[?2004h>         self.try_stack = []
+[?2004l[?2004h>         self.running = True
+[?2004l[?2004h>         self.proc_ranges = []
+[?2004l[?2004h>         self.entry = 0
+[?2004l[?2004h> 
+[?2004l[?2004h>     def load(self, source):
+[?2004l[?2004h>         lines = source.split(chr(10))
+[?2004l[?2004h>         raw = []
+[?2004l[?2004h>         for ln, line in enumerate(lines, 1):
+[?2004l[?2004h>             s = line.strip()
+[?2004l[?2004h>             if not s or s.startswith('#'):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             raw.append((s, ln))
+[?2004l[?2004h>         self.instructions = []
+[?2004l[?2004h>         for s, ln in raw:
+[?2004l[?2004h>             opcode, args = self.parse_instruction(s)
+[?2004l[?2004h>             idx = len(self.instructions)
+[?2004l[?2004h>             self.instructions.append((opcode, args, ln))
+[?2004l[?2004h>             if opcode == 'LABEL':
+[?2004l[?2004h>                 self.labels[args[0]] = idx
+[?2004l[?2004h>             elif opcode == 'PROC':
+[?2004l[?2004h>                 self.procs[args[0]] = {'nargs': int(args[1]), 'nlocals': int(args[2]), 'start': idx + 1}
+[?2004l[?2004h>         # find proc ranges
+[?2004l[?2004h>         self.proc_ranges = []
+[?2004l[?2004h>         idx = 0
+[?2004l[?2004h>         while idx < len(self.instructions):
+[?2004l[?2004h>             op, ar, ln = self.instructions[idx]
+[?2004l[?2004h>             if op == 'PROC':
+[?2004l[?2004h>                 depth = 1
+[?2004l[?2004h>                 eidx = idx + 1
+[?2004l[?2004h>                 while eidx < len(self.instructions):
+[?2004l[?2004h>                     o2, a2, l2 = self.instructions[eidx]
+[?2004l[?2004h>                     if o2 == 'PROC': depth += 1
+[?2004l[?2004h>                     elif o2 == 'ENDPROC':
+[?2004l[?2004h>                         depth -= 1
+[?2004l[?2004h>                         if depth == 0: break
+[?2004l[?2004h>                     eidx += 1
+[?2004l[?2004h>                 self.proc_ranges.append((idx, eidx))
+[?2004l[?2004h>                 self.procs[ar[0]]['end'] = eidx
+[?2004l[?2004h>                 idx = eidx + 1
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 idx += 1
+[?2004l[?2004h>         self.entry = 0
+[?2004l[?2004h>         for i in range(len(self.instructions)):
+[?2004l[?2004h>             inside = False
+[?2004l[?2004h>             for ps, pe in self.proc_ranges:
+[?2004l[?2004h>                 if ps <= i <= pe:
+[?2004l[?2004h>                     inside = True
+[?2004l[?2004h>                     break
+[?2004l[?2004h>             if not inside:
+[?2004l[?2004h>                 self.entry = i
+[?2004l[?2004h>                 break
+[?2004l[?2004h> 
+[?2004l[?2004h>     def parse_instruction(self, text):
+[?2004l[?2004h>         text = text.strip()
+[?2004l[?2004h>         if text.upper().startswith('PUSH '):
+[?2004l[?2004h>             rest = text[5:].strip()
+[?2004l[?2004h>             if rest.startswith('\"'):
+[?2004l[?2004h>                 s, _ = self.parse_string_literal(rest)
+[?2004l[?2004h>                 return ('PUSH', [s])
+[?2004l[?2004h>             parts = rest.split()
+[?2004l[?2004h>             return ('PUSH', parts)
+[?2004l[?2004h>         parts = text.split()
+[?2004l[?2004h>         opcode = parts[0].upper()
+[?2004l[?2004h>         args = parts[1:] if len(parts) > 1 else []
+[?2004l[?2004h>         return (opcode, args)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def parse_string_literal(self, text):
+[?2004l[?2004h>         assert text[0] == '\"'
+[?2004l[?2004h>         i = 1
+[?2004l[?2004h>         result = []
+[?2004l[?2004h>         while i < len(text):
+[?2004l[?2004h>             c = text[i]
+[?2004l[?2004h>             if c == '\\\\':
+[?2004l[?2004h>                 if i + 1 < len(text):
+[?2004l[?2004h>                     nc = text[i+1]
+[?2004l[?2004h>                     if nc == 'n': result.append(chr(10))
+[?2004l[?2004h>                     elif nc == 't': result.append(chr(9))
+[?2004l[?2004h>                     elif nc == '\\\\': result.append('\\\\')
+[?2004l[?2004h>                     elif nc == '\"': result.append('\"')
+[?2004l[?2004h>                     else: result.append('\\\\'); result.append(nc)
+[?2004l[?2004h>                     i += 2
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     result.append('\\\\')
+[?2004l[?2004h>                     i += 1
+[?2004l[?2004h>             elif c == '\"':
+[?2004l[?2004h>                 return (''.join(result), i+1)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 result.append(c)
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>         return (''.join(result), i)
+[?2004l[?2004h> ''' 
+[?2004l[?2004h> with open('/app/svm', 'w') as f:
+[?2004l[?2004h>     f.write(code)
+[?2004l[?2004h> os.chmod('/app/svm', 0o755)
+[?2004l[?2004h> print('done')
+[?2004l[?2004h> "
+[?2004ldone
+[?2004hroot@22622e8366f1:/app# python3 /tmp/gen.py
+[?2004lpython3: can't open file '/tmp/gen.py': [Errno 2] No such file or directory
+[?2004hroot@22622e8366f1:/app# head -5 /app/svm
+[?2004l#!/usr/bin/env python3
+import sys
+import re
+
+def main():
+[?2004hroot@22622e8366f1:/app# wc -l /app/svm
+[?2004l139 /app/svm
+[?2004hroot@22622e8366f1:/app# /app/svm /tmp/test1.svm
+[?2004l  File "/app/svm", line 122
+    if c == '\':
+            ^
+SyntaxError: unterminated string literal (detected at line 122)
+[?2004hroot@22622e8366f1:/app# /app/svm /tmp/test1.svm
+[?2004l  File "/app/svm", line 122
+    if c == '\':
+            ^
+SyntaxError: unterminated string literal (detected at line 122)
+[?2004hroot@22622e8366f1:/app# rm -f /app/svm
+[?2004l[?2004hroot@22622e8366f1:/app# python3 -c "import base64; open('/tmp/write_svm.py','w').write(base64.b64decode(open('/tmp/svm.b64').read()).decode())"
+[?2004lTraceback (most recent call last):
+  File "<string>", line 1, in <module>
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/svm.b64'
+[?2004hroot@22622e8366f1:/app# python3 << 'EOF'
+[?2004l[?2004h> # Write the svm script using explicit chr() calls to avoid escaping issues
+[?2004l[?2004h> lines = []
+[?2004l[?2004h> L = lines.append
+[?2004l[?2004h> BS = chr(92)  # backslash
+[?2004l[?2004h> NL = chr(10)  # newline
+[?2004l[?2004h> DQ = chr(34)  # double quote
+[?2004l[?2004h> TB = chr(9)   # tab
+[?2004l[?2004h> 
+[?2004l[?2004h> L('#!/usr/bin/env python3')
+[?2004l[?2004h> L('import sys')
+[?2004l[?2004h> L('')
+[?2004l[?2004h> L('def main():')
+[?2004l[?2004h> L('    if len(sys.argv) < 2:')
+[?2004l[?2004h> L('        print(' + DQ + 'Usage: svm <program.svm>' + DQ + ', file=sys.stderr)')
+[?2004l[?2004h> L('        sys.exit(1)')
+[?2004l[?2004h> L('    with open(sys.argv[1], ' + DQ + 'r' + DQ + ') as f:')
+[?2004l[?2004h> L('        source = f.read()')
+[?2004l[?2004h> L('    vm = VM()')
+[?2004l[?2004h> L('    vm.load(source)')
+[?2004l[?2004h> L('    vm.run()')
+[?2004l[?2004h> L('')
+[?2004l[?2004h> print('Generated', len(lines), 'lines so far')
+[?2004l[?2004h> 
+[?2004l[?2004h> # OK this approach is too tedious. Let me just write the file directly.
+[?2004l[?2004h> # The issue is that heredocs mangle backslashes.
+[?2004l[?2004h> # Let me write a small bootstrap that writes the real file.
+[?2004l[?2004h> 
+[?2004l[?2004h> import textwrap, os
+[?2004l[?2004h> 
+[?2004l[?2004h> # I'll write the file character by character for the tricky parts
+[?2004l[?2004h> code_parts = []
+[?2004l[?2004h> 
+[?2004l[?2004h> def add(s):
+[?2004l[?2004h>     code_parts.append(s)
+[?2004l[?2004h> 
+[?2004l[?2004h> add('#!/usr/bin/env python3' + NL)
+[?2004l[?2004h> add('import sys' + NL)
+[?2004l[?2004h> add(NL)
+[?2004l[?2004h> add('BS = chr(92)' + NL)
+[?2004l[?2004h> add('NL = chr(10)' + NL)
+[?2004l[?2004h> add('DQ = chr(34)' + NL)
+[?2004l[?2004h> add('TB = chr(9)' + NL)
+[?2004l[?2004h> add(NL)
+[?2004l[?2004h> 
+[?2004l[?2004h> # Actually, let me just write the whole thing to a temp file using python
+[?2004l[?2004h> # and avoid the shell entirely
+[?2004l[?2004h> 
+[?2004l[?2004h> print('Switching to direct file write approach...')
+[?2004l[?2004h> EOF
+[?2004lGenerated 13 lines so far
+Switching to direct file write approach...
+[?2004hroot@22622e8366f1:/app# # Let me use a completely different approach - write a Python file that writes the svm file
+[?2004l[?2004hroot@22622e8366f1:/app# python3 -c "
+[?2004l[?2004h> import os, sys
+[?2004l[?2004h> 
+[?2004l[?2004h> # Build the source code as a list of strings
+[?2004l[?2004h> BS = chr(92)
+[?2004l[?2004h> NL = chr(10)
+[?2004l[?2004h> DQ = chr(34)
+[?2004l[?2004h> TB = chr(9)
+[?2004l[?2004h> SQ = chr(39)
+[?2004l[?2004h> 
+[?2004l[?2004h> lines = []
+[?2004l[?2004h> def L(s=''):
+[?2004l[?2004h>     lines.append(s)
+[?2004l[?2004h> 
+[?2004l[?2004h> L('#!/usr/bin/env python3')
+[?2004l[?2004h> L('import sys')
+[?2004l[?2004h> L('')
+[?2004l[?2004h> L('BS = chr(92)')
+[?2004l[?2004h> L('NL = chr(10)')
+[?2004l[?2004h> L('DQ = chr(34)')
+[?2004l[?2004h> L('TB = chr(9)')
+[?2004l[?2004h> L('')
+[?2004l[?2004h> L('def main():')
+[?2004l[?2004h> L('    if len(sys.argv) < 2:')
+[?2004l[?2004h> L('        print(SQ + 'Usage: svm <program.svm>' + SQ + ', file=sys.stderr)')
+[?2004l[?2004h> 
+[?2004l[?2004h> print('test')
+[?2004l[?2004h> "
+[?2004l  File "<string>", line 25
+    L('        print(SQ + 'Usage: svm <program.svm>' + SQ + ', file=sys.stderr)')
+                                                                               ^
+SyntaxError: unterminated string literal (detected at line 25)
+[?2004hroot@22622e8366f1:/app# python3 << 'ENDSCRIPT'
+[?2004l[?2004h> import base64, os
+[?2004l[?2004h> 
+[?2004l[?2004h> src = (
+[?2004l[?2004h> '#!/usr/bin/env python3\n'
+[?2004l[?2004h> 'import sys\n'
+[?2004l[?2004h> '\n'
+[?2004l[?2004h> 'BS = chr(92)\n'
+[?2004l[?2004h> 'NL = chr(10)\n'
+[?2004l[?2004h> 'DQ = chr(34)\n'
+[?2004l[?2004h> 'TB = chr(9)\n'
+[?2004l[?2004h> '\n'
+[?2004l[?2004h> 'def main():\n'
+[?2004l[?2004h> '    if len(sys.argv) < 2:\n'
+[?2004l[?2004h> '        print("Usage: svm <program.svm>", file=sys.stderr)\n'
+[?2004l[?2004h> '        sys.exit(1)\n'
+[?2004l[?2004h> '    with open(sys.argv[1]) as f:\n'
+[?2004l[?2004h> '        source = f.read()\n'
+[?2004l[?2004h> '    vm = VM()\n'
+[?2004l[?2004h> '    vm.load(source)\n'
+[?2004l[?2004h> '    vm.run()\n'
+[?2004l[?2004h> )
+[?2004l[?2004h> 
+[?2004l[?2004h> enc = base64.b64encode(src.encode()).decode()
+[?2004l[?2004h> with open('/tmp/svm_part1.b64', 'w') as f:
+[?2004l[?2004h>     f.write(enc)
+[?2004l[?2004h> print('Part 1 written, length:', len(src))
+[?2004l[?2004h> ENDSCRIPT
+[?2004lPart 1 written, length: 310
+[?2004hroot@22622e8366f1:/app# python3 << 'PYEOF'
+[?2004l[?2004h> import os
+[?2004l[?2004h> 
+[?2004l[?2004h> # Write the VM source code to /app/svm
+[?2004l[?2004h> # Using chr() for special characters to avoid any escaping issues
+[?2004l[?2004h> BS = chr(92)   # backslash
+[?2004l[?2004h> NL = chr(10)   # newline  
+[?2004l[?2004h> DQ = chr(34)   # double quote
+[?2004l[?2004h> TB = chr(9)    # tab
+[?2004l[?2004h> SQ = chr(39)   # single quote
+[?2004l[?2004h> 
+[?2004l[?2004h> def w(f, line):
+[?2004l[?2004h>     f.write(line + NL)
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/svm', 'w') as f:
+[?2004l[?2004h>     w(f, '#!/usr/bin/env python3')
+[?2004l[?2004h>     w(f, 'import sys')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'BS = chr(92)')
+[?2004l[?2004h>     w(f, 'NL = chr(10)')
+[?2004l[?2004h>     w(f, 'DQ = chr(34)')
+[?2004l[?2004h>     w(f, 'TB = chr(9)')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'class VMException(Exception):')
+[?2004l[?2004h>     w(f, '    def __init__(self, value):')
+[?2004l[?2004h>     w(f, '        self.value = value')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'class VMFault(Exception):')
+[?2004l[?2004h>     w(f, '    def __init__(self, message):')
+[?2004l[?2004h>     w(f, '        self.message = message')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'class Closure:')
+[?2004l[?2004h>     w(f, '    def __init__(self, proc_name, captures):')
+[?2004l[?2004h>     w(f, '        self.proc_name = proc_name')
+[?2004l[?2004h>     w(f, '        self.captures = captures')
+[?2004l[?2004h>     w(f, '    def __repr__(self):')
+[?2004l[?2004h>     w(f, '        return ' + SQ + '<closure ' + SQ + ' + self.proc_name + ' + SQ + '>' + SQ)
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'class ArrayRef:')
+[?2004l[?2004h>     w(f, '    def __init__(self, data):')
+[?2004l[?2004h>     w(f, '        self.data = data')
+[?2004l[?2004h>     w(f, '    def __repr__(self):')
+[?2004l[?2004h>     w(f, '        return str(self.data)')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     w(f, 'class VM:')
+[?2004l[?2004h>     w(f, '    def __init__(self):')
+[?2004l[?2004h>     w(f, '        self.stack = []')
+[?2004l[?2004h>     w(f, '        self.instructions = []')
+[?2004l[?2004h>     w(f, '        self.pc = 0')
+[?2004l[?2004h>     w(f, '        self.labels = {}')
+[?2004l[?2004h>     w(f, '        self.procs = {}')
+[?2004l[?2004h>     w(f, '        self.heap = {}')
+[?2004l[?2004h>     w(f, '        self.heap_allocs = {}')
+[?2004l[?2004h>     w(f, '        self.freed = set()')
+[?2004l[?2004h>     w(f, '        self.next_heap_addr = 1')
+[?2004l[?2004h>     w(f, '        self.call_stack = []')
+[?2004l[?2004h>     w(f, '        self.current_frame = None')
+[?2004l[?2004h>     w(f, '        self.try_stack = []')
+[?2004l[?2004h>     w(f, '        self.running = True')
+[?2004l[?2004h>     w(f, '        self.proc_ranges = []')
+[?2004l[?2004h>     w(f, '        self.entry = 0')
+[?2004l[?2004h>     w(f, '')
+[?2004l[?2004h>     # load method
+[?2004l[?2004h>     w(f, '    def load(self, source):')
+[?2004l[?2004h>     w(f, '        lines = source.split(NL)')
+[?2004l[?2004h>     w(f, '        raw = []')
+[?2004l[?2004h>     w(f, '        for ln, line in enumerate(lines, 1):')
+[?2004l[?2004h>     w(f, '            s = line.strip()')
+[?2004l[?2004h>     w(f, '            if not s or s.startswith(' + SQ + '#' + SQ + '):')
+[?2004l[?2004h>     w(f, '                continue')
+[?2004l[?2004h>     w(f, '            raw.append((s, ln))')
+[?2004l[?2004h>     w(f, '        self.instructions = []')
+[?2004l[?2004h>     w(f, '        for s, ln in raw:')
+[?2004l[?2004h>     w(f, '            opcode, args = self.parse_instruction(s)')
+[?2004l[?2004h>     w(f, '            idx = len(self.instructions)')
+[?2004l[?2004h>     w(f, '            self.instructions.append((opcode, args, ln))')
+[?2004l[?2004h>     w(f, '            if opcode == ' + SQ + 'LABEL' + SQ + ':')
+[?2004l[?2004h>     w(f, '                self.labels[args[0]] = idx')
+[?2004l[?2004h>     w(f, '            elif opcode == ' + SQ + 'PROC' + SQ + ':')
+[?2004l[?2004h>     w(f, '                self.procs[args[0]] = {' + SQ + 'nargs' + SQ + ': int(args[1]), ' + SQ + 'nlocals' + SQ + ': int(args[2]), ' + SQ + 'start' + SQ + ': idx + 1}')
+[?2004l[?2004h>     w(f, '        self.proc_ranges = []')
+[?2004l[?2004h>     w(f, '        idx = 0')
+[?2004l[?2004h>     w(f, '        while idx < len(self.instructions):')
+[?2004l[?2004h>     w(f, '            op, ar, ln = self.instructions[idx]')
+[?2004l[?2004h>     w(f, '            if op == ' + SQ + 'PROC' + SQ + ':')
+[?2004l[?2004h>     w(f, '                depth = 1')
+[?2004l[?2004h>     w(f, '                eidx = idx + 1')
+[?2004l[?2004h>     w(f, '                while eidx < len(self.instructions):')
+[?2004l[?2004h>     w(f, '                    o2, a2, l2 = self.instructions[eidx]')
+[?2004l[?2004h>     w(f, '                    if o2 == ' + SQ + 'PROC' + SQ + ': depth += 1')
+[?2004l[?2004h>     w(f, '                    elif o2 == ' + SQ + 'ENDPROC' + SQ + ':')
+[?2004l[?2004h>     w(f, '                        depth -= 1')
+[?2004l[?2004h>     w(f, '                        if depth == 0: break')
+[?2004l[?2004h>     w(f, '                    eidx += 1')
+[?2004l[?2004h>     w(f, '                self.proc_ranges.append((idx, eidx))')
+[?2004l[?2004h>     w(f, '                self.procs[ar[0]][' + SQ + 'end' + SQ + '] = eidx')
+[?2004l[?2004h>     w(f, '                idx = eidx + 1')
+[?2004l[?2004h>     w(f, '            else:')
+[?2004l[?2004h>     w(f, '                idx += 1')
+[?2004l[?2004h>     w(f, '        self.entry = 0')
+[?2004l[?2004h>     w(f, '        for i in range(len(self.instructions)):')
+[?2004l[?2004h>     w(f, '            inside = False')
+[?2004l[?2004h>     w(f, '            for ps, pe in self.proc_ranges:')
+[?2004l[?2004h>     w(f, '                if ps <= i <= pe:')
+[?2004l[?2004h>     w(f, '                    inside = True')
+[?2004l[?2004h>     w(f, '                    break')
+[?2004l[?2004h>     w(f, '            if not inside:')
+[?2004l[?2004h>     w(f, '                self.entry = i')
+[?2004l[?2004h>     w(f, '                break')
+[?2004l[?2004h> 
+[?2004l[?2004h> print('Phase 1 done')
+[?2004l[?2004h> PYEOF
+[?2004lPhase 1 done
+[?2004hroot@22622e8366f1:/app# rm -f /app/svm
+[?2004l[?2004hroot@22622e8366f1:/app# 

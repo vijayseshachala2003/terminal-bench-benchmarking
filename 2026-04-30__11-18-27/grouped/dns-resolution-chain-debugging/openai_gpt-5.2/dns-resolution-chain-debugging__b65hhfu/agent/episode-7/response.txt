@@ -1,0 +1,75 @@
+{
+  "analysis": "Primary and secondary still fail to start. named-checkconf now fails on both because the logging block was partially removed leaving 'category default { default_log; };' behind, which BIND interprets at top-level as unknown option. Resolver starts and listens on 5300 but returns SERVFAIL because forwarder (primary on 5301) is down. Also trust-anchors block currently has an empty line because KSK extraction produced nothing (awk pattern likely wrong due to leading whitespace/fields). We must: cleanly remove logging blocks from primary/secondary, restart them, and correctly extract the KSK DNSKEY and insert into resolver trust-anchors. Then fix example.com delegation warning by making NS targets outside child zone or provide glue properly; but first get services up.",
+  "plan": "1) Completely remove any remaining logging statements from primary and secondary named.conf (delete from 'logging {' to matching '};', and also delete any stray 'category' lines). Re-run named-checkconf. 2) Restart primary and secondary and verify ports 5301/5302 are listening. 3) Fix resolver trust-anchors: extract the KSK DNSKEY line robustly by matching 'DNSKEY 257' in the signed zone file, then rewrite resolver named.conf with that line. Restart resolver. 4) Verify resolver can resolve secure.example.com and returns AD flag. 5) Verify AXFR from secondary works. 6) Run test queries. After that, address remaining example.com delegation warnings if they impact test queries.",
+  "commands": [
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\nlogging\\s*\\{.*?\\};\\s*//sg; s/^\\s*category\\s+default\\s*\\{[^\\}]*\\};\\s*\\n//mg' /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "KSKLINE=$(grep -E 'DNSKEY\\s+257\\s+3\\s+' /app/dns/primary/zones/secure.example.com.zone.signed | head -n1); echo \"$KSKLINE\" | sed -n '1p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<EOF\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation yes;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named-resolver.pid\";\n};\n\ntrust-anchors {\n    $KSKLINE\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

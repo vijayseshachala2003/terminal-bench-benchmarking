@@ -1,0 +1,83 @@
+{
+  "analysis": "All test queries to resolver return SERVFAIL. Resolver forwards only to primary (5301). This strongly suggests the primary is serving zones but resolver is failing due to DNSSEC validation problems (SERVFAIL on unsigned example.com too could happen if primary answers are not reachable, but services are up). We need to query primary directly to see if authoritative answers are OK. If primary answers fine, then resolver is likely validating and failing because example.com is unsigned but perhaps has bogus DNSSEC records, or because secure.example.com is signed but lacks a proper delegation/DS chain from example.com, causing validation failure when resolver tries to validate secure.example.com. However even example.com A queries SERVFAIL via resolver implies resolver may be failing to resolve at all (forward only + dnssec-validation auto might be treating responses as bogus if it thinks zone is signed but broken). We should: (1) dig primary directly for example.com and secure.example.com with +dnssec. (2) inspect resolver logs for 'bogus'/'validation failure'. (3) Establish proper delegation: add NS records for secure.example.com in example.com zone and add DS from dsset-secure.example.com. into example.com zone; also ensure glue if needed. (4) Possibly disable dnssec-validation on resolver? But requirement wants DNSSEC valid, so better to fix chain. Also ensure example.com zone itself is not signed; that's fine. Need delegation records so validator can build chain.",
+  "plan": "1) Query primary directly for example.com and secure.example.com to confirm authoritative service. 2) Check resolver log for validation errors. 3) Add delegation in example.com zone: 'secure.example.com. NS ns1.secure.example.com.' etc, provide A records for those NS names (glue), and add DS record from dsset-secure.example.com. file. Increment example.com SOA serial. 4) Reload primary (restart or rndc reload), trigger secondary transfer, flush resolver cache, retest queries and check AD flag for secure.example.com. 5) Update /app/dns_health.json dnssec_valid to true if AD appears.",
+  "commands": [
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com A +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 www.example.com A +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com A +dnssec +multi +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 200 /tmp/named-resolver.log | egrep -i 'bogus|validate|validation|servfail|failed|error' || true\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "echo '--- dsset-secure.example.com.'; cat /app/dns/primary/zones/dsset-secure.example.com.\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cp -a /app/dns/primary/zones/example.com.zone /app/dns/primary/zones/example.com.zone.bak.$(date +%s)\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport re\nz='/app/dns/primary/zones/example.com.zone'\nwith open(z) as f: data=f.read().splitlines()\n# bump SOA serial (first number after SOA)\nout=[]\nsoa_idx=None\nfor i,line in enumerate(data):\n    if ' IN SOA ' in line and soa_idx is None:\n        soa_idx=i\n    out.append(line)\nif soa_idx is None:\n    raise SystemExit('SOA not found')\n# find serial within next ~10 lines\nfor j in range(soa_idx, min(soa_idx+15, len(out))):\n    m=re.search(r'(\\d{10})\\s*;\\s*serial', out[j])\n    if m:\n        serial=int(m.group(1))+1\n        out[j]=out[j].replace(m.group(1), str(serial))\n        break\nelse:\n    raise SystemExit('serial not found')\n# append delegation + DS if not present\ntext='\\n'.join(out)\nif 'secure.example.com.' not in text:\n    out.append('')\n    out.append('; Delegation + DS for secure.example.com (DNSSEC chain)')\n    out.append('secure.example.com. 3600 IN NS ns1.secure.example.com.')\n    out.append('secure.example.com. 3600 IN NS ns2.secure.example.com.')\n    out.append('ns1.secure.example.com. 3600 IN A 192.0.2.53')\n    out.append('ns2.secure.example.com. 3600 IN A 192.0.2.54')\n    # DS record from dsset file\n    with open('/app/dns/primary/zones/dsset-secure.example.com.') as f:\n        ds=[ln.strip() for ln in f if ln.strip() and not ln.startswith(';')]\n    out.extend(ds)\nwith open(z,'w') as f: f.write('\\n'.join(out)+\"\\n\")\nprint('updated',z)\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 2\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=2 +tries=1 | tail -n 2\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 example.com A +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/flags:/{print; exit}'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "DNSSEC_VALID=$(dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1 | awk '/flags:/{if($0~ / ad[ ;]/) print \"true\"; else print \"false\"; exit}'); jq --argjson v \"$DNSSEC_VALID\" '.dnssec_valid=$v' /app/dns_health.json > /app/dns_health.json.tmp && mv /app/dns_health.json.tmp /app/dns_health.json\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cat /app/dns_health.json\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

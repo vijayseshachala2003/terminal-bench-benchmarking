@@ -1,0 +1,43 @@
+{
+  "analysis": "Resolver still fails to start after rewrite: named.conf reports at line 16 'DNSKEY' unexpected inside trust-anchors. That indicates the trust-anchors clause syntax expects a domain name label followed by a DNSKEY, not a raw RR line (or expects a key format like 'secure.example.com. static-key ...'). We need to use the correct BIND trust-anchors syntax. For BIND 9.18, use: trust-anchors { \"secure.example.com\" static-key <flags> <protocol> <alg> \"base64\"; }; We'll extract the KSK DNSKEY fields and convert to static-key format. Then restart resolver and test AD flag.",
+  "plan": "1) Extract the KSK DNSKEY (257) from the signed zone, parse out flags/proto/alg and base64 key material (concatenate multi-line). 2) Rewrite resolver named.conf trust-anchors using static-key syntax for secure.example.com. 3) Validate with named-checkconf, restart resolver, verify it listens on 5300, and query secure.example.com via resolver to confirm it answers and sets AD. 4) Run the full test query list and then generate dns_health.json.",
+  "commands": [
+    {
+      "keystrokes": "KSKREC=$(perl -0777 -ne 'if(/\\n\\s*\\d+\\s+DNSKEY\\s+257\\s+3\\s+8\\s*\\(\\s*(.*?)\\)\\s*/s){$k=$1; $k=~s/\\s+//g; print $k; exit} elsif(/\\n\\s*\\d+\\s+DNSKEY\\s+257\\s+3\\s+8\\s+([^\\s;]+)/){print $1; exit}' /app/dns/primary/zones/secure.example.com.zone.signed); echo \"$KSKREC\" | head\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "FLAGS=257; PROTO=3; ALG=8; KEY=\"$KSKREC\"; cat > /app/dns/resolver/named.conf <<EOF\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation yes;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named-resolver.pid\";\n};\n\ntrust-anchors {\n    \"secure.example.com\" static-key $FLAGS $PROTO $ALG \"$KEY\";\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\nnamed -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read -r t n; do echo \"===== $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1 +noall +answer +comments; done\n",
+      "duration": 6.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR >/tmp/axfr_example.txt && echo success_example\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR >/tmp/axfr_secure.txt && echo success_secure\n",
+      "duration": 2.0
+    }
+  ],
+  "task_complete": false
+}

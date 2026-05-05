@@ -1,0 +1,278 @@
+Current terminal state:
+New Terminal Output:
+
+root@eb1cfbf54433:/app# cat > /app/svm <<'PY'
+> #!/usr/bin/env python3
+> import sys, re
+> from dataclasses import dataclass
+> from typing import Any, List, Dict, Tuple, Optional
+>
+> class VMFault(SystemExit):
+>     def __init__(self, msg: str, code: int = 1):
+>         self.msg = msg
+>         super().__init__(code)
+>
+> class VMThrow(Exception):
+>     def __init__(self, value: Any):
+>         self.value = value
+>         super().__init__(value)
+>
+> def to_string(x: Any) -> str:
+>     if isinstance(x, str):
+>         return x
+>     if isinstance(x, bool):
+>         return '1' if x else '0'
+>     if isinstance(x, (int, float)) and not isinstance(x, bool):
+>         return str(x)
+>     if isinstance(x, list):
+>         return str(x)
+>     if isinstance(x, dict) and x.get('__closure__'):
+>         return f"<closure {x['proc']} captures={len(x['captures'])}>"
+>     return str(x)
+>
+> def fault(msg: str) -> None:
+>     print(f"ERROR: {msg}")
+>     raise VMFault(msg, 1)
+>
+> def uncaught(v: Any) -> None:
+>     print(f"EXCEPTION: {to_string(v)}")
+>     raise VMFault('uncaught', 1)
+>
+> def is_int(x: Any) -> bool:
+>     return isinstance(x, int) and not isinstance(x, bool)
+>
+> def is_float(x: Any) -> bool:
+>     return isinstance(x, float)
+>
+> def is_num(x: Any) -> bool:
+>     return is_int(x) or is_float(x)
+>
+> def truthy(x: Any) -> bool:
+>     if x is None:
+>         return False
+>     if isinstance(x, bool):
+>         return x
+>     if is_num(x):
+>         return x != 0
+>     if isinstance(x, (str, list)):
+>         return len(x) != 0
+>     if isinstance(x, dict) and x.get('__closure__'):
+>         return True
+>     return bool(x)
+>
+> def type_name(x: Any) -> str:
+>     if is_int(x): return 'int'
+>     if is_float(x): return 'float'
+>     if isinstance(x, str): return 'string'
+>     if isinstance(x, list): return 'array'
+>     if isinstance(x, dict) and x.get('__closure__'): return 'closure'
+>     return 'unknown'
+> PY
+root@eb1cfbf54433:/app# cat >> /app/svm <<'PY'
+> _token_re = re.compile(r"\s*(?:(#.*)$|\"((?:\\.|[^\"])*)\"|([^\s]+))")
+>
+, main)
+            continue
+        if op == 'PROC':
+            if len(toks) != 4: fault('type error: PROC expects name nargs nlocals')
+            name = str(toks[1])
+            nargs = int(parse_value(str(toks[2])))
+            nlocals = int(parse_value(str(toks[3])))
+            code: List[Instr] = []
+            labels: Dict[str, int] = {}
+            while i < len(lines):
+                toks2 = tokenize_line(lines[i]); i += 1
+                if not toks2: continue
+                op2 = str(toks2[0])
+                if op2 == 'ENDPROC': break
+                if op2 == 'LABEL':
+                    if len(toks2) != 2: fault('type error: LABEL expects 1 arg')
+                    add_label(str(toks2[1]), labels, code)
+                    continue
+                code.append(Instr(op2, toks2[1:], i))
+            procs[name] = ProcDef(name, nargs, nlocals, code, labels)
+            continue
+        if op == 'PUSH' and len(toks) != 2: fault('type error: PUSH expects 1 arg')
+        main.append(Instr(op, toks[1:], i))
+
+    return Program(main=main, labels=main_labels, procs=procs)
+PY
+> def unescape_string(s: str) -> str:
+>     out = []
+>     i = 0
+>     while i < len(s):
+>         c = s[i]
+>         if c != '\\':
+>             out.append(c); i += 1; continue
+>         i += 1
+>         if i >= len(s):
+>             out.append('\\'); break
+>         e = s[i]; i += 1
+>         if e == 'n': out.append('\n')
+>         elif e == 't': out.append('\t')
+>         elif e == '\\': out.append('\\')
+>         elif e == '"': out.append('"')
+>         else: out.append(e)
+>     return ''.join(out)
+>
+> def tokenize_line(line: str) -> List[Any]:
+>     res: List[Any] = []
+>     pos = 0
+>     while pos < len(line):
+>         m = _token_re.match(line, pos)
+>         if not m: break
+>         if m.group(1) is not None: break
+>         if m.group(2) is not None: res.append(unescape_string(m.group(2)))
+>         elif m.group(3) is not None: res.append(m.group(3))
+>         pos = m.end()
+>     return res
+>
+> def parse_value(tok: str) -> Any:
+>     if re.fullmatch(r"-?\d+", tok): return int(tok)
+>     if re.fullmatch(r"-?(?:\d+\.\d*|\d*\.\d+)(?:[eE]-?\d+)?", tok) or re.fullmatch(r"-?\d+[eE]-?\d+", tok):
+>         return float(tok)
+>     return tok
+>
+> @dataclass
+> class Instr:
+>     op: str
+>     args: List[Any]
+>     line: int
+>
+> @dataclass
+> class ProcDef:
+>     name: str
+>     nargs: int
+>     nlocals: int
+>     code: List[Instr]
+>     labels: Dict[str, int]
+>
+> @dataclass
+> class Program:
+>     main: List[Instr]
+>     labels: Dict[str, int]
+>     procs: Dict[str, ProcDef]
+>
+> def parse_program(text: str) -> Program:
+>     lines = text.splitlines()
+>     i = 0
+>     main: List[Instr] = []
+>     main_labels: Dict[str, int] = {}
+>     procs: Dict[str, ProcDef] = {}
+>
+>     def add_label(lbl: str, labels: Dict[str, int], code: List[Instr]):
+>         labels[lbl] = len(code)
+>
+>     wh
+[... output limited to 10000 bytes; 11520 interior bytes omitted ...]
+ue(str(args[0])))
+>                     if n < 0 or n >= len(fr.locals): raise VMThrow('type error: LLOAD out of range')
+>                     self.push(fr.locals[n])
+>                 elif op == 'LSTORE':
+>                     n = int(parse_value(str(args[0])))
+>                     val = self.pop()
+>                     if n < 0 or n >= len(fr.locals): raise VMThrow('type error: LSTORE out of range')
+>                     fr.locals[n] = val
+>
+>                 elif op == 'JMP':
+>                     self.jump(str(args[0]))
+>                 elif op == 'JZ':
+>                     v = self.pop()
+>                     if not truthy(v): self.jump(str(args[0]))
+>                 elif op == 'JNZ':
+>                     v = self.pop()
+>                     if truthy(v): self.jump(str(args[0]))
+>
+>                 elif op == 'CALL':
+>                     name = str(args[0])
+>                     if name not in self.prog.procs: fault(f"unknown instruction: unknown procedure {name}")
+>                     pd = self.prog.procs[name]
+>                     if len(self.stack) < pd.nargs: fault('stack underflow')
+>                     argv = [self.pop() for _ in range(pd.nargs)][::-1]
+>                     locals_ = argv + [0 for _ in range(pd.nlocals)]
+>                     self.frames.append(Frame(name, pd.code, pd.labels, 0, locals_, None))
+>                 elif op == 'RET':
+>                     retv = self.pop()
+>                     if len(self.frames) == 1:
+>                         self.push(retv); return
+>                     self.frames.pop(); self.push(retv)
+>
+>                 elif op == 'CLOSURE':
+>                     proc = str(args[0]); nc = int(parse_value(str(args[1])))
+>                     if proc not in self.prog.procs: fault(f"unknown instruction: unknown procedure {proc}")
+>                     if len(self.stack) < nc: fault('stack underflow')
+>                     caps = [self.pop() for _ in range(nc)][::-1]
+>                     self.push({'__closure__': True, 'proc': proc, 'captures': caps})
+>                 elif op == 'CALLCLOSURE':
+>                     clo = self.pop()
+>                     if not (isinstance(clo, dict) and clo.get('__closure__')): raise VMThrow('type error: CALLCLOSURE expects closure')
+>                     proc = clo['proc']; pd = self.prog.procs[proc]
+>                     if len(self.stack) < pd.nargs: fault('stack underflow')
+>                     argv = [self.pop() for _ in range(pd.nargs)][::-1]
+>                     locals_ = argv + [0 for _ in range(pd.nlocals)]
+>                     self.frames.append(Frame(proc, pd.code, pd.labels, 0, locals_, clo))
+>                 elif op == 'GETCAPTURED':
+>                     n = int(parse_value(str(args[0])))
+>                     if fr.closure is None: raise VMThrow('type error: GETCAPTURED outside closure')
+>                     caps = fr.closure['captures']
+>                     if n < 0 or n >= len(caps): raise VMThrow('type error: GETCAPTURED out of range')
+>                     self.push(caps[n])
+>
+>                 elif op == 'PRINT':
+>                     sys.stdout.write(to_string(self.peek())); sys.stdout.flush()
+>                 elif op == 'PRINTLN':
+>                     sys.stdout.write(to_string(self.peek()) + '\n'); sys.stdout.flush()
+>                 elif op == 'READ':
+>                     s = self.stdin.readline()
+>                     if s.endswith('\n'): s = s[:-1]
+>                     self.push(s)
+>
+>                 elif op == 'TRY':
+>                     lbl = str(args[0])
+>                     if lbl not in fr.labels: fault(f"unknown instruction: unknown label {lbl}")
+>                     self.handlers.append((len(self.frames)-1, fr.labels[lbl], len(self.stack)))
+>                 elif op == 'ENDTRY':
+>                     if self.handlers: self.handlers.pop()
+>                 elif op == 'THROW':
+>                     raise VMThrow(self.pop())
+>                 else:
+>                     fault(f"unknown instruction: {op}")
+>
+>             except VMThrow as te:
+>                 self.handle_throw(te.value)
+> PY
+root@eb1cfbf54433:/app# cat >> /app/svm <<'PY'
+>
+> def main(argv: List[str]) -> int:
+>     if len(argv) != 2:
+>         print('Usage: /app/svm <program.svm>')
+>         return 1
+>     path = argv[1]
+>     try:
+>         text = open(path, 'r', encoding='utf-8').read()
+>     except Exception:
+>         print(f"ERROR: cannot open file: {path}")
+>         return 1
+>     try:
+>         prog = parse_program(text)
+>         VM(prog).run()
+>         return 0
+>     except VMFault as e:
+>         return int(e.code)
+>
+> if __name__ == '__main__':
+>     raise SystemExit(main(sys.argv))
+> PY
+root@eb1cfbf54433:/app# chmod +x /app/svm
+root@eb1cfbf54433:/app# python3 -m py_compile /app/svm
+root@eb1cfbf54433:/app# /app/svm /app/smoke.svm
+5
+root@eb1cfbf54433:/app# /app/svm /app/closure.svm
+42
+root@eb1cfbf54433:/app# /app/svm /app/uaf.svm; echo exit=$?
+ERROR: use after free
+exit=1
+root@eb1cfbf54433:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

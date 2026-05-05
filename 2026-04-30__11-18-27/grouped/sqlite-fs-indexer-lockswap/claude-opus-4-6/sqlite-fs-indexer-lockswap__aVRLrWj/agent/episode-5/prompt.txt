@@ -1,0 +1,215 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@59468ec3fa5c:/app# python3 << 'PYEOF'
+> import textwrap
+> code = textwrap.dedent('''\
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import tempfile
+>
+>
+> def _nfc(s):
+>     return unicodedata.normalize('NFC', s)
+>
+>
+> def _load_ignore_patterns(ignore_path='/data/ignore.txt'):
+>     patterns = []
+>     try:
+>         with open(ignore_path, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.rstrip('\\n').rstrip('\\r')
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith('#'):
+>                     continue
+>                 pat = line.strip()
+>                 if not pat:
+>                     continue
+>                 try:
+>                     pat_nfc = _nfc(pat)
+>                 except Exception:
+>                     continue
+>                 if pat_nfc.startswith('/'):
+>                     patterns.append((pat_nfc[1:], 'rooted'))
+>                 elif '/' in pat_nfc:
+>                     patterns.append((pat_nfc, 'path'))
+>                 else:
+>                     patterns.append((pat_nfc, 'basename'))
+>     except FileNotFoundError:
+>         pass
+>     except Exception:
+>         pass
+>     return patterns
+>
+>
+> def _wildcard_match(pattern, text):
+>     # Parse pattern into tokens
+>     tokens = []
+>     i = 0
+>     while i < len(pattern):
+>         if pattern[i] == '*':
+>             if i + 1 < len(pattern) and pattern[i + 1] == '*':
+>                 tokens.append(('lit', '**'))
+>                 i += 2
+>             else:
+>                 tokens.append(('wild',))
+>                 i += 1
+>         else:
+>             tokens.append(('lit', pattern[i]))
+>             i += 1
+>     # Merge consecutive literals
+>     merged = []
+>     for tok in tokens:
+>         if tok[0] == 'lit' and merged and merged[-1][0] == 'lit':
+>             merged[-1] = ('lit', merged[-1][1] + tok[1])
+>         else:
+>             merged.append(tok)
+>     # Collapse consecutive wilds
+>     final = []
+>     for tok in merged:
+>         if tok[0] == 'wild' and final and final[-1][0] == 'wild':
+>             continue
+>         final.append(tok)
+>     return _dp_match(final, text, 0, 0, {})
+>
+>
+> def _dp_match(tokens, text, ti, si, memo):
+>     key = (ti, si)
+>     if key in memo:
+>         return memo[key]
+>     if ti == len(tokens):
+>         result = (si == len(text))
+>         memo[key] = result
+>         return result
+>     tok = tokens[ti]
+>     if tok[0] == 'lit':
+>         lit = tok[1]
+>         if text[si:si+len(lit)] == lit:
+>             result = _dp_match(tokens, text, ti + 1, si + len(lit), memo)
+>         else:
+>             result = False
+>     else:
+>         result = False
+>         j = si
+>         while j <= len(text):
+>             if _dp_match(tokens, text, ti + 1, j, memo):
+>                 result = True
+>                 break
+>             if j < len(text) and text[j] != '/':
+>                 j += 1
+>             else:
+>                 break
+>     memo[key] = result
+>     return result
+>
+>
+> def _should_ignore(rel_path_nfc, patterns):
+>     components = rel_path_nfc.split('/')
+>     for pat, match_type in patterns:
+>         if match_type == 'rooted':
+>             if _wildcard_match(pat, rel_path_nfc):
+>                 return True
+>         elif match_type == 'basename':
+>             for comp in components:
+>                 if _wildcard_match(pat, comp):
+>                     return True
+>         else:
+>             if _wildcard_match(pat, rel_path_nfc):
+>                 return True
+>             for i in range(len(rel_path_nfc)):
+>                 if rel_path_nfc[i] == '/' and i + 1 < len(rel_path_nfc):
+>                     suffix = rel_path_nfc[i+1:]
+>                     if _wildcard_match(pat, suffix):
+>                         return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, 'rb') as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir, db_path):
+>     patterns = _load_ignore_patterns()
+>     root_dir = os.path.abspath(root_dir)
+>     file_map = {}
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         dirnames[:] = sorted(
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         )
+>         filenames = sorted(filenames)
+>         for fname in filenames:
+>             full_path = os.path.join(dirpath, fname)
+>             if os.path.islink(full_path):
+>                 continue
+>             rel_path = os.path.relpath(full_path, root_dir).replace(os.sep, '/')
+>             nfc_rel = _nfc(rel_path)
+>             if _should_ignore(nfc_rel, patterns):
+>                 continue
+>             if nfc_rel in file_map:
+>                 existing_orig, _ = file_map[nfc_rel]
+>                 if rel_path > existing_orig:
+>                     file_map[nfc_rel] = (rel_path, full_path)
+>             else:
+>                 file_map[nfc_rel] = (rel_path, full_path)
+>     entries = []
+>     for nfc_rel in sorted(file_map.keys()):
+>         _, abs_path = file_map[nfc_rel]
+>         entries.append((nfc_rel, abs_path))
+>     rows = []
+>     for nfc_rel, abs_path in entries:
+>         try:
+>             sha256_hex, size = _hash_file(abs_path)
+>             rows.append((nfc_rel, sha256_hex, size))
+>         except (OSError, IOError):
+>             continue
+>     db_dir = os.path.dirname(os.path.abspath(db_path))
+>     os.makedirs(db_dir, exist_ok=True)
+>     fd, tmp_path = tempfile.mkstemp(dir=db_dir, suffix='.db.tmp')
+>     os.close(fd)
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute('PRAGMA journal_mode=WAL')
+>             conn.execute('PRAGMA synchronous=FULL')
+>             conn.execute(
+>                 'CREATE TABLE files ('
+>                 '  path TEXT PRIMARY KEY,'
+>                 '  sha256 TEXT NOT NULL,'
+>                 '  size INTEGER NOT NULL'
+>                 ')'
+>             )
+>             conn.executemany(
+>                 'INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)',
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>         os.replace(tmp_path, os.path.abspath(db_path))
+>     except Exception:
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> ''')
+> with open('/app/app/indexer.py', 'w') as f:
+>     f.write(code)
+> print('DONE')
+> PYEOF
+DONE
+root@59468ec3fa5c:/app#

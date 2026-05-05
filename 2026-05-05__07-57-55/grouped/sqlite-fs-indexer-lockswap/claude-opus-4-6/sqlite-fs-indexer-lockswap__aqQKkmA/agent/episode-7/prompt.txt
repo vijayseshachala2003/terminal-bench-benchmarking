@@ -1,0 +1,297 @@
+New Terminal Output:
+
+root@03b001346266:/app# cat > /app/app/indexer.py << 'PYTHON_EOF'
+> import os
+> import hashlib
+> import sqlite3
+> import unicodedata
+> import re
+> import tempfile
+>
+>
+> def _load_ignore_patterns(ignore_path="/data/ignore.txt"):
+>     """Load ignore patterns from file. Returns list of (pattern_nfc, match_type) tuples.
+>
+>     match_type:
+>       'rooted'    - pattern started with '/', match against full relative path only
+>       'basename'  - pattern has no '/', match against each path component
+>       'path'      - pattern has '/' (but not leading), match against full path or any suffix after '/'
+>     """
+>     patterns = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8") as f:
+>             for line in f:
+>                 line = line.rstrip("\n").rstrip("\r")
+>                 stripped = line.lstrip()
+>                 if not stripped or stripped.startswith("#"):
+>                     continue
+>                 pat = line.strip()
+>                 if not pat:
+>                     continue
+>                 # NFC normalize the pattern
+>                 pat = unicodedata.normalize("NFC", pat)
+>
+>                 if pat.startswith("/"):
+>                     pat = pat[1:]
+>                     patterns.append((pat, "rooted"))
+>                 elif "/" in pat:
+>                     patterns.append((pat, "path"))
+>                 else:
+>                     patterns.append((pat, "basename"))
+>     except (FileNotFoundError, OSError):
+>         pass
+>     return patterns
+>
+>
+> def _compile_pattern(pat):
+>     """Compile a glob pattern to a regex.
+>     '*' matches zero or more characters except '/'.
+>     '**' (two consecutive stars) matches literal '**' in the path.
+>     '?' matches any single character except '/'.
+>     '[...]' character classes are supported.
+>     """
+>     i = 0
+>     regex = "^"
+>     while i < len(pat):
+>         c = pat[i]
+>         if c == '*':
+>             if i + 1 < len(pat) and pat[i + 1] == '*':
+>                 regex += r"\*\*"
+>                 i += 2
+>             else:
+>                 regex += r"[^/]*"
+>                 i += 1
+>         elif c == '?':
+>             regex += r"[^/]"
+>             i += 1
+>         elif c == '[':
+>             j = i + 1
+>             if j < len(pat) and pat[j] == '!':
+>                 j += 1
+>             if j < len(pat) and pat[j] == ']':
+>                 j += 1
+>             while j < len(pat) and pat[j] != ']':
+>                 j += 1
+>             if j >= len(pat):
+>                 regex += re.escape(c)
+>                 i += 1
+>             else:
+>                 stuff = pat[i+1:j]
+>                 stuff = stuff.replace('\\', '\\\\')
+>                 if stuff[0:1] == '!':
+>                     stuff = '^' + stuff[1:]
+>                 elif stuff[0:1] == '^':
+>                     stuff = '\\' + stuff
+>                 regex += f"[{stuff}]"
+>                 i = j + 1
+>         else:
+>             regex += re.escape(c)
+>             i += 1
+>     regex += "$"
+>     try:
+>         return re.compile(regex)
+>     except re.error:
+>         return None
+>
+i>
+> def _match_pattern(compiled_re, text):
+>     """Match compiled regex against text."""
+>     if compiled_re is None:
+>         return False
+>     return compiled_re.match(text) is not None
+>
+>
+> def _is_ignored(rel_path_nfc, compiled_patterns):
+>     """Check if a NFC-normalized relative path should be ignored."""
+>     for compiled_re, match_type in compiled_patterns:
+>         if match_type == "rooted":
+>             if _match_pattern(compiled_re, rel_path_nfc):
+>                 return True
+>         elif match_type == "basename":
+>             components = rel_path_nfc.split("/")
+>             for comp in components:
+>                 if _match_pattern(compiled_re, comp):
+>                     return True
+>         elif match_type == "path":
+>             if _match_pattern(compiled_re, rel_path_nfc):
+>                 return True
+>             parts = rel_path_nfc.split("/")
+>             for k in range(1, len(parts)):
+>                 suffix = "/".join(parts[k:])
+>                 if _match_pattern(compiled_re, suffix):
+>                     return True
+>     return False
+>
+r>
+a> def _is_parent_ignored(rel_path_nfc, compiled_patterns):
+>     """Check if any parent directory of the path is ignored."""
+>     parts = rel_path_nfc.split("/")
+>     for i in range(1, len(parts)):
+>         dir_path = "/".join(parts[:i])
+>         if _is_ignored(dir_path, compiled_patterns):
+>             return True
+>     return False
+>
+>
+> def _hash_file(filepath):
+>     """Compute SHA-256 hash of a file, return (hex_digest, size)."""
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(filepath, "rb") as f:
+>         while True:
+>             chunk = f.read(65536)
+>             if not chunk:
+>                 break
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def build_index(root_dir: str, 
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+atch_type))
+>
+>     # Collect all files: map from NFC path -> (original_rel_path, abs_path)
+>     nfc_map = {}
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Remove symlinked directories to prevent traversal
+>         dirnames[:] = [
+>             d for d in dirnames
+>             if not os.path.islink(os.path.join(dirpath, d))
+>         ]
+>         # Sort dirnames for deterministic traversal
+>         dirnames.sort()
+>
+>         for filename in sorted(filenames):
+>             full_path = os.path.join(dirpath, filename)
+>
+>             # Skip symlinks
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             # Compute relative path using forward slashes
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path = rel_path.replace(os.sep, "/")
+>
+>             # NFC normalize
+>             rel_path_nfc = unicodedata.normalize("NFC", rel_path)
+>
+>             # Check ignore rules (on NFC path)
+>             if _is_ignored(rel_path_nfc, compiled_patterns):
+>                 continue
+>
+>             # Check if any parent directory is ignored
+>             if _is_parent_ignored(rel_path_nfc, compiled_patterns):
+>                 continue
+>
+>             # Handle Unicode collisions: keep lexicographically largest original path
+>             if rel_path_nfc in nfc_map:
+>                 existing_orig = nfc_map[rel_path_nfc][0]
+>                 if rel_path > existing_orig:
+>                     nfc_map[rel_path_nfc] = (rel_path, full_path)
+>             else:
+>                 nfc_map[rel_path_nfc] = (rel_path, full_path)
+>
+>     # Hash all files and prepare rows
+>     rows = []
+>     for nfc_path in sorted(nfc_map.keys()):
+>         orig_rel, abs_path = nfc_map[nfc_path]
+>         try:
+>             hex_digest, size = _hash_file(abs_path)
+>             rows.append((nfc_path, hex_digest, size))
+>         except (OSError, IOError):
+>             continue
+>
+>     # Write to a temporary database, then atomically replace.
+>     # This handles concurrency: each worker writes its own temp file,
+>     # then does an atomic os.replace.
+>     db_path_abs = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_path_abs)
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     fd, tmp_path = tempfile.mkstemp(suffix=".db", dir=db_dir)
+>     os.close(fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=FULL")
+>             conn.execute(
+>                 "CREATE TABLE files ("
+>                 "path TEXT PRIMARY KEY, "
+>                 "sha256 TEXT NOT NULL, "
+>                 "size INTEGER NOT NULL)"
+>             )
+>             conn.executemany(
+>                 "INSERT INTO files (path, sha256, size) VALUES (?, ?, ?)",
+>                 rows
+>             )
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         os.replace(tmp_path, db_path_abs)
+>     except BaseException:
+>         try:
+>             os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         raise
+> PYTHON_EOF
+root@03b001346266:/app# python3 -c "from app.indexer import build_index; print('Import OK')"
+Import OK
+root@03b001346266:/app# python3 -c "
+> import os, sqlite3, multiprocessing
+>
+> # Clean up previous test artifacts
+> import shutil
+> for p in ['/tmp/test_tree', '/tmp/test_ignore', '/tmp/test_sym', '/tmp/test_conc']:
+>     shutil.rmtree(p, ignore_errors=True)
+> for p in ['/tmp/test_index.db', '/tmp/test_ignore.db', '/tmp/test_sym.db', '/tmp/test_conc.db']:
+>     try: os.unlink(p)
+>     except: pass
+>
+> # Full test
+> os.makedirs('/tmp/ft/sub', exist_ok=True)
+> with open('/tmp/ft/a.txt', 'w') as f: f.write('aaa')
+> with open('/tmp/ft/b.log', 'w') as f: f.write('bbb')
+> with open('/tmp/ft/sub/c.txt', 'w') as f: f.write('ccc')
+> with open('/tmp/ft/sub/d.log', 'w') as f: f.write('ddd')
+> os.symlink('/tmp/ft/a.txt', '/tmp/ft/link.txt')
+> os.symlink('/tmp/ft/sub', '/tmp/ft/linksub')
+>
+> with open('/data/ignore.txt', 'w') as f:
+>     f.write('# comment\n')
+>     f.write('\n')
+>     f.write('*.log\n')
+>
+> from app.indexer import build_index
+>
+> # Concurrent test
+> def worker(args):
+>     build_index(*args)
+>
+> db = '/tmp/ft.db'
+> with multiprocessing.Pool(4) as pool:
+>     pool.map(worker, [('/tmp/ft', db)] * 8)
+>
+> conn = sqlite3.connect(db)
+> print('Integrity:', conn.execute('PRAGMA integrity_check').fetchone())
+> for row in conn.execute('SELECT * FROM files ORDER BY path'):
+>     print(row)
+> conn.close()
+>
+> os.remove('/data/ignore.txt')
+> shutil.rmtree('/tmp/ft')
+> os.unlink('/tmp/ft.db')
+> print('ALL TESTS PASSED')
+> "
+Integrity: ('ok',)
+('a.txt', '9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0', 3)
+('sub/c.txt', '64daa44ad493ff28a96effab6e77f1732a3d97d83241581b37dbd70a7a4900fe', 3)
+ALL TESTS PASSED
+root@03b001346266:/app#

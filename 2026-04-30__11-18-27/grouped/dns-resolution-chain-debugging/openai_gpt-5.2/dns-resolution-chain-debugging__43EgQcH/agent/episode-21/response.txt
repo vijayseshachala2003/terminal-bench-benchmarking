@@ -1,0 +1,35 @@
+{
+  "analysis": "Resolver failed to start due to syntax error in trust-anchors static-ds line: BIND expects numeric fields, but the digest was inserted without being properly quoted/formed, or the variable expansion truncated quotes. Error at line 2 indicates it saw the digest where it expected a number, meaning our static-ds line likely missing keytag/alg/digesttype fields or has quoting issues. Need to open resolver named.conf and correct trust-anchors syntax. We'll regenerate resolver named.conf using a small python script to safely write the trust-anchors block with proper quoting and required numeric fields.",
+  "plan": "1) Display resolver named.conf to see the malformed trust-anchors line. 2) Regenerate a correct trust-anchors block using dnssec-dsfromkey output parsed into keytag/alg/digesttype/digest, and write resolver named.conf with properly quoted digest. 3) Run named-checkconf to confirm. 4) Start resolver and verify it listens on 5300. 5) Re-test secure.example.com via resolver.",
+  "commands": [
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,80p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\nimport glob,subprocess\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')\nif not ksk:\n    raise SystemExit('No KSK key file found')\ndsline=subprocess.check_output(['dnssec-dsfromkey','-2',ksk[0]],text=True).strip().splitlines()[0]\nparts=dsline.split()\nname=parts[0].rstrip('.')+'.'\nkeytag=int(parts[4]); alg=int(parts[5]); dtype=int(parts[6]); digest=parts[7]\nconf=f'''trust-anchors {{\n    \"{name}\" static-ds {keytag} {alg} {dtype} \"{digest}\";\n}};\n\noptions {{\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 {{ 127.0.0.1; }};\n    listen-on-v6 {{ none; }};\n    allow-query {{ any; }};\n    allow-recursion {{ any; }};\n    recursion yes;\n    dnssec-validation yes;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n}};\n\nzone \"example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\nzone \"secure.example.com\" {{\n    type forward;\n    forward only;\n    forwarders {{ 127.0.0.1 port 5301; }};\n}};\n\ncontrols {{ }};\n'''\nPath('/app/dns/resolver/named.conf').write_text(conf)\nprint('wrote resolver config with static-ds trust anchor:', dsline)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

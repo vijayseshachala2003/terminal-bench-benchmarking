@@ -1,0 +1,159 @@
+New Terminal Output:
+
+root@e94396860cb1:/app# nl -ba /app/stress_test.cpp | sed -n '1,80p'
+     1  #include "lockfree_queue.h"
+     2  #include <thread>
+     3  #include <vector>
+     4  #include <atomic>
+     5  #include <iostream>
+     6  #include <chrono>
+     7  #include <unordered_set>
+     8  #include <mutex>
+     9  #include <cassert>
+    10  #include <csignal>
+    11  #include <cstdlib>
+    12
+    13  constexpr int NUM_PRODUCERS = 4;
+    14  constexpr int NUM_CONSUMERS = 4;
+    15  constexpr int OPS_PER_THREAD = 1250000;  // 10M total (4 producers * 1.25M each)
+    16  constexpr uint64_t SENTINEL = UINT64_MAX;
+    17  constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+    18
+    19  std::atomic<bool> start_flag{false};
+    20  std::atomic<int> producers_done{0};
+    21  std::atomic<uint64_t> total_enqueued{0};
+    22  std::atomic<uint64_t> total_dequeued{0};
+    23  std::atomic<bool> timed_out{false};
+    24
+    25  std::mutex dequeued_mutex;
+    26  std::vector<uint64_t> all_dequeued;
+    27
+    28  void producer(LockFreeQueue& queue, int id) {
+    29      while (!start_flag.load(std::memory_order_acquire)) {
+    30          std::this_thread::yield();
+    31      }
+    32
+    33      uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+    34
+    35      for (int i = 0; i < OPS_PER_THREAD; ++i) {
+    36          uint64_t value = base + i + 1;  // +1 to avoid 0 values
+    37          queue.enqueue(value);
+    38          total_enqueued.fetch_add(1, std::memory_order_relaxed);
+    39      }
+    40
+    41      producers_done.fetch_add(1, std::memory_order_release);
+    42  }
+    43
+    44  void consumer(LockFreeQueue& queue, std::vector<uint64_t>& local_dequeued) {
+    45      while (!start_flag.load(std::memory_order_acquire)) {
+    46          std::this_thread::yield();
+    47      }
+    48
+    49      int empty_spins = 0;
+    50      const int MAX_EMPTY_SPINS = 100000;
+    51
+    52      while (!timed_out.load(std::memory_order_relaxed)) {
+    53          uint64_t value;
+    54          if (queue.dequeue(value)) {
+    55              local_dequeued.push_back(value);
+    56              total_dequeued.fetch_add(1, std::memory_order_relaxed);
+    57              empty_spins = 0;
+    58          } else {
+    59              if (producers_done.load(std::memory_order_acquire) == NUM_PRODUCERS) {
+    60                  empty_spins++;
+    61                  if (empty_spins > MAX_EMPTY_SPINS) {
+    62                      break;
+    63                  }
+    64              }
+    65              std::this_thread::yield();
+    66          }
+    67      }
+    68  }
+    69
+    70  int main() {
+    71      std::cout << "=== Lock-Free Queue Stress Test ===" << std::endl;
+    72      std::cout << "Producers: " << NUM_PRODUCERS << std::endl;
+    73      std::cout << "Consumers: " << NUM_CONSUMERS << std::endl;
+    74      std::cout << "Operations per producer: " << OPS_PER_THREAD << std::endl;
+    75      std::cout << "Total operations: " << (NUM_PRODUCERS * OPS_PER_THREAD) << std::endl;
+    76      std::cout << std::endl;
+    77
+    78      LockFreeQueue queue;
+    79
+    80      std::vector<std::thread> producer_threads;
+root@e94396860cb1:/app# grep -n "start_flag\|timed_out\|finished" -n /app/stress_test.cpp | head -n 30
+19:std::atomic<bool> start_flag{false};
+23:std::atomic<bool> timed_out{false};
+29:    while (!start_flag.load(std::memory_order_acquire)) {
+45:    while (!start_flag.load(std::memory_order_acquire)) {
+52:    while (!timed_out.load(std::memory_order_relaxed)) {
+100:            if (finished.load(std::memory_order_acquire) || timed_out.load(std::memory_order_relaxed)) {
+108:                timed_out.store(true, std::memory_order_relaxed);
+119:    start_flag.store(true, std::memory_order_release);
+126:    std::cout << "All producers finished" << std::endl;
+133:    finished.store(true, std::memory_order_release);
+138:    std::cout << "All consumers finished" << std::endl;
+root@e94396860cb1:/app# perl -i -pe 'if($.==1){$seen=0} if(!$seen && /std::atomic<bool>\s+timed_out\s*\{false\};/){$_ .= "std::atomic<bool> finished{false};\n";
+ $seen=1}' /app/stress_test.cpp
+root@e94396860cb1:/app# grep -n "start_flag\|timed_out\|finished" -n /app/stress_test.cpp | head -n 40
+19:std::atomic<bool> start_flag{false};
+23:std::atomic<bool> timed_out{false};
+24:std::atomic<bool> finished{false};
+30:    while (!start_flag.load(std::memory_order_acquire)) {
+46:    while (!start_flag.load(std::memory_order_acquire)) {
+53:    while (!timed_out.load(std::memory_order_relaxed)) {
+101:            if (finished.load(std::memory_order_acquire) || timed_out.load(std::memory_order_relaxed)) {
+109:                timed_out.store(true, std::memory_order_relaxed);
+120:    start_flag.store(true, std::memory_order_release);
+127:    std::cout << "All producers finished" << std::endl;
+134:    finished.store(true, std::memory_order_release);
+139:    std::cout << "All consumers finished" << std::endl;
+root@e94396860cb1:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@e94396860cb1:/app# /app/stress_test_tsan
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 13959 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@e94396860cb1:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@e94396860cb1:/app# /app/stress_test
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 1325 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+root@e94396860cb1:/app#

@@ -1,0 +1,75 @@
+{
+  "analysis": "example.com zone loads (with glue warnings for delegated sub.example.com, but OK) and transfers successfully to secondary. secure.example.com signed zone is broken: signatures expired and multiple bad base64 encodings, so the zone does not load on primary; consequently secondary refresh/AXFR fails and resolver returns SERVFAIL for everything (likely because it forwards only to primary and primary is failing to load one of its configured zones, possibly causing startup/view issues or SERVFAIL for unrelated queries due to DNSSEC validation/other errors). We must fix secure.example.com by generating a valid signed zone (or serve the unsigned zone and sign correctly) and ensure DNSSEC validation works. Also need to address session.key permission noise by setting session-keyfile to writable path (optional but good).",
+  "plan": "1) Inspect the unsigned secure.example.com.zone to see intended records. 2) Recreate DNSSEC signing for secure.example.com: generate new KSK/ZSK (or a single KSK) under /app/dns/primary/keys, add DNSKEY records via dnssec-signzone output, and produce a fresh secure.example.com.zone.signed with valid base64 and non-expired RRSIGs. 3) Ensure primary serves the new signed file and has dnssec-enable on (default) and inline-signing not required. 4) Restart primary and secondary to trigger zone transfer; verify AXFR for secure.example.com works. 5) Retest resolver queries; if resolver still SERVFAIL, inspect resolver logs. 6) Verify DNSSEC validation via resolver: AD flag present for secure.example.com A. 7) Write /app/dns_health.json summarizing fixes and statuses.",
+  "commands": [
+    {
+      "keystrokes": "sed -n '1,200p' /app/dns/primary/zones/secure.example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "ls -ლა /app/dns/primary/keys\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/keys && dnssec-keygen -a ECDSAP256SHA256 -b 256 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/keys && dnssec-keygen -f KSK -a ECDSAP256SHA256 -b 256 -n ZONE secure.example.com\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "ls -1 /app/dns/primary/keys | grep '^Ksecure\\.example\\.com' | sort\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dnssec-signzone -S -K /app/dns/primary/keys -o secure.example.com -f /app/dns/primary/zones/secure.example.com.zone.signed /app/dns/primary/zones/secure.example.com.zone\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g >/tmp/named_primary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g >/tmp/named_secondary.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g >/tmp/named_resolver.log 2>&1 &\n",
+      "duration": 0.2
+    },
+    {
+      "keystrokes": "sleep 0.7; dig @127.0.0.1 -p 5301 secure.example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=5 +tries=1 | head -n 80\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1\" \"$2}' /app/test_queries.txt | while read t n; do echo \"### $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=2 +tries=1 +noall +answer +comments; done\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +comments +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named_primary.log\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 160 /tmp/named_resolver.log\n",
+      "duration": 0.5
+    }
+  ],
+  "task_complete": false
+}

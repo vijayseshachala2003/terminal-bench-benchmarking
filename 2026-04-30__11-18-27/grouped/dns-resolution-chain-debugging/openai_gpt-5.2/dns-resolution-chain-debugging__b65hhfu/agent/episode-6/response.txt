@@ -1,0 +1,107 @@
+{
+  "analysis": "named failed to start for all three instances. Primary/secondary failure is due to permission denied when trying to read /etc/bind/rndc.key and due to logging file paths under /var/log/named plus -g complaining about logging config permission denied. Resolver additionally has invalid config: 'trusted-keys' is not a valid top-level option in this BIND version/config context; it also broke the file structure, causing further parse errors. We must (1) disable the control channel / rndc-key usage and avoid writing logs to /var/log, and (2) configure DNSSEC validation for the internal secure.example.com zone correctly. In BIND 9, trust anchors are configured via 'trust-anchors' (for dnssec-validation yes) or 'managed-keys'/'trusted-keys' in older contexts; for 9.18, use 'trust-anchors { ...; };' or 'dnssec-validation yes;' plus 'trusted-keys' in a 'view' maybe. We'll implement a simple approach: disable dnssec-validation on resolver and instead validate by querying the authoritative with +dnssec? But requirement says DNSSEC validation passes; best is to keep validation on and add 'trust-anchors' for secure.example.com KSK. Also fix example.com NS delegation: current NS targets are out-of-zone (ns1.sub.example.com is in sub.example.com, not in example.com), so glue we added as ns1.sub (ns1.sub.example.com) is still in example.com zone actually; but the NS targets are ns1.sub.example.com which is in-zone (example.com)?? Wait: ns1.sub.example.com is within example.com, so should not be out of zone; named-checkzone says out of zone because it's missing trailing dot? it has dot. Actually it's within example.com; warning indicates it thinks it's out-of-zone because the owner is sub.example.com (delegation) and nameserver is ns1.sub.example.com which is within sub.example.com (child zone) thus considered below delegation, requiring glue at parent (we provided ns1.sub A but name is ns1.sub.example.com, correct). Yet warning now is 'out of zone has no address records' meaning our A record name doesn't match: we added 'ns1.sub' (ns1.sub.example.com) yes should match. But perhaps needs full name 'ns1.sub.example.com.' not 'ns1.sub'. We'll add explicit FQDN records.\n",
+  "plan": "1) Update all named.conf files to avoid /etc/bind/rndc.key and /var/log permissions: add 'controls { };' to disable control channel; remove logging blocks entirely (since we use -g) or point to /app/... log files. Also set pid-file to /app/... to avoid /var/run permission issues. 2) Fix resolver named.conf by removing the invalid 'trusted-keys' insertion and instead add a 'trust-anchors { ...; };' clause (or 'dnssec-validation yes;' plus 'trust-anchors'). We'll reconstruct resolver config cleanly. 3) Add correct glue A records for ns1.sub.example.com. and ns2.sub.example.com. in example.com zone; bump serial again. 4) Restart named processes and verify they listen. 5) Verify AXFR from secondary. 6) Run test queries and check DNSSEC AD flag from resolver for secure.example.com.",
+  "commands": [
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -n '1,120p' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -n '1,160p' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSKLINE=$(awk '$4==\"DNSKEY\" && $5==\"257\"{print; exit}' /app/dns/primary/zones/secure.example.com.zone.signed); echo \"$KSKLINE\" > /tmp/kskline.txt; cat /tmp/kskline.txt\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<EOF\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    forwarders { 127.0.0.1 port 5301; };\n    forward only;\n    dnssec-validation yes;\n    max-ncache-ttl 60;\n    pid-file \"/app/dns/resolver/named-resolver.pid\";\n};\n\ntrust-anchors {\n    $KSKLINE\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's#logging\\s*\\{.*?\\};\\s*##s' /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's#pid-file \"/var/run/named/named-primary.pid\";#pid-file \"/app/dns/primary/named-primary.pid\";#; s#pid-file \"/var/run/named/named-secondary.pid\";#pid-file \"/app/dns/secondary/named-secondary.pid\";#' /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -q '^controls' /app/dns/primary/named.conf || echo -e '\ncontrols { };\n' >> /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -q '^controls' /app/dns/secondary/named.conf || echo -e '\ncontrols { };\n' >> /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "grep -n 'ns[12]\\.sub' /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's/2024010102\\s*; Serial/2024010103      ; Serial/' /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -q '^ns1\\.sub\\.example\\.com\\.' /app/dns/primary/zones/example.com.zone || cat >> /app/dns/primary/zones/example.com.zone <<'EOF'\nns1.sub.example.com. IN A 192.168.1.40\nns2.sub.example.com. IN A 192.168.1.41\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head -n 20\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

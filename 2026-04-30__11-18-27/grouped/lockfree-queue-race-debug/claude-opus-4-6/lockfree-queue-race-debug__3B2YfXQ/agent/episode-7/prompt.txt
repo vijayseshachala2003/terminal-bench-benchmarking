@@ -1,0 +1,157 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@38376bb0c267:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         std::atomic<uint64_t> value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Head and tail pointers
+>     // ABA is prevented because we never reuse node memory during queue lifetime
+>     // (nodes are retired to a separate list, not recycled)
+>     alignas(64) std::atomic<Node*> head_;
+>     alignas(64) std::atomic<Node*> tail_;
+>
+>     // Retired nodes - deleted only in destructor
+>     std::atomic<Node*> retired_list_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@38376bb0c267:/app# cat > /app/lockfree_queue.cpp << 'CPP_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(dummy, std::memory_order_relaxed);
+>     tail_.store(dummy, std::memory_order_relaxed);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     Node* head = head_.load(std::memory_order_relaxed);
+>     delete head;
+>
+>     // Delete all retired nodes
+>     Node* retired = retired_list_.load(std::memory_order_relaxed);
+>     while (retired) {
+>         Node* next = retired->next.load(std::memory_order_relaxed);
+>         delete retired;
+>         retired = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     // Always allocate fresh nodes - never reuse
+>     // This prevents ABA problem on head_/tail_ since no pointer is ever recycled
+>     // and prevents use-after-free since retired nodes are not touched
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Push node onto retired list (lock-free stack push)
+>     // Node will be deleted in destructor
+>     Node* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old_head, std::memory_order_relaxed);
+>     } while (!retired_list_.compare_exchange_weak(old_head, node,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail for consistency check
+>         if (tail == tail_.load(std::memory_order_acquire)) {
+>             if (next == nullptr) {
+>                 // Try to link new node at the end of the list
+>                 if (tail->next.compare_exchange_weak(next, new_node,
+>                         std::memory_order_release, std::memory_order_relaxed)) {
+>                     // Linked successfully. Try to swing tail forward.
+>                     tail_.compare_exchange_strong(tail, new_node,
+>                         std::memory_order_release, std::memory_order_relaxed);
+>                     return;
+>                 }
+>             } else {
+>                 // Tail is lagging; try to advance it
+>                 tail_.compare_exchange_weak(tail, next,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         Node* head = head_.load(std::memory_order_acquire);
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head->next.load(std::memory_order_acquire);
+>
+>         // Re-read head for consistency check
+>         if (head == head_.load(std::memory_order_acquire)) {
+>             if (head == tail) {
+>                 if (next == nullptr) {
+>                     return false;  // Queue is empty
+>                 }
+>                 // Tail is lagging; advance it
+>                 tail_.compare_exchange_weak(tail, next,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>             } else {
+>                 // Read value BEFORE CAS - after CAS succeeds, another
+>                 // dequeuer could immediately dequeue 'next' and retire it
+>                 uint64_t val = next->value.load(std::memory_order_relaxed);
+>
+>                 // Try to swing head to next node
+>                 if (head_.compare_exchange_weak(head, next,
+>                         std::memory_order_acq_rel, std::memory_order_relaxed)) {
+>                     value = val;
+>                     // Retire the old sentinel node (head)
+>                     // Don't delete it - other threads may still reference it
+>                     retire_node(head);
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> CPP_EOF
+root@38376bb0c267:/app# make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@38376bb0c267:/app#

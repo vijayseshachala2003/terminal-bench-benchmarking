@@ -1,0 +1,135 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+- Extra text detected after JSON object
+
+New Terminal Output:
+
+All producers finished
+cat << 'EOF' > fix.py
+import os
+import json
+
+h_content = '''#ifndef LOCKFREE_QUEUE_H
+#define LOCKFREE_QUEUE_H
+
+#include <atomic>
+#include <cstdint>
+
+class LockFreeQueue {
+public:
+    LockFreeQueue();
+    ~LockFreeQueue();
+
+    void enqueue(uint64_t value);
+    bool dequeue(uint64_t& value);
+
+    LockFreeQueue(const LockFreeQueue&) = delete;
+    LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+
+private:
+    struct Node;
+
+    struct TaggedPtr {
+        Node* ptr;
+        uint64_t tag;
+
+        TaggedPtr() : ptr(nullptr), tag(0) {}
+        TaggedPtr(Node* p, uint64_t t) : ptr(p), tag(t) {}
+
+        bool operator==(const TaggedPtr& other) const {
+            return ptr == other.ptr && tag == other.tag;
+        }
+    };
+
+    struct Node {
+        std::atomic<uint64_t> value;
+        std::atomic<TaggedPtr> next;
+        Node() : value(0), next(TaggedPtr(nullptr, 0)) {}
+        explicit Node(uint64_t val) : value(val), next(TaggedPtr(nullptr, 0)) {}
+    };
+
+    std::atomic<TaggedPtr> head_;
+    std::atomic<TaggedPtr> tail_;
+
+    std::atomic<TaggedPtr> free_list_;
+
+    Node* allocate_node(uint64_t value);
+    void free_node(Node* node);
+};
+
+#endif
+'''
+
+cpp_content = '''#include "lockfree_queue.h"
+#include <new>
+
+LockFreeQueue::LockFreeQueue() {
+    Node* dummy = new Node();
+    head_.store(TaggedPtr(dummy, 0), std::memory_order_relaxed);
+    tail_.store(TaggedPtr(dummy, 0), std::memory_order_relaxed);
+    free_list_.store(TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+}
+
+LockFreeQueue::~LockFreeQueue() {
+    uint64_t dummy;
+    while (dequeue(dummy)) {}
+
+    Node* head = head_.load(std::memory_order_relaxed).ptr;
+    delete head;
+
+    TaggedPtr free_node = free_list_.load(std::memory_order_relaxed);
+    while (free_node.ptr) {
+        TaggedPtr next = free_node.ptr->next.load(std::memory_order_relaxed);
+        delete free_node.ptr;
+        free_node = next;
+    }
+}
+
+LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+    TaggedPtr head = free_list_.load(std::memory_order_acquire);
+    while (head.ptr) {
+        TaggedPtr next = head.ptr->next.load(std::memory_order_relaxed);
+        if (free_list_.compare_exchange_weak(head, TaggedPtr(next.ptr, head.tag + 1), std::memory_order_acquire, std::memory_order_relaxed)) {
+            head.ptr->value.store(value, std::memory_order_relaxed);
+            head.ptr->next.store(TaggedPtr(nullptr, 0), std::memory_order_relaxed);
+            return head.ptr;
+        }
+    }
+    return new Node(value);
+}
+
+void LockFreeQueue::free_node(Node* node) {
+    TaggedPtr old_head = free_list_.load(std::memory_order_relaxed);
+    do {
+        node->next.store(old_head, std::memory_order_relaxed);
+    } while (!free_list_.compare_exchange_weak(old_head, TaggedPtr(node, old_head.tag + 1), std::memory_order_release, std::memory_order_relaxed));
+}
+
+void LockFreeQueue::enqueue(uint64_t value) {
+    Node* new_node = allocate_node(value);
+
+    while (true) {
+        TaggedPtr tail = tail_.load(std::memory_order_acquire);
+        TaggedPtr next = tail.ptr->next.load(std::memory_order_acquire);
+
+        if (tail == tail_.load(std::memory_order_acquire)) {
+            if (next.ptr == nullptr) {
+                if (tail.ptr->next.compare_exchange_weak(next, TaggedPtr(new_node, next.tag + 1), std::memory_order_release, std::memory_order_relaxed)) {
+                    tail_.compare_exchange_strong(tail, TaggedPtr(new_node, tail.tag + 1), std::memory_order_release, std::memory_order_relaxed);
+                    return;
+                }
+            } else {
+                tail_.compare_exchange_strong(tail, TaggedPtr(next.ptr, tail.tag + 1), std::memory_order_release, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+bool LockFreeQueue::dequeue(uint64_t& value) {
+    while (true) {
+        TaggedPtr head = head_.load(std::memory_order_acquire);
+        TaggedPtr tail = tail_.load(std::memory_order_acquire);
+        TaggedPtr next = head.ptr->next.load(std::memory_order_acquire);
+
+        if (head == head_.load(std::memory_order_acquire)) {
+            if (head.ptr == tail.pt

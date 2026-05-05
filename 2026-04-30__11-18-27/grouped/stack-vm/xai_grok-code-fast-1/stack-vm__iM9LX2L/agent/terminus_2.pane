@@ -1,0 +1,335 @@
+[?2004hroot@61c6d71f42d2:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@61c6d71f42d2:/app# clear
+[?2004l[H[J[3J[?2004hroot@61c6d71f42d2:/app# cat > /app/svm << 'EOF'
+[?2004l[?2004h> #!/usr/bin/env python3
+[?2004l[?2004h> 
+[?2004l[?2004h> import sys
+[?2004l[?2004h> import ast
+[?2004l[?2004h> 
+[?2004l[?2004h> class Closure:
+[?2004l[?2004h>     def __init__(self, proc_name, captures):
+[?2004l[?2004h>         self.proc_name = proc_name
+[?2004l[?2004h>         self.captures = captures
+[?2004l[?2004h> 
+[?2004l[?2004h> class VM:
+[?2004l[?2004h>     def __init__(self):
+[?2004l[?2004h>         self.stack = []
+[?2004l[?2004h>         self.heap = {}
+[?2004l[?2004h>         self.heap_alloc = {}  # addr -> size
+[?2004l[?2004h>         self.free = set()
+[?2004l[?2004h>         self.procedures = {}  # name -> (nargs, nlocals, code)
+[?2004l[?2004h>         self.labels = {}
+[?2004l[?2004h>         self.ip = 0
+[?2004l[?2004h>         self.program = []
+[?2004l[?2004h>         self.procedure_stack = []
+[?2004l[?2004h>         self.locals_stack = []
+[?2004l[?2004h>         self.closure_stack = []
+[?2004l[?2004h>         self.exception_handler = None
+[?2004l[?2004h>         self.current_closure = None
+[?2004l[?2004h> 
+[?2004l[?2004h>     def parse_program(self, filename):
+[?2004l[?2004h>         lines = []
+[?2004l[?2004h>         with open(filename, 'r') as f:
+[?2004l[?2004h>             for line in f:
+[?2004l[?2004h>                 line = line.strip()
+[?2004l[?2004h>                 if not line or line.startswith('#'):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 lines.append(line.split())
+[?2004l[?2004h>         self.program = lines
+[?2004l[?2004h>         # Parse procedures and labels
+[?2004l[?2004h>         i = 0
+[?2004l[?2004h>         while i < len(self.program):
+[?2004l[?2004h>             instr = self.program[i]
+[?2004l[?2004h>             if instr[0] == 'LABEL':
+[?2004l[?2004h>                 self.labels[instr[1]] = i
+[?2004l[?2004h>             elif instr[0] == 'PROC':
+[?2004l[?2004h>                 name = instr[1]
+[?2004l[?2004h>                 nargs = int(instr[2])
+[?2004l[?2004h>                 nlocals = int(instr[3])
+[?2004l[?2004h>                 code = []
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>                 while i < len(self.program) and self.program[i][0] != 'ENDPROC':
+[?2004l[?2004h>                     code.append(self.program[i])
+[?2004l[?2004h>                     i += 1
+[?2004l[?2004h>                 self.procedures[name] = (nargs, nlocals, code)
+[?2004l[?2004h>                 self.program[i] = ['NOP']  # replace ENDPROC
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     def run(self, filename):
+[?2004l[?2004h>         self.parse_program(filename)
+[?2004l[?2004h>         self.ip = 0
+[?2004l[?2004h>         while self.ip < len(self.program):
+[?2004l[?2004h>             instr = self.program[self.ip]
+[?2004l[?2004h>             self.execute(instr)
+[?2004l[?2004h>             self.ip += 1
+[?2004l[?2004h> 
+[?2004l[?2004h>     def execute(self, instr):
+[?2004l[?2004h>         op = instr[0]
+[?2004l[?2004h>         if op == 'PUSH':
+[?2004l[?2004h>             val = instr[1]
+[?2004l[?2004h>             if val.startswith('"'):
+[?2004l[?2004h>                 val = ast.literal_eval(val)
+[?2004l[?2004h>             elif '.' in val:
+[?2004l[?2004h>                 val = float(val)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 val = int(val)
+[?2004l[?2004h>             self.stack.append(val)
+[?2004l[?2004h>         elif op == 'POP':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             self.stack.pop()
+[?2004l[?2004h>         elif op == 'DUP':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             self.stack.append(self.stack[-1])
+[?2004l[?2004h>         elif op == 'SWAP':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             self.stack[-1], self.stack[-2] = self.stack[-2], self.stack[-1]
+[?2004l[?2004h>         elif op == 'ROT':
+[?2004l[?2004h>             if len(self.stack) < 3: self.fault('stack underflow')
+[?2004l[?2004h>             a, b, c = self.stack[-3], self.stack[-2], self.stack[-1]
+[?2004l[?2004h>             self.stack[-3], self.stack[-2], self.stack[-1] = b, c, a
+[?2004l[?2004h>         elif op == 'ADD':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+[?2004l[?2004h>                 self.stack.append(a + b)
+[?2004l[?2004h>             elif isinstance(a, str) and isinstance(b, str):
+[?2004l[?2004h>                 self.stack.append(a + b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error: cannot ADD ' + type(a).__name__ + ' and ' + type(b).__name__)
+[?2004l[?2004h>         elif op == 'SUB':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+[?2004l[?2004h>                 self.stack.append(a - b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'MUL':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+[?2004l[?2004h>                 self.stack.append(a * b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'DIV':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>             if b == 0:
+[?2004l[?2004h>                 self.throw('division by zero')
+[?2004l[?2004h>             if isinstance(a, int) and isinstance(b, int):
+[?2004l[?2004h>                 self.stack.append(a // b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.stack.append(a / b)
+[?2004l[?2004h>         elif op == 'MOD':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(a, int) and isinstance(b, int):
+[?2004l[?2004h>                 self.stack.append(a % b)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'NEG':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack.pop()
+[?2004l[?2004h>             if isinstance(a, (int, float)):
+[?2004l[?2004h>                 self.stack.append(-a)
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op in ['EQ', 'NE', 'LT', 'GT', 'LE', 'GE']:
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>             res = {'EQ': a == b, 'NE': a != b, 'LT': a < b, 'GT': a > b, 'LE': a <= b, 'GE': a >= b}[op]
+[?2004l[?2004h>             self.stack.append(1 if res else 0)
+[?2004l[?2004h>         elif op == 'AND':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             self.stack.append(1 if a and b else 0)
+[?2004l[?2004h>         elif op == 'OR':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             b, a = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             self.stack.append(1 if a or b else 0)
+[?2004l[?2004h>         elif op == 'NOT':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack.pop()
+[?2004l[?2004h>             self.stack.append(0 if a else 1)
+[?2004l[?2004h>         elif op == 'TYPE':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             t = type(self.stack[-1]).__name__
+[?2004l[?2004h>             if t == 'int': t = 'int'
+[?2004l[?2004h>             elif t == 'float': t = 'float'
+[?2004l[?2004h>             elif t == 'str': t = 'string'
+[?2004l[?2004h>             elif t == 'list': t = 'array'
+[?2004l[?2004h>             elif isinstance(self.stack[-1], Closure): t = 'closure'
+[?2004l[?2004h>             self.stack.append(t)
+[?2004l[?2004h>         elif op == 'TOINT':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack.pop()
+[?2004l[?2004h>             self.stack.append(int(a))
+[?2004l[?2004h>         elif op == 'TOFLOAT':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack.pop()
+[?2004l[?2004h>             self.stack.append(float(a))
+[?2004l[?2004h>         elif op == 'TOSTR':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack.pop()
+[?2004l[?2004h>             self.stack.append(str(a))
+[?2004l[?2004h>         elif op == 'LEN':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             a = self.stack[-1]
+[?2004l[?2004h>             if isinstance(a, (str, list)):
+[?2004l[?2004h>                 self.stack.append(len(a))
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'NEWARRAY':
+[?2004l[?2004h>             n = int(instr[1])
+[?2004l[?2004h>             self.stack.append([None] * n)
+[?2004l[?2004h>         elif op == 'ALOAD':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             idx, arr = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(arr, list):
+[?2004l[?2004h>                 self.stack.append(arr[idx])
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'ASTORE':
+[?2004l[?2004h>             if len(self.stack) < 3: self.fault('stack underflow')
+[?2004l[?2004h>             val, idx, arr = self.stack.pop(), self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if isinstance(arr, list):
+[?2004l[?2004h>                 arr[idx] = val
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 self.throw('type error')
+[?2004l[?2004h>         elif op == 'ALLOC':
+[?2004l[?2004h>             n = int(instr[1])
+[?2004l[?2004h>             addr = max(self.heap.keys()) + 1 if self.heap else 0
+[?2004l[?2004h>             self.heap_alloc[addr] = n
+[?2004l[?2004h>             for i in range(n):
+[?2004l[?2004h>                 self.heap[addr + i] = None
+[?2004l[?2004h>             self.stack.append(addr)
+[?2004l[?2004h>         elif op == 'LOAD':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             addr = self.stack.pop()
+[?2004l[?2004h>             if addr in self.free:
+[?2004l[?2004h>                 self.fault('use after free')
+[?2004l[?2004h>             self.stack.append(self.heap[addr])
+[?2004l[?2004h>         elif op == 'STORE':
+[?2004l[?2004h>             if len(self.stack) < 2: self.fault('stack underflow')
+[?2004l[?2004h>             val, addr = self.stack.pop(), self.stack.pop()
+[?2004l[?2004h>             if addr in self.free:
+[?2004l[?2004h>                 self.fault('use after free')
+[?2004l[?2004h>             self.heap[addr] = val
+[?2004l[?2004h>         elif op == 'FREE':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             addr = self.stack.pop()
+[?2004l[?2004h>             if addr not in self.heap_alloc:
+[?2004l[?2004h>                 self.fault('invalid free')
+[?2004l[?2004h>             for i in range(self.heap_alloc[addr]):
+[?2004l[?2004h>                 del self.heap[addr + i]
+[?2004l[?2004h>             del self.heap_alloc[addr]
+[?2004l[?2004h>             self.free.add(addr)
+[?2004l[?2004h>         elif op == 'LLOAD':
+[?2004l[?2004h>             n = int(instr[1])
+[?2004l[?2004h>             self.stack.append(self.locals_stack[-1][n])
+[?2004l[?2004h>         elif op == 'LSTORE':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             n = int(instr[1])
+[?2004l[?2004h>             self.locals_stack[-1][n] = self.stack.pop()
+[?2004l[?2004h>         elif op == 'LABEL':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         elif op == 'JMP':
+[?2004l[?2004h>             self.ip = self.labels[instr[1]] - 1  # -1 because ip +=1 after
+[?2004l[?2004h>         elif op == 'JZ':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             val = self.stack.pop()
+[?2004l[?2004h>             if not val:
+[?2004l[?2004h>                 self.ip = self.labels[instr[1]] - 1
+[?2004l[?2004h>         elif op == 'JNZ':
+[?2004l[?2004h>             if not self.stack: self.fault('stack underflow')
+[?2004l[?2004h>             val = self.stack.pop()
+[?2004l[?2004h>             if val:
+[?2004l[?2004h>                 self.ip = self.labels[instr[1]] - 1
+[?2004l[?2004h>         elif op == 'PROC':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         elif op == 'ENDPROC':
+[?2004l[?2004h>             pass
+[?2004l[?2004h>         elif op == 'CALL':
+[?2004l[?2004h>             proc = self.procedures[instr[1]]
+[?2004l[?2004h>             nargs, nlocals, code = proc
+[?2004l[?2004h>             args = [self.stack.pop() for _ in range(nargs)]
+[?2004l[?2004h>             args.reverse()
+[?2004l[?2004h>             locals = args + [None] * nlocals
+[?2004l[?2004h>             self.locals_stack.append(locals)
+[?2004l[?2004h>             self.closure_stack.append(self.current_closure)
+[?2004l[?2004h>             self.current_closure = None
+[?2004l[?2004h>             self.procedure_stack.append((self.ip, self.program))
+[?2004l[?2004h>             self.program = code
+[?2004l[?2004h>             self.ip = -1  # will be 0 after +1
+[?2004l[?2004h>         elif op == 'RET':
+[?2004l[?2004h>             ret_val = self.stack.pop()
+[?2004l[?2004h>             self.ip, self.program = self.procedure_stack.pop()
+[?2004l[?2004h>             self.locals_stack.pop()
+[?2004l[?2004h>             self.current_closure = self.closure_stack.pop()
+[?2004l[?2004h>             self.stack.append(ret_val)
+[?2004l[?2004h>         elif op == 'CLOSURE':
+[?2004l[?2004h>             proc = instr[1]
+[?2004l[?2004h>             ncaptures = int(instr[2])
+[?2004l[?2004h>             captures = [self.stack.pop() for _ in range(ncaptures)]
+[?2004l[?2004h>             captures.reverse()
+[?2004l[?2004h>             self.stack.append(Closure(proc, captures))
+[?2004l[?2004h>         elif op == 'CALLCLOSURE':
+[?2004l[?2004h>             closure = self.stack.pop()
+[?2004l[?2004h>             proc = self.procedures[closure.proc_name]
+[?2004l[?2004h>             nargs, nlocals, code = proc
+[?2004l[?2004h>             args = [self.stack.pop() for _ in range(nargs)]
+[?2004l[?2004h>             args.reverse()
+[?2004l[?2004h>             locals = closure.captures + args + [None] * nlocals
+[?2004l[?2004h>             self.locals_stack.append(locals)
+[?2004l[?2004h>             self.closure_stack.append(self.current_closure)
+[?2004l[?2004h>             self.current_closure = closure
+[?2004l[?2004h>             self.procedure_stack.append((self.ip, self.program))
+[?2004l[?2004h>             self.program = code
+[?2004l[?2004h>             self.ip = -1
+[?2004l[?2004h>         elif op == 'GETCAPTURED':
+[?2004l[?2004h>             n = int(instr[1])
+[?2004l[?2004h>             self.stack.append(self.current_closure.captures[n])
+[?2004l[?2004h>         elif op == 'PRINT':
+[?2004l[?2004h>             print(self.stack[-1], end='')
+[?2004l[?2004h>         elif op == 'PRINTLN':
+[?2004l[?2004h>             print(self.stack[-1])
+[?2004l[?2004h>         elif op == 'READ':
+[?2004l[?2004h>             self.stack.append(input())
+[?2004l[?2004h>         elif op == 'TRY':
+[?2004l[?2004h>             self.exception_handler = self.labels[instr[1]]
+[?2004l[?2004h>         elif op == 'THROW':
+[?2004l[?2004h>             self.throw(self.stack.pop())
+[?2004l[?2004h>         elif op == 'ENDTRY':
+[?2004l[?2004h>             self.exception_handler = None
+[?2004l[?2004h>         elif op == 'HALT':
+[?2004l[?2004h>             sys.exit(0)
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             self.fault('unknown instruction: ' + op)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def throw(self, val):
+[?2004l[?2004h>         if self.exception_handler is not None:
+[?2004l[?2004h>             self.ip = self.exception_handler - 1
+[?2004l[?2004h>             self.stack.append(val)
+[?2004l[?2004h>             self.exception_handler = None
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             print('EXCEPTION: ' + str(val))
+[?2004l[?2004h>             sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h>     def fault(self, msg):
+[?2004l[?2004h>         print('ERROR: ' + msg)
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     if len(sys.argv) != 2:
+[?2004l[?2004h>         print('Usage: svm <program.svm>')
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h>     vm = VM()
+[?2004l[?2004h>     vm.run(sys.argv[1])
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@61c6d71f42d2:/app# chmod +x /app/svm
+[?2004l[?2004hroot@61c6d71f42d2:/app# 

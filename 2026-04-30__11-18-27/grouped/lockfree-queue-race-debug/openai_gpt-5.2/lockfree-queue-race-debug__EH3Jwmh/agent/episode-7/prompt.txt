@@ -1,0 +1,137 @@
+Current terminal state:
+New Terminal Output:
+
+bash -lc 'head -200 /app/term_check.txt'
+cat > /app/lockfree_queue.h <<'EOF'
+#ifndef LOCKFREE_QUEUE_H
+#define LOCKFREE_QUEUE_H
+
+#include <atomic>
+#include <cstdint>
+
+class LockFreeQueue {
+public:
+    LockFreeQueue();
+    ~LockFreeQueue();
+
+    void enqueue(uint64_t value);
+    bool dequeue(uint64_t& value);
+
+    LockFreeQueue(const LockFreeQueue&) = delete;
+    LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+
+private:
+    struct Node;
+
+    // Tagged pointer to mitigate ABA on pointer CAS.
+    struct TaggedPtr {
+        Node* ptr;
+        uint64_t tag;
+        bool operator==(const TaggedPtr& o) const { return ptr == o.ptr && tag == o.tag; }
+    };
+
+    struct Node {
+        uint64_t value;
+        std::atomic<TaggedPtr> next;
+        Node() : value(0), next(TaggedPtr{nullptr, 0}) {}
+        explicit Node(uint64_t v) : value(v), next(TaggedPtr{nullptr, 0}) {}
+    };
+
+    // Michael-Scott queue state (tagged to avoid ABA).
+    std::atomic<TaggedPtr> head_;
+    std::atomic<TaggedPtr> tail_;
+
+    // Hazard pointers for safe reclamation.
+    static constexpr int kMaxThreads = 64;
+    static constexpr int kHPPerThread = 2;
+    static constexpr int kRetireThreshold = 64;
+
+    struct HazardRecord {
+        std::atomic<Node*> hp[kHPPerThread];
+    };
+
+    static std::atomic<int> thread_count_;
+    static HazardRecord hazards_[kMaxThreads];
+
+    static int thread_index();
+    static void set_hazard(int idx, int slot, Node* p);
+    static void clear_hazard(int idx, int slot);
+    static bool is_hazarded(Node* p);
+
+    struct Retired {
+        Node* node;
+        Retired* next;
+    };
+
+    static thread_local int tls_index_;
+    static thread_local Retired* retired_list_;
+    static thread_local int retired_count_;
+
+    static void retire(Node* n);
+    static void scan();
+
+    // No freelist reuse; nodes are reclaimed via hazard pointers.
+    static Node* new_node(uint64_t value);
+};
+
+#endif
+EOF
+cat > /app/lockfree_queue.cpp <<'EOF'
+#include "lockfree_queue.h"
+
+#include <cassert>
+#include <cstdlib>
+#include <new>
+#include <vector>
+
+std::atomic<int> LockFreeQueue::thread_count_{0};
+LockFreeQueue::HazardRecord LockFreeQueue::hazards_[LockFreeQueue::kMaxThreads];
+thread_local int LockFreeQueue::tls_index_ = -1;
+thread_local LockFreeQueue::Retired* LockFreeQueue::retired_list_ = nullptr;
+thread_local int LockFreeQueue::retired_count_ = 0;
+
+int LockFreeQueue::thread_index() {
+    if (tls_index_ >= 0) return tls_index_;
+    int idx = thread_count_.fetch_add(1, std::memory_order_relaxed);
+    // Stress test uses <= 8 threads; keep a safe upper bound.
+    assert(idx < kMaxThreads);
+    for (int i = 0; i < kHPPerThread; ++i) {
+        hazards_[idx].hp[i].store(nullptr, std::memory_order_relaxed);
+    }
+    tls_index_ = idx;
+    return idx;
+}
+
+void LockFreeQueue::set_hazard(int idx, int slot, Node* p) {
+    hazards_[idx].hp[slot].store(p, std::memory_order_release);
+}
+
+void LockFreeQueue::clear_hazard(int idx, int slot) {
+    hazards_[idx].hp[slot].store(nullptr, std::memory_order_release);
+}
+
+bool LockFreeQueue::is_hazarded(Node* p) {
+    int n = thread_count_.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        for (int s = 0; s < kHPPerThread; ++s) {
+            if (hazards_[i].hp[s].load(std::memory_order_acquire) == p) return true;
+        }
+    }
+    return false;
+}
+
+void LockFreeQueue::retire(Node* n) {
+    auto* r = new Retired{n, retired_list_};
+    retired_list_ = r;
+    if (++retired_count_ >= kRetireThreshold) {
+        scan();
+    }
+}
+
+void LockFreeQueue::scan() {
+    // Collect hazard pointers snapshot.
+    std::vector<Node*> hp;
+    int n = thread_count_.load(std::memory_order_
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

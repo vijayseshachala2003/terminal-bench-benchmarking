@@ -1,0 +1,131 @@
+New Terminal Output:
+
+root@1eaa284b8765:/app# cat > /app/lockfree_queue.cpp << 'CPP_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     TaggedPtr initial(dummy, 0);
+>     head_.store(initial, std::memory_order_relaxed);
+>     tail_.store(initial, std::memory_order_relaxed);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     TaggedPtr head = head_.load(std::memory_order_relaxed);
+>     delete head.ptr;
+>
+>     // Delete all retired nodes
+>     Node* retired = retired_list_.load(std::memory_order_relaxed);
+>     while (retired) {
+>         Node* next = retired->next.load(std::memory_order_relaxed);
+>         delete retired;
+>         retired = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Add to retired list for cleanup at destruction
+>     // This prevents use-after-free: we never reuse nodes
+>     Node* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old_head, std::memory_order_relaxed);
+>     } while (!retired_list_.compare_exchange_weak(old_head, node,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         TaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail.ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-check tail consistency
+>         TaggedPtr tail2 = tail_.load(std::memory_order_acquire);
+>         if (tail == tail2) {
+>             if (next == nullptr) {
+>                 // Try to link new node at the end
+>                 if (tail.ptr->next.compare_exchange_weak(next, new_node,
+>                         std::memory_order_release, std::memory_order_relaxed)) {
+>                     // Try to swing tail to new node
+>                     TaggedPtr new_tail(new_node, tail.tag + 1);
+>                     tail_.compare_exchange_strong(tail, new_tail,
+>                         std::memory_order_release, std::memory_order_relaxed);
+>                     return;
+>                 }
+>             } else {
+>                 // Tail is behind, try to advance it
+>                 TaggedPtr new_tail(next, tail.tag + 1);
+>                 tail_.compare_exchange_strong(tail, new_tail,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         TaggedPtr head = head_.load(std::memory_order_acquire);
+>         TaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head.ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-check head consistency
+>         TaggedPtr head2 = head_.load(std::memory_order_acquire);
+>         if (head == head2) {
+>             if (head.ptr == tail.ptr) {
+>                 if (next == nullptr) {
+>                     return false;  // Queue is empty
+>                 }
+>                 // Tail is behind, advance it
+>                 TaggedPtr new_tail(next, tail.tag + 1);
+>                 tail_.compare_exchange_strong(tail, new_tail,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>             } else {
+>                 // Read value before CAS, otherwise another dequeue might
+>                 // retire the node
+>                 value = next->value.load(std::memory_order_relaxed);
+>                 TaggedPtr new_head(next, head.tag + 1);
+>                 if (head_.compare_exchange_weak(head, new_head,
+>                         std::memory_order_release, std::memory_order_relaxed)) {
+>                     // Successfully dequeued, retire old dummy node
+>                     retire_node(head.ptr);
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> CPP_EOF
+root@1eaa284b8765:/app# make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+/usr/bin/ld: /tmp/lockfree_queue-340ee0.o: in function `LockFreeQueue::LockFreeQueue()':
+lockfree_queue.cpp:(.text+0x48): undefined reference to `__atomic_store'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x67): undefined reference to `__atomic_store'
+/usr/bin/ld: /tmp/lockfree_queue-340ee0.o: in function `LockFreeQueue::~LockFreeQueue()':
+lockfree_queue.cpp:(.text+0xaf): undefined reference to `__atomic_load'
+/usr/bin/ld: /tmp/lockfree_queue-340ee0.o: in function `LockFreeQueue::dequeue(unsigned long&)':
+lockfree_queue.cpp:(.text+0x14d): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x16a): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x189): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x1b1): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x20a): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: /tmp/lockfree_queue-340ee0.o: in function `LockFreeQueue::enqueue(unsigned long)':
+lockfree_queue.cpp:(.text+0x305): undefined reference to `__atomic_compare_exchange'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x31a): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x346): undefined reference to `__atomic_load'
+/usr/bin/ld: lockfree_queue.cpp:(.text+0x3a0): undefined reference to `__atomic_compare_exchange'
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+make: *** [Makefile:13: stress_test] Error 1
+root@1eaa284b8765:/app#

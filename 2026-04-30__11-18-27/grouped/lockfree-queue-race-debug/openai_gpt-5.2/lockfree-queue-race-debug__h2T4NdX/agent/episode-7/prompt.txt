@@ -1,0 +1,275 @@
+New Terminal Output:
+
+root@0f3eca341fe0:/app# /app/stress_test_tsan 2>&1 | tail -n 50
+    #3 <null> <null> (libstdc++.so.6+0xd44a2) (BuildId: 289ee39f8c07bd4fa48102dfeeb7e6f9c76158b4)
+
+  Previous write of size 8 at 0x7b0400000a10 by thread T6:
+    #0 <null> <null> (stress_test_tsan+0xd4b07) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #1 <null> <null> (stress_test_tsan+0xd4c5b) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #2 <null> <null> (stress_test_tsan+0xd82f3) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #3 <null> <null> (libstdc++.so.6+0xd44a2) (BuildId: 289ee39f8c07bd4fa48102dfeeb7e6f9c76158b4)
+
+  Location is heap block of size 16 at 0x7b0400000a10 allocated by thread T6:
+    #0 <null> <null> (stress_test_tsan+0xd3576) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #1 <null> <null> (stress_test_tsan+0xd4adb) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #2 <null> <null> (stress_test_tsan+0xd4c5b) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #3 <null> <null> (stress_test_tsan+0xd82f3) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #4 <null> <null> (libstdc++.so.6+0xd44a2) (BuildId: 289ee39f8c07bd4fa48102dfeeb7e6f9c76158b4)
+
+  Thread T4 (tid=3343, running) created by main thread at:
+    #0 <null> <null> (stress_test_tsan+0x535cd) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #1 <null> <null> (libstdc++.so.6+0xd4578) (BuildId: 289ee39f8c07bd4fa48102dfeeb7e6f9c76158b4)
+    #2 <null> <null> (stress_test_tsan+0xd548e) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #3 <null> <null> (libc.so.6+0x27249) (BuildId: 6196744a316dbd57c0fd8968df1680aac482cec4)
+
+  Thread T6 (tid=3345, running) created by main thread at:
+    #0 <null> <null> (stress_test_tsan+0x535cd) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #1 <null> <null> (libstdc++.so.6+0xd4578) (BuildId: 289ee39f8c07bd4fa48102dfeeb7e6f9c76158b4)
+    #2 <null> <null> (stress_test_tsan+0xd6fc1) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #3 <null> <null> (stress_test_tsan+0xd54dc) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+    #4 <null> <null> (libc.so.6+0x27249) (BuildId: 6196744a316dbd57c0fd8968df1680aac482cec4)
+
+SUMMARY: ThreadSanitizer: data race (/app/stress_test_tsan+0xd4797) (BuildId: 4cdb3dfa14a5e61131b88ae58bd7971e93b21be4)
+==================
+All producers finished
+TIMEOUT: stress test exceeded 120s wall clock limit
+All consumers finished
+Duration: 120104 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 115224
+Unique values: 115224
+Duplicates: 0
+Missing: 4884776
+Invalid: 0
+
+STRESS TEST FAILED
+  - Count mismatch: got 115224, expected 5000000
+  - Found 4884776 missing values
+STRESS TEST FAILED
+  - Wall clock timeout after 120s
+ThreadSanitizer: reported 4 warnings
+root@0f3eca341fe0:/app# cat > lockfree_queue.h <<'EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstddef>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         uint64_t value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Hazard pointers for safe memory reclamation.
+>     // Prevents use-after-free and ABA due to pointer reuse by delaying deletes
+>     // until no thread holds a hazard reference to the node.
+>     struct HazardRecord {
+>         std::atomic<std::uintptr_t> hazard;
+>     };
+>
+>     static constexpr std::size_t kMaxThreads = 128;
+>     static constexpr std::size_t kHazardsPerThread = 2; // (head/tail) and next
+>     static HazardRecord hazards_[kMaxThreads * kHazardsPerThread];
+>     static std::atomic<std::size_t> next_thread_id_;
+>
+>     static std::size_t thread_id();
+>     static void set_hazard(std::size_t slot, Node* p);
+>     static void clear_hazard(std::size_t slot);
+>     static bool any_hazard_points_to(Node* p);
+>
+>     struct RetiredNode {
+>         Node* node;
+>         RetiredNode* next;
+>     };
+>
+>     static thread_local RetiredNode* retired_;
+>     static thread_local std::size_t retired_count_;
+>
+>     static void retire_node(Node* n);
+>     static void try_reclaim();
+>
+>     std::atomic<Node*> head_;
+>     std::atomic<Node*> tail_;
+>
+>     Node* allocate_node(uint64_t value);
+> };
+>
+> #endif
+> EOF
+root@0f3eca341fe0:/app# cat > lockfree_queue.cpp <<'EOF'
+> #include "lockfree_queue.h"
+>
+> LockFreeQueue::HazardRecord LockFreeQueue::hazards_[LockFreeQueue::kMaxThreads * LockFreeQueue::kHazardsPerThread]{};
+> std::atomic<std::size_t> LockFreeQueue::next_thread_id_{0};
+> thread_local LockFreeQueue::RetiredNode* LockFreeQueue::retired_ = nullptr;
+> thread_local std::size_t LockFreeQ
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+cur = &retired_;
+>     std::size_t new_count = 0;
+>     while (*cur) {
+>         RetiredNode* r = *cur;
+>         if (!any_hazard_points_to(r->node)) {
+>             *cur = r->next;
+>             delete r->node;
+>             delete r;
+>         } else {
+>             cur = &r->next;
+>             ++new_count;
+>         }
+>     }
+>     retired_count_ = new_count;
+> }
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(dummy, std::memory_order_relaxed);
+>     tail_.store(dummy, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     Node* head = head_.load(std::memory_order_relaxed);
+>     delete head;
+>
+>     // Destructor is single-threaded; reclaim anything this thread retired.
+>     try_reclaim();
+>     while (retired_) {
+>         RetiredNode* r = retired_;
+>         retired_ = r->next;
+>         delete r->node;
+>         delete r;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     const std::size_t tid = thread_id();
+>     const std::size_t hz0 = tid * kHazardsPerThread;
+>     const std::size_t hz1 = hz0 + 1;
+>
+>     while (true) {
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         set_hazard(hz0, tail);
+>         if (tail != tail_.load(std::memory_order_acquire)) continue;
+>
+>         Node* next = tail->next.load(std::memory_order_acquire);
+>         set_hazard(hz1, next);
+>
+>         if (tail == tail_.load(std::memory_order_acquire)) {
+>             if (next == nullptr) {
+>                 if (tail->next.compare_exchange_weak(next, new_node,
+>                                                     std::memory_order_release,
+>                                                     std::memory_order_relaxed)) {
+>                     tail_.compare_exchange_weak(tail, new_node,
+>                                                 std::memory_order_release,
+>                                                 std::memory_order_relaxed);
+>                     clear_hazard(hz1);
+>                     clear_hazard(hz0);
+>                     return;
+>                 }
+>             } else {
+>                 tail_.compare_exchange_weak(tail, next,
+>                                             std::memory_order_release,
+>                                             std::memory_order_relaxed);
+>             }
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     const std::size_t tid = thread_id();
+>     const std::size_t hz0 = tid * kHazardsPerThread;
+>     const std::size_t hz1 = hz0 + 1;
+>
+>     while (true) {
+>         Node* head = head_.load(std::memory_order_acquire);
+>         set_hazard(hz0, head);
+>         if (head != head_.load(std::memory_order_acquire)) continue;
+>
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head->next.load(std::memory_order_acquire);
+>         set_hazard(hz1, next);
+>
+>         if (head == head_.load(std::memory_order_acquire)) {
+>             if (head == tail) {
+>                 if (next == nullptr) {
+>                     clear_hazard(hz1);
+>                     clear_hazard(hz0);
+>                     return false;
+>                 }
+>                 tail_.compare_exchange_weak(tail, next,
+>                                             std::memory_order_release,
+>                                             std::memory_order_relaxed);
+>             } else {
+>                 uint64_t v = next->value;
+>                 if (head_.compare_exchange_weak(head, next,
+>                                                 std::memory_order_release,
+>                                                 std::memory_order_relaxed)) {
+>                     value = v;
+>                     clear_hazard(hz1);
+>                     clear_hazard(hz0);
+>                     retire_node(head);
+>                     return true;
+>                 }
+>             }
+>         }
+>     }
+> }
+> EOF
+root@0f3eca341fe0:/app# make clean && make
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@0f3eca341fe0:/app# time -p /app/stress_test | tail -n 40
+=== Lock-Free Queue Stress Test ===
+Producers: 4
+Consumers: 4
+Operations per producer: 1250000
+Total operations: 5000000
+
+All producers finished
+All consumers finished
+Duration: 1796 ms
+
+=== Results ===
+Expected: 5000000
+Enqueued: 5000000
+Dequeued: 5000000
+Unique values: 5000000
+Duplicates: 0
+Missing: 0
+Invalid: 0
+
+STRESS TEST PASSED
+real 2.56
+user 3.28
+sys 0.76
+root@0f3eca341fe0:/app# make clean && make tsan
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -fsanitize=thread -g -o stress_test_tsan lockfree_queue.cpp stress_test.cpp
+root@0f3eca341fe0:/app# /app/stress_test_tsan 2>&1 | tail -n 120
+

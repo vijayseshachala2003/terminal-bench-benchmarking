@@ -1,0 +1,402 @@
+[?2004hroot@0df0d591699f:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@0df0d591699f:/app# clear
+[?2004l[H[J[3J[?2004hroot@0df0d591699f:/app# cat << 'EOF' > /app/gen_svm.py
+[?2004l[?2004h> import os
+[?2004l[?2004h> 
+[?2004l[?2004h> code = r'''#!/usr/bin/env python3
+[?2004l[?2004h> import sys
+[?2004l[?2004h> 
+[?2004l[?2004h> def error(msg):
+[?2004l[?2004h>     print(f"ERROR: {msg}")
+[?2004l[?2004h>     sys.exit(1)
+[?2004l[?2004h> 
+[?2004l[?2004h> def lex(line):
+[?2004l[?2004h>     tokens = []
+[?2004l[?2004h>     i = 0
+[?2004l[?2004h>     while i < len(line):
+[?2004l[?2004h>         while i < len(line) and line[i].isspace():
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>         if i >= len(line):
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if line[i] == '#':
+[?2004l[?2004h>             break
+[?2004l[?2004h>         if line[i] == '"':
+[?2004l[?2004h>             start = i
+[?2004l[?2004h>             i += 1
+[?2004l[?2004h>             while i < len(line):
+[?2004l[?2004h>                 if line[i] == '\\':
+[?2004l[?2004h>                     i += 2
+[?2004l[?2004h>                 elif line[i] == '"':
+[?2004l[?2004h>                     i += 1
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     i += 1
+[?2004l[?2004h>             tokens.append(line[start:i])
+[?2004l[?2004h>         else:
+[?2004l[?2004h>             start = i
+[?2004l[?2004h>             while i < len(line) and not line[i].isspace() and line[i] != '#':
+[?2004l[?2004h>                 i += 1
+[?2004l[?2004h>             tokens.append(line[start:i])
+[?2004l[?2004h>     return tokens
+[?2004l[?2004h> 
+[?2004l[?2004h> def parse_val(v):
+[?2004l[?2004h>     if v.startswith('"') and v.endswith('"'):
+[?2004l[?2004h>         s = v[1:-1]
+[?2004l[?2004h>         s = s.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\').replace('\\"', '"')
+[?2004l[?2004h>         return s
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         return int(v)
+[?2004l[?2004h>     except:
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         return float(v)
+[?2004l[?2004h>     except:
+[?2004l[?2004h>         pass
+[?2004l[?2004h>     return v
+[?2004l[?2004h> 
+[?2004l[?2004h> def run(program):
+[?2004l[?2004h>     with open(program, 'r') as f:
+[?2004l[?2004h>         lines = f.readlines()
+[?2004l[?2004h>     
+[?2004l[?2004h>     instructions = []
+[?2004l[?2004h>     labels = {}
+[?2004l[?2004h>     procs = {}
+[?2004l[?2004h>     
+[?2004l[?2004h>     for line in lines:
+[?2004l[?2004h>         tokens = lex(line)
+[?2004l[?2004h>         if tokens:
+[?2004l[?2004h>             instructions.append(tokens)
+[?2004l[?2004h>             
+[?2004l[?2004h>     # First pass: find labels and procs
+[?2004l[?2004h>     pc = 0
+[?2004l[?2004h>     while pc < len(instructions):
+[?2004l[?2004h>         op = instructions[pc]
+[?2004l[?2004h>         cmd = op[0].upper()
+[?2004l[?2004h>         if cmd == 'LABEL':
+[?2004l[?2004h>             labels[op[1]] = pc
+[?2004l[?2004h>         elif cmd == 'PROC':
+[?2004l[?2004h>             procs[op[1]] = {'pc': pc, 'nargs': int(op[2]), 'nlocals': int(op[3])}
+[?2004l[?2004h>         pc += 1
+[?2004l[?2004h>         
+[?2004l[?2004h>     stack = []
+[?2004l[?2004h>     call_stack = []
+[?2004l[?2004h>     try_stack = []
+[?2004l[?2004h>     heap = {}
+[?2004l[?2004h>     freed_heap = set()
+[?2004l[?2004h>     next_heap = 1
+[?2004l[?2004h>     locals_env = []
+[?2004l[?2004h>     current_closure = None
+[?2004l[?2004h>     
+[?2004l[?2004h>     def throw_exc(msg, pc):
+[?2004l[?2004h>         if not try_stack:
+[?2004l[?2004h>             print(f"EXCEPTION: {msg}")
+[?2004l[?2004h>             sys.exit(1)
+[?2004l[?2004h>         catch_pc, call_depth = try_stack.pop()
+[?2004l[?2004h>         while len(call_stack) > call_depth:
+[?2004l[?2004h>             call_stack.pop()
+[?2004l[?2004h>         return catch_pc
+[?2004l[?2004h>         
+[?2004l[?2004h>     pc = 0
+[?2004l[?2004h>     while pc < len(instructions):
+[?2004l[?2004h>         op = instructions[pc]
+[?2004l[?2004h>         cmd = op[0].upper()
+[?2004l[?2004h>         
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             if cmd == 'PUSH':
+[?2004l[?2004h>                 stack.append(parse_val(op[1]))
+[?2004l[?2004h>             elif cmd == 'POP':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 stack.pop()
+[?2004l[?2004h>             elif cmd == 'DUP':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 stack.append(stack[-1])
+[?2004l[?2004h>             elif cmd == 'SWAP':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 stack[-1], stack[-2] = stack[-2], stack[-1]
+[?2004l[?2004h>             elif cmd == 'ROT':
+[?2004l[?2004h>                 if len(stack) < 3: error("stack underflow")
+[?2004l[?2004h>                 a, b, c = stack[-3], stack[-2], stack[-1]
+[?2004l[?2004h>                 stack[-3:] = [b, c, a]
+[?2004l[?2004h>             elif cmd == 'ADD':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b) or type(a) not in (int, float, str):
+[?2004l[?2004h>                     pc = throw_exc("type error: cannot ADD", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(a + b)
+[?2004l[?2004h>             elif cmd == 'SUB':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b) or type(a) not in (int, float):
+[?2004l[?2004h>                     pc = throw_exc("type error: cannot SUB", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(a - b)
+[?2004l[?2004h>             elif cmd == 'MUL':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b) or type(a) not in (int, float):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(a * b)
+[?2004l[?2004h>             elif cmd == 'DIV':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b) or type(a) not in (int, float):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 if b == 0:
+[?2004l[?2004h>                     pc = throw_exc("division by zero", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 if isinstance(a, int):
+[?2004l[?2004h>                     stack.append(a // b)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     stack.append(a / b)
+[?2004l[?2004h>             elif cmd == 'MOD':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b) or type(a) not in (int, float):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 if b == 0:
+[?2004l[?2004h>                     pc = throw_exc("division by zero", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(a % b)
+[?2004l[?2004h>             elif cmd == 'NEG':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) not in (int, float):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(-a)
+[?2004l[?2004h>             elif cmd in ('EQ', 'NE', 'LT', 'GT', 'LE', 'GE'):
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 if type(a) != type(b):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 if cmd == 'EQ': stack.append(1 if a == b else 0)
+[?2004l[?2004h>                 elif cmd == 'NE': stack.append(1 if a != b else 0)
+[?2004l[?2004h>                 elif cmd == 'LT': stack.append(1 if a < b else 0)
+[?2004l[?2004h>                 elif cmd == 'GT': stack.append(1 if a > b else 0)
+[?2004l[?2004h>                 elif cmd == 'LE': stack.append(1 if a <= b else 0)
+[?2004l[?2004h>                 elif cmd == 'GE': stack.append(1 if a >= b else 0)
+[?2004l[?2004h>             elif cmd == 'AND':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 stack.append(1 if (a and b) else 0)
+[?2004l[?2004h>             elif cmd == 'OR':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 b = stack.pop()
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 stack.append(1 if (a or b) else 0)
+[?2004l[?2004h>             elif cmd == 'NOT':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 a = stack.pop()
+[?2004l[?2004h>                 stack.append(1 if not a else 0)
+[?2004l[?2004h>             elif cmd == 'TYPE':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 a = stack[-1]
+[?2004l[?2004h>                 if isinstance(a, int): stack.append("int")
+[?2004l[?2004h>                 elif isinstance(a, float): stack.append("float")
+[?2004l[?2004h>                 elif isinstance(a, str): stack.append("string")
+[?2004l[?2004h>                 elif isinstance(a, list): stack.append("array")
+[?2004l[?2004h>                 elif isinstance(a, dict) and a.get('type') == 'closure': stack.append("closure")
+[?2004l[?2004h>                 else: stack.append("unknown")
+[?2004l[?2004h>             elif cmd == 'TOINT':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 try: stack[-1] = int(stack[-1])
+[?2004l[?2004h>                 except: pc = throw_exc("type error", pc); continue
+[?2004l[?2004h>             elif cmd == 'TOFLOAT':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 try: stack[-1] = float(stack[-1])
+[?2004l[?2004h>                 except: pc = throw_exc("type error", pc); continue
+[?2004l[?2004h>             elif cmd == 'TOSTR':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 stack[-1] = str(stack[-1])
+[?2004l[?2004h>             elif cmd == 'LEN':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 a = stack[-1]
+[?2004l[?2004h>                 if isinstance(a, (str, list)):
+[?2004l[?2004h>                     stack[-1] = len(a)
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             elif cmd == 'NEWARRAY':
+[?2004l[?2004h>                 n = int(op[1])
+[?2004l[?2004h>                 stack.append([0] * n)
+[?2004l[?2004h>             elif cmd == 'ALOAD':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 idx = stack.pop()
+[?2004l[?2004h>                 arr = stack.pop()
+[?2004l[?2004h>                 if not isinstance(arr, list) or not isinstance(idx, int):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 stack.append(arr[idx])
+[?2004l[?2004h>             elif cmd == 'ASTORE':
+[?2004l[?2004h>                 if len(stack) < 3: error("stack underflow")
+[?2004l[?2004h>                 val = stack.pop()
+[?2004l[?2004h>                 idx = stack.pop()
+[?2004l[?2004h>                 arr = stack.pop()
+[?2004l[?2004h>                 if not isinstance(arr, list) or not isinstance(idx, int):
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 arr[idx] = val
+[?2004l[?2004h>             elif cmd == 'ALLOC':
+[?2004l[?2004h>                 n = int(op[1])
+[?2004l[?2004h>                 addr = next_heap
+[?2004l[?2004h>                 next_heap += 1
+[?2004l[?2004h>                 heap[addr] = [0] * n
+[?2004l[?2004h>                 stack.append(addr)
+[?2004l[?2004h>             elif cmd == 'LOAD':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 addr = stack.pop()
+[?2004l[?2004h>                 if addr in freed_heap: error("use after free")
+[?2004l[?2004h>                 if addr not in heap: error("invalid heap address")
+[?2004l[?2004h>                 stack.append(heap[addr][0])
+[?2004l[?2004h>             elif cmd == 'STORE':
+[?2004l[?2004h>                 if len(stack) < 2: error("stack underflow")
+[?2004l[?2004h>                 val = stack.pop()
+[?2004l[?2004h>                 addr = stack.pop()
+[?2004l[?2004h>                 if addr in freed_heap: error("use after free")
+[?2004l[?2004h>                 if addr not in heap: error("invalid heap address")
+[?2004l[?2004h>                 heap[addr][0] = val
+[?2004l[?2004h>             elif cmd == 'FREE':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 addr = stack.pop()
+[?2004l[?2004h>                 if addr in freed_heap: error("use after free")
+[?2004l[?2004h>                 if addr in heap:
+[?2004l[?2004h>                     del heap[addr]
+[?2004l[?2004h>                     freed_heap.add(addr)
+[?2004l[?2004h>             elif cmd == 'LLOAD':
+[?2004l[?2004h>                 n = int(op[1])
+[?2004l[?2004h>                 stack.append(locals_env[n])
+[?2004l[?2004h>             elif cmd == 'LSTORE':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 n = int(op[1])
+[?2004l[?2004h>                 locals_env[n] = stack.pop()
+[?2004l[?2004h>             elif cmd == 'LABEL':
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             elif cmd == 'JMP':
+[?2004l[?2004h>                 pc = labels[op[1]]
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             elif cmd == 'JZ':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 val = stack.pop()
+[?2004l[?2004h>                 if not val:
+[?2004l[?2004h>                     pc = labels[op[1]]
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             elif cmd == 'JNZ':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 val = stack.pop()
+[?2004l[?2004h>                 if val:
+[?2004l[?2004h>                     pc = labels[op[1]]
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>             elif cmd == 'PROC':
+[?2004l[?2004h>                 # Skip over procedure body
+[?2004l[?2004h>                 while pc < len(instructions) and instructions[pc][0].upper() != 'ENDPROC':
+[?2004l[?2004h>                     pc += 1
+[?2004l[?2004h>             elif cmd == 'ENDPROC':
+[?2004l[?2004h>                 pass
+[?2004l[?2004h>             elif cmd == 'CALL':
+[?2004l[?2004h>                 name = op[1]
+[?2004l[?2004h>                 proc = procs[name]
+[?2004l[?2004h>                 nargs = proc['nargs']
+[?2004l[?2004h>                 nlocals = proc['nlocals']
+[?2004l[?2004h>                 if len(stack) < nargs: error("stack underflow")
+[?2004l[?2004h>                 args = [stack.pop() for _ in range(nargs)][::-1]
+[?2004l[?2004h>                 new_locals = args + [0] * nlocals
+[?2004l[?2004h>                 call_stack.append((pc + 1, locals_env, current_closure))
+[?2004l[?2004h>                 locals_env = new_locals
+[?2004l[?2004h>                 current_closure = None
+[?2004l[?2004h>                 pc = proc['pc']
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             elif cmd == 'RET':
+[?2004l[?2004h>                 if not call_stack:
+[?2004l[?2004h>                     break
+[?2004l[?2004h>                 ret_pc, old_locals, old_closure = call_stack.pop()
+[?2004l[?2004h>                 locals_env = old_locals
+[?2004l[?2004h>                 current_closure = old_closure
+[?2004l[?2004h>                 pc = ret_pc
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             elif cmd == 'CLOSURE':
+[?2004l[?2004h>                 proc_name = op[1]
+[?2004l[?2004h>                 ncaptures = int(op[2])
+[?2004l[?2004h>                 if len(stack) < ncaptures: error("stack underflow")
+[?2004l[?2004h>                 captures = [stack.pop() for _ in range(ncaptures)][::-1]
+[?2004l[?2004h>                 stack.append({'type': 'closure', 'proc': proc_name, 'captures': captures})
+[?2004l[?2004h>             elif cmd == 'CALLCLOSURE':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 closure = stack.pop()
+[?2004l[?2004h>                 if not isinstance(closure, dict) or closure.get('type') != 'closure':
+[?2004l[?2004h>                     pc = throw_exc("type error", pc)
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 proc = procs[closure['proc']]
+[?2004l[?2004h>                 nargs = proc['nargs']
+[?2004l[?2004h>                 nlocals = proc['nlocals']
+[?2004l[?2004h>                 if len(stack) < nargs: error("stack underflow")
+[?2004l[?2004h>                 args = [stack.pop() for _ in range(nargs)][::-1]
+[?2004l[?2004h>                 new_locals = args + [0] * nlocals
+[?2004l[?2004h>                 call_stack.append((pc + 1, locals_env, current_closure))
+[?2004l[?2004h>                 locals_env = new_locals
+[?2004l[?2004h>                 current_closure = closure
+[?2004l[?2004h>                 pc = proc['pc']
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             elif cmd == 'GETCAPTURED':
+[?2004l[?2004h>                 n = int(op[1])
+[?2004l[?2004h>                 stack.append(current_closure['captures'][n])
+[?2004l[?2004h>             elif cmd == 'PRINT':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 print(stack[-1], end='')
+[?2004l[?2004h>             elif cmd == 'PRINTLN':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 print(stack[-1])
+[?2004l[?2004h>             elif cmd == 'READ':
+[?2004l[?2004h>                 stack.append(sys.stdin.readline().strip())
+[?2004l[?2004h>             elif cmd == 'TRY':
+[?2004l[?2004h>                 try_stack.append((labels[op[1]], len(call_stack)))
+[?2004l[?2004h>             elif cmd == 'THROW':
+[?2004l[?2004h>                 if not stack: error("stack underflow")
+[?2004l[?2004h>                 val = stack.pop()
+[?2004l[?2004h>                 pc = throw_exc(str(val), pc)
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             elif cmd == 'ENDTRY':
+[?2004l[?2004h>                 if try_stack:
+[?2004l[?2004h>                     try_stack.pop()
+[?2004l[?2004h>             elif cmd == 'HALT':
+[?2004l[?2004h>                 break
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 error(f"unknown instruction: {cmd}")
+[?2004l[?2004h>         except Exception as e:
+[?2004l[?2004h>             error(str(e))
+[?2004l[?2004h>         
+[?2004l[?2004h>         pc += 1
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == "__main__":
+[?2004l[?2004h>     if len(sys.argv) < 2:
+[?2004l[?2004h>         print("Usage: svm <program.svm>")
+[?2004l[?2004h>         sys.exit(1)
+[?2004l[?2004h>     run(sys.argv[1])
+[?2004l[?2004h> '''
+[?2004l[?2004h> 
+[?2004l[?2004h> with open('/app/svm', 'w') as f:
+[?2004l[?2004h>     f.write(code)
+[?2004l[?2004h> os.chmod('/app/svm', 0o755)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0df0d591699f:/app# python3 /app/gen_svm.py
+[?2004l[?2004hroot@0df0d591699f:/app# cat << 'EOF' > test.svm
+[?2004l[?2004h> PUSH 42
+[?2004l[?2004h> PRINTLN
+[?2004l[?2004h> HALT
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@0df0d591699f:/app# /app/svm test.svm
+[?2004l42
+[?2004hroot@0df0d591699f:/app# 

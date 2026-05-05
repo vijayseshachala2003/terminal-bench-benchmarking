@@ -1,0 +1,59 @@
+{
+  "analysis": "Primary now serves secure.example.com correctly with DNSSEC records (A with RRSIG, NS with RRSIG, etc.), so authoritative side is fixed. Resolver still returns SERVFAIL, which now strongly indicates DNSSEC validation failure due to lack of a trust anchor/DS chain for secure.example.com (it’s an island of trust not anchored in the global DNS root in this lab). With dnssec-validation enabled, BIND will mark it bogus and SERVFAIL. To make validation pass, we must configure the resolver with a trust anchor for secure.example.com (static-trust-anchor) or disable validation (but requirement wants DNSSEC valid, so add trust anchor). We can extract the DNSKEY from the signed zone or via dig from primary and add it to resolver using 'trusted-keys' (deprecated) or 'trust-anchors'/'managed-keys'. In BIND 9.18, use 'trust-anchors { \"secure.example.com\" static-key <DNSKEY RR>; };' Alternatively use 'dnssec-validation yes;' plus 'trust-anchors' statement. We'll fetch the KSK DNSKEY (flag 257) and insert as static trust anchor in resolver named.conf, restart resolver, and re-test; success should show NOERROR and ideally 'ad' flag from resolver.",
+  "plan": "1) Query primary for secure.example.com DNSKEY and capture the KSK (flags 257) record. 2) Edit /app/dns/resolver/named.conf to add a trust anchor for secure.example.com using the KSK DNSKEY as a static-key in a trust-anchors block. 3) Restart resolver (and keep primary/secondary running). 4) Re-test secure.example.com via resolver with +dnssec and confirm it returns NOERROR (and AD flag if validation succeeds). 5) Run all /app/test_queries.txt queries and verify zone transfers. 6) Generate /app/dns_health.json report.",
+  "commands": [
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 secure.example.com DNSKEY +dnssec +norecurse\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "KSK_LINE=$(dig @127.0.0.1 -p 5301 secure.example.com DNSKEY +dnssec +norecurse | awk '/DNSKEY/ && $0 ~ / 257 / {print; exit}'); echo \"$KSK_LINE\"\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport subprocess,shlex\nout=subprocess.check_output(['dig','@127.0.0.1','-p','5301','secure.example.com','DNSKEY','+dnssec','+norecurse'],text=True)\nksk=None\nfor line in out.splitlines():\n    if ' DNSKEY ' in line and ' 257 ' in line and not line.strip().startswith(';'):\n        ksk=line.strip()\n        break\nprint(ksk or '')\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\nimport subprocess\nconf=Path('/app/dns/resolver/named.conf')\ntext=conf.read_text().splitlines()\n# remove any existing trust-anchors block\nnew=[]\nskip=False\nfor l in text:\n    if l.strip().startswith('trust-anchors'):\n        skip=True\n    if not skip:\n        new.append(l)\n    if skip and l.strip().endswith('};'):\n        skip=False\n# fetch KSK DNSKEY\nout=subprocess.check_output(['dig','@127.0.0.1','-p','5301','secure.example.com','DNSKEY','+dnssec','+norecurse'],text=True)\nksk=None\nfor line in out.splitlines():\n    if ' DNSKEY ' in line and ' 257 ' in line and not line.strip().startswith(';'):\n        ksk=line.strip()\n        break\nif not ksk:\n    raise SystemExit('No KSK DNSKEY found')\n# insert trust-anchors before controls\ninsert=[]\nfor l in new:\n    if l.strip().startswith('controls'):\n        insert.append('trust-anchors {')\n        insert.append(f'    \"secure.example.com\" static-key {ksk};')\n        insert.append('};')\n    insert.append(l)\nconf.write_text('\\n'.join(insert)+\"\\n\")\nprint('updated resolver named.conf with trust anchor')\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5300\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1 | grep -E 'status:|flags:'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"## $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 3.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=1 +tries=1 | head\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=1 +tries=1 | head\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

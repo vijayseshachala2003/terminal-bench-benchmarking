@@ -1,0 +1,197 @@
+New Terminal Output:
+
+root@afa509a83f97:/app# pip install pytest -q 2>&1 | tail -3
+
+[notice] A new release of pip is available: 24.3.1 -> 26.1.1
+[notice] To update, run: pip install --upgrade pip
+root@afa509a83f97:/app# ls /data/ignore.txt 2>/dev/null && cat /data/ignore.txt || echo 'no ignore.txt'
+no ignore.txt
+root@afa509a83f97:/app# cat /app/app/indexer.py
+import os
+import hashlib
+import sqlite3
+import unicodedata
+import tempfile
+
+
+def _load_ignore_patterns(ignore_path="/data/ignore.txt"):
+    """Load ignore patterns from file, return list of NFC-normalized patterns."""
+    patterns = []
+    try:
+        with open(ignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n").rstrip("\r")
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                pat = unicodedata.normalize("NFC", line.strip())
+                patterns.append(pat)
+    except (OSError, IOError):
+        pass
+    return patterns
+
+
+def _wildcard_match(pattern, text):
+    """Match where * matches zero or more characters that are not '/'.
+
+    ** is NOT special recursive glob - it's two consecutive * wildcards,
+    each matching zero or more non-/ characters.
+    """
+    p_len = len(pattern)
+    t_len = len(text)
+
+    # dp approach with two rows
+    prev = [False] * (t_len + 1)
+    prev[0] = True
+
+    for i in range(1, p_len + 1):
+        curr = [False] * (t_len + 1)
+        pc = pattern[i - 1]
+        if pc == '*':
+            curr[0] = prev[0]  # * can match empty
+            for j in range(1, t_len + 1):
+                curr[j] = prev[j] or (curr[j - 1] and text[j - 1] != '/')
+        else:
+            curr[0] = False
+            for j in range(1, t_len + 1):
+                curr[j] = prev[j - 1] and text[j - 1] == pc
+        prev = curr
+
+    return prev[t_len]
+
+
+def _is_ignored(rel_path_nfc, patterns):
+    """Check if a NFC-normalized relative path should be ignored."""
+    for pat in patterns:
+        if pat.startswith('/'):
+            # Anchored: match against full relative path only
+            anchored = pat[1:]
+            if _wildcard_match(anchored, rel_path_nfc):
+                return True
+        elif '/' in pat:
+            # Contains / but not leading: match full path or any suffix after /
+            if _wildcard_match(pat, rel_path_nfc):
+                return True
+            idx = 0
+            while True:
+                idx = rel_path_nfc.find('/', idx)
+                if idx == -1:
+                    break
+                suffix = rel_path_nfc[idx + 1:]
+                if _wildcard_match(pat, suffix):
+                    return True
+                idx += 1
+        else:
+            # No /: match against each path component
+            components = rel_path_nfc.split('/')
+            for comp in components:
+                if _wildcard_match(pat, comp):
+                    return True
+    return False
+
+
+def _hash_file(filepath):
+    """Compute SHA-256 hash of file contents, return (hex_digest, size)."""
+    h = hashlib.sha256()
+    size = 0
+    with open(filepath, 'rb') as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    patterns = _load_ignore_patterns()
+
+    # Use abspath only - realpath follows symlinks which we don't want
+    root_dir = os.path.abspath(root_dir)
+
+    # Collect files: nfc_rel_path -> (original_rel_path, full_path)
+    file_map = {}
+
+    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        # Remove symlinked directories and sort for determinism
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if not os.path.islink(os.path.join(dirpath, d))
+        )
+
+        for filename in sorted(filenames):
+            full_path = os.path.join(dirpath, filename)
+
+            # Skip symlinks
+            if os.path.islink(full_path):
+                continue
+
+            # Relative path with forward slashes
+            rel_path = os.path.relpath(full_path, root_dir)
+            rel_path = rel_path.replace(os.sep, '/')
+
+            # NFC normalize
+            nfc_rel_path = unicodedata.normalize('NFC', rel_path)
+
+            # Check ignore patterns
+            if _is_ignored(nfc_rel_path, patterns):
+                continue
+
+            # Handle Unicode collisions: keep lexicographically largest original
+            if nfc_rel_path in file_map:
+                existing_orig = file_map[nfc_rel_path][0]
+                if rel_path > existing_orig:
+                    file_map[nfc_rel_path] = (rel_path, full_path)
+            else:
+                file_map[nfc_rel_path] = (rel_path, full_path)
+
+    # Build rows sorted by NFC path for determinism
+    rows = []
+    for nfc_path in sorted(file_map.keys()):
+        orig_rel, full_path = file_map[nfc_path]
+        try:
+            sha256_hex, size = _hash_file(full_path)
+            rows.append((nfc_path, sha256_hex, size))
+        except (OSError, IOError):
+            continue
+
+    # Write to database using temp file + atomic rename for concurrency safety
+    db_path_abs = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_path_abs)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(suffix='.db', dir=db_dir if db_dir else '.')
+    os.close(fd)
+
+    try:
+        conn = sqlite3.connect(tmp_path)
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("""
+                CREATE TABLE files (
+                    path TEXT PRIMARY KEY,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL
+                )
+            """)
+            conn.executemany(
+                "INSERT INTO files VALUES (?, ?, ?)",
+                rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Atomic rename - safe for concurrent writers
+        os.replace(tmp_path, db_path_abs)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+root@afa509a83f97:/app#

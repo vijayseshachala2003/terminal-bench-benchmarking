@@ -1,0 +1,179 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@b22e726280e5:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         std::atomic<uint64_t> value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Pack pointer + tag into a single 64-bit value
+>     // Lower 48 bits: pointer, upper 16 bits: tag
+>     static constexpr uint64_t PTR_MASK = 0x0000FFFFFFFFFFFF;
+>     static constexpr int TAG_SHIFT = 48;
+>
+>     static uint64_t make_tagged(Node* ptr, uint64_t tag) {
+>         return (reinterpret_cast<uint64_t>(ptr) & PTR_MASK) | (tag << TAG_SHIFT);
+>     }
+>
+>     static Node* get_ptr(uint64_t tagged) {
+>         return reinterpret_cast<Node*>(tagged & PTR_MASK);
+>     }
+>
+>     static uint64_t get_tag(uint64_t tagged) {
+>         return tagged >> TAG_SHIFT;
+>     }
+>
+>     std::atomic<uint64_t> head_;
+>     std::atomic<uint64_t> tail_;
+>
+>     // Retired nodes list - only freed in destructor
+>     std::atomic<Node*> retired_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@b22e726280e5:/app# cat > /app/lockfree_queue.cpp << 'IMPL_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(make_tagged(dummy, 0), std::memory_order_relaxed);
+>     tail_.store(make_tagged(dummy, 0), std::memory_order_relaxed);
+>     retired_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     Node* head = get_ptr(head_.load(std::memory_order_relaxed));
+>     delete head;
+>
+>     // Delete all retired nodes
+>     Node* r = retired_.load(std::memory_order_relaxed);
+>     while (r) {
+>         Node* next = r->next.load(std::memory_order_relaxed);
+>         delete r;
+>         r = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     Node* old_top = retired_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old_top, std::memory_order_relaxed);
+>     } while (!retired_.compare_exchange_weak(old_top, node,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         uint64_t tail = tail_.load(std::memory_order_acquire);
+>         Node* tail_ptr = get_ptr(tail);
+>         uint64_t tail_tag = get_tag(tail);
+>         Node* next = tail_ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail to check consistency
+>         if (tail != tail_.load(std::memory_order_acquire)) {
+>             continue;
+>         }
+>
+>         if (next == nullptr) {
+>             // Try to link new node at the end
+>             Node* expected_next = nullptr;
+>             if (tail_ptr->next.compare_exchange_weak(expected_next, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 // Try to swing tail to the new node
+>                 uint64_t new_tail = make_tagged(new_node, tail_tag + 1);
+>                 tail_.compare_exchange_strong(tail, new_tail,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             // Tail is behind, try to advance it
+>             uint64_t new_tail = make_tagged(next, tail_tag + 1);
+>             tail_.compare_exchange_strong(tail, new_tail,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         uint64_t head = head_.load(std::memory_order_acquire);
+>         uint64_t tail = tail_.load(std::memory_order_acquire);
+>         Node* head_ptr = get_ptr(head);
+>         Node* tail_ptr = get_ptr(tail);
+>         uint64_t head_tag = get_tag(head);
+>         uint64_t tail_tag = get_tag(tail);
+>         Node* next = head_ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read head to check consistency
+>         if (head != head_.load(std::memory_order_acquire)) {
+>             continue;
+>         }
+>
+>         if (head_ptr == tail_ptr) {
+>             if (next == nullptr) {
+>                 return false;  // Queue is empty
+>             }
+>             // Tail is behind, advance it
+>             uint64_t new_tail = make_tagged(next, tail_tag + 1);
+>             tail_.compare_exchange_strong(tail, new_tail,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             if (next == nullptr) {
+>                 continue;  // Inconsistent read, retry
+>             }
+>             // Read value before CAS
+>             uint64_t result = next->value.load(std::memory_order_relaxed);
+>             uint64_t new_head = make_tagged(next, head_tag + 1);
+>             if (head_.compare_exchange_strong(head, new_head,
+>                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+>                 value = result;
+>                 retire_node(head_ptr);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> IMPL_EOF
+root@b22e726280e5:/app# cd /app && make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp -latomic
+root@b22e726280e5:/app#

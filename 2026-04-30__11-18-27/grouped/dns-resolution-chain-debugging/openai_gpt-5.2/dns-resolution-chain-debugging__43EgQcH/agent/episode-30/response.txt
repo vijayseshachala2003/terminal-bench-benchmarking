@@ -1,0 +1,39 @@
+{
+  "analysis": "Services are up on 5300/5301/5302, all queries in /app/test_queries.txt resolve successfully via the resolver, and AXFR from secondary succeeds for both zones. However, DNSSEC validation is currently reported as false because delv refused to load the deprecated trusted-keys stanza. We should not finalize yet: we need a working DNSSEC validation proof and set dnssec_valid=true if validation passes. Next step is to validate using a supported delv key format: use delv -k with the KSK .key file, or use a trust-anchors stanza format that delv accepts (e.g., managed-keys/trust-anchors with initial-key). Also ensure the delv anchor uses the full base64 key (currently truncated to last field only). After successful delv validation, update /app/dns_health.json accordingly.",
+  "plan": "1) Run delv help to confirm correct option for loading a DNSKEY key file (likely -k). 2) Use the actual KSK public key file (/app/dns/primary/keys/Ksecure.example.com.+013+*.key) directly with delv (either -k or -a depending on support). 3) If delv requires a config file, generate a trust-anchors block in the exact format delv accepts (not trusted-keys), using the complete DNSKEY from the .key file. 4) Re-run delv and confirm it reports 'fully validated'. 5) Update /app/dns_health.json to set dnssec_valid true and ensure the JSON has no embedded newlines in string values (currently one issues_fixed value wrapped).",
+  "commands": [
+    {
+      "keystrokes": "delv -h 2>&1 | sed -n '1,120p'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "KSKFILE=$(ls -1 /app/dns/primary/keys/Ksecure.example.com.+013+*.key | head -n1); echo \"KSKFILE=$KSKFILE\"; cat \"$KSKFILE\"\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "delv @127.0.0.1 -p 5301 secure.example.com A -k \"$KSKFILE\" || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "DNSKEY_LINE=$(awk '!/^;/{print; exit}' \"$KSKFILE\"); echo \"$DNSKEY_LINE\"\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport subprocess,glob\nksk=glob.glob('/app/dns/primary/keys/Ksecure.example.com.+013+*.key')[0]\ndnskey=open(ksk).read().splitlines()\ndnskey=[l for l in dnskey if l and not l.startswith(';')][0]\n# Build a trust-anchors config delv may accept\nparts=dnskey.split()\nname=parts[0]\nflags=parts[4]; proto=parts[5]; alg=parts[6]\n# public key may be split across multiple fields; join the remainder\npub=''.join(parts[7:])\nconf=f'''trust-anchors {{\n    \"{name}\" initial-key {flags} {proto} {alg} \"{pub}\";\n}};\n'''\nopen('/tmp/delv-anchors.conf','w').write(conf)\nprint(conf)\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "delv @127.0.0.1 -p 5301 secure.example.com A -a /tmp/delv-anchors.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport json,subprocess\np=subprocess.run('delv @127.0.0.1 -p 5301 secure.example.com A -a /tmp/delv-anchors.conf',shell=True,text=True,capture_output=True)\ndnssec_valid=('fully validated' in (p.stdout+p.stderr))\n# Load existing report and update dnssec_valid and fix any wrapped strings\nreport=json.load(open('/app/dns_health.json'))\nreport['dnssec_valid']=dnssec_valid\n# normalize any accidental newlines in issues_fixed values\nreport['issues_fixed']={k:v.replace('\\n',' ') for k,v in report['issues_fixed'].items()}\nopen('/app/dns_health.json','w').write(json.dumps(report,indent=4))\nprint('dnssec_valid=',dnssec_valid)\nprint(p.stdout)\nprint(p.stderr)\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "cat /app/dns_health.json\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

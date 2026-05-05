@@ -1,0 +1,72 @@
+New Terminal Output:
+
+root@71a978a6c362:/app# sed -n '260,520p' /app/app/indexer.py
+
+    # Deterministic insertion order by normalized path.
+    items: List[Tuple[str, str]] = sorted(((nfc_path, abs_path) for nfc_path, (_orig, abs_path) in winners.items()), key=lambda t: t[0])
+
+    # Concurrency strategy:
+    # Use an external lock file to serialize writers replacing the db.
+    # Build a temp DB and atomically replace db_path.
+    lock_path = db_path_abs + ".lock"
+
+    # fcntl is POSIX-only but tests run on Linux.
+    import fcntl  # type: ignore
+
+    with open(lock_path, "a+b") as lockf:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+
+        # Create temp DB in same directory for atomic replace.
+        tmp_dir = os.path.dirname(db_path_abs) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(db_path_abs) + ".tmp.", dir=tmp_dir)
+        os.close(fd)
+
+        try:
+            conn = sqlite3.connect(tmp_path, timeout=30.0, isolation_level=None)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=FULL;")
+                conn.execute("PRAGMA foreign_keys=OFF;")
+                conn.execute("PRAGMA busy_timeout=30000;")
+
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS files ("
+                    "path TEXT PRIMARY KEY, "
+                    "sha256 TEXT NOT NULL, "
+                    "size INTEGER NOT NULL"
+                    ");"
+                )
+
+                conn.execute("BEGIN;")
+                try:
+                    for rel_nfc, abs_path in items:
+                        sha, size = _sha256_file(abs_path)
+                        # sha is already lowercase hex.
+                        conn.execute(
+                            "INSERT OR REPLACE INTO files(path, sha256, size) VALUES (?, ?, ?);",
+                            (rel_nfc, sha, int(size)),
+                        )
+                    conn.execute("COMMIT;")
+                except Exception:
+                    conn.execute("ROLLBACK;")
+                    raise
+
+                # Sanity/integrity check of the temp DB before replacing.
+                row = conn.execute("PRAGMA integrity_check;").fetchone()
+                if not row or row[0] != "ok":
+                    raise RuntimeError(f"sqlite integrity_check failed: {row}")
+            finally:
+                conn.close()
+
+            os.replace(tmp_path, db_path_abs)
+
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+root@71a978a6c362:/app#

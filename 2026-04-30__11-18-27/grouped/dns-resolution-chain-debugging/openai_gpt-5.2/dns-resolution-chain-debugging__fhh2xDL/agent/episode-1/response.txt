@@ -1,0 +1,159 @@
+{
+  "analysis": "Multiple fatal issues prevent services from starting and zones from loading: (1) All three configs use directory \"/var/cache/bind\" which is not writable in this environment, causing named to exit. (2) Primary TSIG secret is invalid base64, so named-checkconf fails. (3) Secondary named.conf has a syntax error near a ';' (the comment line starting with '; BUG:' is not valid where it is placed / or another parse issue). (4) Resolver named.conf has a syntax error: '}' expected near ';' (likely a stray semicolon after a block). (5) The signed secure zone file is badly corrupted/expired signatures and base64 errors; it cannot be served as-is. (6) example.com zone loads but has delegation glue warnings (not fatal). We need to fix configs to start, fix TSIG to match and be valid, and re-sign or replace the broken signed zone so DNSSEC can validate.",
+  "plan": "1) Make writable runtime dirs under /app/dns/* for each instance (cache, run, log) and update named.conf options directory/pid-file/log paths accordingly. 2) Fix TSIG key handling: generate a valid base64 secret and set it identically on primary and secondary (or include the existing key files if present). 3) Fix secondary and resolver syntax errors. 4) Fix secure.example.com serving: regenerate DNSSEC keys and produce a fresh signed zone file, then configure primary to serve the new signed file. 5) Re-run named-checkconf and named-checkzone, restart all named instances, then test AXFR and run all queries from /app/test_queries.txt through resolver. Later we will generate /app/dns_health.json once everything passes.",
+  "commands": [
+    {
+      "keystrokes": "mkdir -p /app/dns/primary/{cache,run,log} /app/dns/secondary/{cache,run,log} /app/dns/resolver/{cache,run,log}\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/primary/cache\";#' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#pid-file \"/var/run/named/named-primary.pid\";#pid-file \"/app/dns/primary/run/named.pid\";#' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#file \"/var/log/named/named-primary.log\"#file \"/app/dns/primary/log/named.log\"#' /app/dns/primary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/secondary/cache\";#' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#pid-file \"/var/run/named/named-secondary.pid\";#pid-file \"/app/dns/secondary/run/named.pid\";#' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#file \"/var/log/named/named-secondary.log\"#file \"/app/dns/secondary/log/named.log\"#' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#directory \"/var/cache/bind\";#directory \"/app/dns/resolver/cache\";#' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#pid-file \"/var/run/named/named-resolver.pid\";#pid-file \"/app/dns/resolver/run/named.pid\";#' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's#file \"/var/log/named/named-resolver.log\"#file \"/app/dns/resolver/log/named.log\"#' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n 'BUG' -n /app/dns/secondary/named.conf || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i '/^; BUG:/d' /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "nl -ba /app/dns/resolver/named.conf | sed -n '1,120p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport re\np='/app/dns/resolver/named.conf'\ntext=open(p).read().splitlines(True)\n# remove a stray semicolon after forwarders block if present: '};' after 'forwarders { ... };'\nout=[]\nfor line in text:\n    if re.match(r'^\\s*forwarders\\s*\\{', line):\n        out.append(line); continue\n    out.append(line)\nopen(p,'w').write(''.join(out))\nPY\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "sed -i 's/^\\s*forwarders\\s*{\\s*$/forwarders {/' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "sed -i 's/^\\s*}\\s*;\\s*$/};/' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tsig_secret=$(head -c 32 /dev/urandom | base64); printf '%s\n' \"$tsig_secret\" > /tmp/tsig_secret.txt\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tsig_secret=$(cat /tmp/tsig_secret.txt); sed -i -E \"s#secret \\\"[^\\\"]*\\\";#secret \\\"${tsig_secret}\\\";#\" /app/dns/primary/named.conf /app/dns/secondary/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "cp -a /app/dns/primary/zones/secure.example.com.zone /tmp/secure.example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "rm -f /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && rm -f Ksecure.example.com.* && dnssec-keygen -a ECDSAP256SHA256 -b 256 -n ZONE secure.example.com >/tmp/ksk.txt && dnssec-keygen -a ECDSAP256SHA256 -b 256 -n ZONE -f KSK secure.example.com >>/tmp/ksk.txt\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "cd /app/dns/primary/zones && dnssec-signzone -S -o secure.example.com -N increment -t secure.example.com.zone\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone.signed\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named_primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named_secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named_resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E '(:5300|:5301|:5302)'\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer +comments\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR +time=3 +tries=1\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR +time=3 +tries=1\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=2 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named_primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named_secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named_resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

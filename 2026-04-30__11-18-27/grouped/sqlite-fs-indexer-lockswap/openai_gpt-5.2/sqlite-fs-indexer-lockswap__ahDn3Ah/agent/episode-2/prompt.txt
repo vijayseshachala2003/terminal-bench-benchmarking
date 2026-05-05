@@ -1,0 +1,270 @@
+New Terminal Output:
+
+root@69a1bc92baab:/app# cat > /app/app/indexer.py <<'PY'
+-------- Filesystem walk / hashi> import hashlib
+> import os
+> import re
+> import sqlite3
+> import unicodedata
+> from dataclasses import dataclass
+> from typing import Dict, Iterable, List, Optional, Tuple
+>
+>
+> # --------- Unicode helpers ---------
+>
+ > def _nfc(s: str) -> str:
+>     # Ensure consistent normalization for comparisons and storage.
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> # --------- Ignore patterns ---------
+>
+> @dataclass(frozen=True)
+> class _IgnorePattern:
+>     raw: str            # NFC-normalized, as read (minus trailing newline)
+>     anchored: bool      # starts with '/'
+>     has_slash: bool     # contains '/'
+>     regex: re.Pattern   # compiled matcher for full-string match
+>
+>
+l> def _compile_pattern(pat: str) -> re.Pattern:
+>     """Compile a pattern to a regex that matches an entire string.
+>
+>     Rules:
+>     - '*' matches zero or more characters except '/'
+>     - '**' is NOT special; it means two literal '*' characters.
+>
+ >     Implementation detail: we treat '*' as wildcard only when it is not part
+>     of a consecutive '**' run. Any '*' that is adjacent to another '*' is
+>     treated literally.
+>     """
+>     out = ["^"]
+>     i = 0
+>     n = len(pat)
+>     while i < n:
+>         ch = pat[i]
+>         if ch == "*":
+>             prev_is_star = i > 0 and pat[i - 1] == "*"
+>             next_is_star = i + 1 < n and pat[i + 1] == "*"
+>             if prev_is_star or next_is_star:
+>                 # literal '*'
+>                 out.append(re.escape("*"))
+>                 i += 1
+>             else:
+>                 out.append("[^/]*")
+>                 i += 1
+>         else:
+>             out.append(re.escape(ch))
+>             i += 1
+>     out.append("$")
+>     return re.compile("".join(out))
+>
+)>
+> def _load_ignore_patterns(ignore_file: str = "/data/ignore.txt") -> List[_IgnorePattern]:
+>     pats: List[_IgnorePattern] = []
+>     try:
+>         with open(ignore_file, "r", encoding="utf-8", errors="replace") as f:
+>             for line in f:
+>                 # Strip only newline; keep other whitespace for pattern semantics.
+>                 line = line.rstrip("\n")
+>                 if not line.strip():
+>                     continue
+>                 stripped = line.lstrip()
+>                 if stripped.startswith("#"):
+>                     continue
+>                 pat = _nfc(line)
+>                 anchored = pat.startswith("/")
+>                 if anchored:
+>                     pat2 = pat[1:]
+>                 else:
+>                     pat2 = pat
+>                 # Empty pattern after stripping leading '/' should be ignored.
+>                 if pat2 == "":
+>                     continue
+>                 has_slash = "/" in pat2
+>                 try:
+>                     rgx = _compile_pattern(pat2)
+>                 except re.error:
+>                     # Malformed patterns must not crash; ignore them.
+>                     continue
+>                 pats.append(_IgnorePattern(raw=pat2, anchored=anchored, has_slash=has_slash, regex=rgx))
+>     except FileNotFoundError:
+>         return []
+>     except OSError:
+>         # Treat unreadable ignore file as no patterns.
+>         return []
+>     return pats
+>
+>
+> def _iter_suffixes(rel_path: str) -> Iterable[str]:
+>     # rel_path is expected to use '/' separators.
+>     yield rel_path
+>     for i, ch in enumerate(rel_path):
+>         if ch == "/" and i + 1 < len(rel_path):
+>             yield rel_path[i + 1 :]
+>
+>
+A> def _is_ignored(rel_path_nfc: str, patterns: List[_IgnorePattern]) -> bool:
+>     # rel_path_nfc uses '/' and is NFC-normalized.
+>     if not patterns:
+>         return False
+>
+>     components = rel_path_nfc.split("/") if rel_path_nfc else [""]
+>
+>     for p in patterns:
+>         if p.anchored:
+>             if p.regex.match(rel_path_nfc):
+>                 return True
+>             continue
+>
+>         if not p.has_slash:
+>             # Match against each component.
+>             for comp in components:
+>                 if p.regex.match(comp):
+>                     return True
+>             continue
+>
+>         # Has slash, not anchored: match full rel path or any suffix at boundary.
+>         for suf in _iter_suffixes(rel_path_nfc):
+>             if p.regex.match(suf):
+>                 return True
+>
+>     return False
+>
+>
+> # --------- Filesystem walk / hashing ---------
+>
+> def _hash_file(path: str) -> Tuple[str, int]:
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(path, "rb") as f:
+>         for chunk in iter(lambda: f.read(1024 * 1024), b""):
+>             h.update(chunk)
+>             size += len(chunk)
+>     return h.hexdigest(), size
+>
+>
+> def _walk_files(root_dir: str, patterns: List[_IgnorePattern]) -> Dict[str, Tuple[str, str, int]]:
+>     """Return mapping: nfc_rel_path -> (orig_rel_path, sha256, size).
+>
+>     Collision rule: if multiple orig paths normalize to same nfc path,
+>     keep the one with lexicographically largest orig_rel_path.
+>     """
+>     root_dir = os.path.abspath(root_dir)
+>
+>     results: Dict[str, Tuple[str, str, int]] = {}
+>
+>     def rec(abs_dir: str, rel_prefix: str) -> None:
+>         try:
+>             with os.scandir(abs_dir) as it:
+>                 entries = sorted(it, key=lambda e: e.name)
+>         except OSError:
+>             return
+>
+>         for ent in entries:
+>             # Ignore symlinks entirely.
+>             try:
+>                 if ent.is_symlink():
+>                     continue
+>             except OSError:
+>                 continue
+>
+>             name = ent.name
+>             rel = name if not rel_prefix else f"{rel_prefix}/{name}"
+>             rel = rel.replace("\\", "/")
+>
+>             rel_nfc = _nfc(rel)
+>
+>             # Apply ignore rules to both files and directories.
+>             if _is_ignored(rel_nfc, patterns):
+>                 continue
+>
+>             try:
+>                 if ent.is_dir(follow_symlinks=False):
+>                     rec(ent.path, rel)
+>                 elif ent.is_file(follow_symlinks=False):
+>                     sha, size = _hash_file(ent.path)
+>                     prev = results.get(rel_nfc)
+>                     if prev is None or rel > prev[0]:
+>                         results[rel_nfc] = (rel, sha, size)
+>                 else:
+>                     # Ignore non-regular files.
+>                     continue
+>             except OSError:
+>                 continue
+>
+>     rec(root_dir, "")
+>     return results
+>
+>
+> # --------- SQLite writing with concurrency safety ---------
+>
+> def _ensure_parent_dir(path: str) -> None:
+>     parent = os.path.dirname(os.path.abspath(path))
+>     if parent:
+>         os.makedirs(parent, exist_ok=True)
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     patterns = _load_ignore_patterns("/data/ignore.txt")
+>
+>     mapping = _walk_files(root_dir, patterns)
+>
+>     # Deterministic ordering for insertion.
+>     rows = [(p, mapping[p][1], mapping[p][2]) for p in sorted(mapping.keys())]
+>
+>     _ensure_parent_dir(db_path)
+>     db_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+>
+>     # Build in a unique temp file in the same directory for atomic replace.
+>     pid = os.getpid()
+>     tmp_path = os.path.join(db_dir, f".{os.path.basename(db_path)}.tmp.{pid}")
+>
+>     # Best-effort cleanup of our own temp file.
+>     try:
+>         os.unlink(tmp_path)
+>     except FileNotFoundError:
+>         pass
+>     except OSError:
+>         pass
+>
+>     con = sqlite3.connect(tmp_path, timeout=30.0)
+>     try:
+>         cur = con.cursor()
+>         # Pragmas to improve robustness/performance; applied to temp DB.
+>         cur.execute("PRAGMA journal_mode=WAL")
+>         cur.execute("PRAGMA synchronous=NORMAL")
+>         cur.execute("PRAGMA temp_store=MEMORY")
+>
+>         cur.execute("DROP TABLE IF EXISTS files")
+>         cur.execute(
+>             "CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)"
+>         )
+>
+>         cur.execute("BEGIN")
+>         cur.executemany("INSERT INTO files(path, sha256, size) VALUES (?, ?, ?)", rows)
+>         cur.execute("COMMIT")
+>
+>         con.commit()
+>         cur.close()
+>         con.close()
+>
+>         # Atomic swap into place; concurrent writers will race but DB stays valid.
+>         os.replace(tmp_path, db_path)
+>     finally:
+>         try:
+>             con.close()
+>         except Exception:
+>             pass
+>         # If replace failed, remove temp file.
+>         try:
+>             if os.path.exists(tmp_path):
+>                 os.unlink(tmp_path)
+>         except OSError:
+>             pass
+> PY
+root@69a1bc92baab:/app# python -m py_compile /app/app/indexer.py
+root@69a1bc92baab:/app# pytest -q
+bash: pytest: command not found
+root@69a1bc92baab:/app#

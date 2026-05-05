@@ -1,0 +1,205 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@5975737fc753:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+> #include <cstddef>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         std::atomic<uint64_t> value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     // Tagged pointer to solve ABA problem
+>     struct TaggedPtr {
+>         Node* ptr;
+>         uint64_t tag;
+>
+>         TaggedPtr() : ptr(nullptr), tag(0) {}
+>         TaggedPtr(Node* p, uint64_t t) : ptr(p), tag(t) {}
+>
+>         bool operator==(const TaggedPtr& other) const {
+>             return ptr == other.ptr && tag == other.tag;
+>         }
+>         bool operator!=(const TaggedPtr& other) const {
+>             return !(*this == other);
+>         }
+>     };
+>
+>     // We use a struct that can be atomically compared/swapped
+>     // Using __int128 or aligned struct for double-width CAS
+>     struct alignas(16) AtomicTaggedPtr {
+>         Node* ptr;
+>         uint64_t tag;
+>     };
+>
+>     std::atomic<AtomicTaggedPtr> head_;
+>     std::atomic<AtomicTaggedPtr> tail_;
+>
+>     // Retired nodes list for safe memory reclamation
+>     // We simply never reuse nodes to avoid use-after-free
+>     // Nodes are collected and deleted in destructor
+>     struct RetiredNode {
+>         Node* node;
+>         RetiredNode* next;
+>     };
+>     std::atomic<RetiredNode*> retired_list_;
+>
+>     Node* allocate_node(uint64_t value);
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@5975737fc753:/app# cat > /app/lockfree_queue.cpp << 'CPP_EOF'
+> #include "lockfree_queue.h"
+> #include <new>
+> #include <cassert>
+>
+> // Ensure AtomicTaggedPtr is lock-free with 128-bit CAS
+> static_assert(sizeof(LockFreeQueue::AtomicTaggedPtr) == 16,
+>               "AtomicTaggedPtr must be 16 bytes");
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     AtomicTaggedPtr initial{dummy, 0};
+>     head_.store(initial, std::memory_order_relaxed);
+>     tail_.store(initial, std::memory_order_relaxed);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain the queue
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     AtomicTaggedPtr h = head_.load(std::memory_order_relaxed);
+>     delete h.ptr;
+>
+>     // Delete all retired nodes
+>     RetiredNode* r = retired_list_.load(std::memory_order_relaxed);
+>     while (r) {
+>         RetiredNode* next = r->next;
+>         delete r->node;
+>         delete r;
+>         r = next;
+>     }
+> }
+>
+> LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+>     return new Node(value);
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Add to retired list for cleanup in destructor
+>     // We do NOT reuse nodes to prevent use-after-free
+>     RetiredNode* rn = new RetiredNode{node, nullptr};
+>     RetiredNode* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         rn->next = old_head;
+>     } while (!retired_list_.compare_exchange_weak(old_head, rn,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = allocate_node(value);
+>
+>     while (true) {
+>         AtomicTaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail.ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail to check consistency
+>         AtomicTaggedPtr tail2 = tail_.load(std::memory_order_acquire);
+>         if (tail.ptr != tail2.ptr || tail.tag != tail2.tag) {
+>             continue;  // tail changed, retry
+>         }
+>
+>         if (next == nullptr) {
+>             // Try to link new_node at the end
+>             if (tail.ptr->next.compare_exchange_weak(next, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 // Successfully linked. Try to swing tail to new_node.
+>                 AtomicTaggedPtr new_tail{new_node, tail.tag + 1};
+>                 tail_.compare_exchange_strong(tail, new_tail,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             // Tail is behind, try to advance it
+>             AtomicTaggedPtr new_tail{next, tail.tag + 1};
+>             tail_.compare_exchange_strong(tail, new_tail,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         AtomicTaggedPtr head = head_.load(std::memory_order_acquire);
+>         AtomicTaggedPtr tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head.ptr->next.load(std::memory_order_acquire);
+>
+>         // Re-read head to check consistency
+>         AtomicTaggedPtr head2 = head_.load(std::memory_order_acquire);
+>         if (head.ptr != head2.ptr || head.tag != head2.tag) {
+>             continue;  // head changed, retry
+>         }
+>
+>         if (head.ptr == tail.ptr) {
+>             if (next == nullptr) {
+>                 return false;  // Queue is empty
+>             }
+>             // Tail is behind, advance it
+>             AtomicTaggedPtr new_tail{next, tail.tag + 1};
+>             tail_.compare_exchange_strong(tail, new_tail,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             // Read the value before CAS, because after CAS
+>             // another thread could free next
+>             uint64_t val = next->value.load(std::memory_order_relaxed);
+>             // Try to swing head to next node
+>             AtomicTaggedPtr new_head{next, head.tag + 1};
+>             if (head_.compare_exchange_strong(head, new_head,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 value = val;
+>                 // Retire the old dummy node
+>                 retire_node(head.ptr);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> CPP_EOF
+root@5975737fc753:/app# make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+lockfree_queue.cpp:6:37: error: 'AtomicTaggedPtr' is a private member of 'LockFreeQueue'
+static_assert(sizeof(LockFreeQueue::AtomicTaggedPtr) == 16,
+                                    ^
+./lockfree_queue.h:45:24: note: declared private here
+    struct alignas(16) AtomicTaggedPtr {
+                       ^
+1 error generated.
+make: *** [Makefile:13: stress_test] Error 1
+root@5975737fc753:/app#

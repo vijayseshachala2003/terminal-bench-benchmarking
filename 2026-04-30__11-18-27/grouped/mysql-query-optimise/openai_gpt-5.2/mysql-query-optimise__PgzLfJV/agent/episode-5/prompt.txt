@@ -1,0 +1,202 @@
+New Terminal Output:
+
+root@d7bbc4eb0ea3:/app# nl -ba /app/optimize.py | sed -n '280,380p'
+   280      for t, cols in table_indexable_cols.items():
+   281          cols = sorted([c for c in cols if c in meta['tables'][t]['columns']])
+   282          if len(cols) >= 2:
+   283              # selectivity mean
+   284              sels = [selectivity(meta, t, c) for c in cols]
+   285              sel_mean = sum(sels) / len(sels) if sels else 0.0
+   286              sel_mean2 = r2(sel_mean)
+   287              # pattern with largest total_time for this table
+   288              p = table_pattern_best[t]
+   289              impact = p['frequency'] * p['_avg_raw'] * max(sel_mean, 0.1)
+   290              composite_candidates.append({
+   291                  'table': t,
+   292                  'columns': cols,
+   293                  'impact_score': r1(impact),
+   294                  'selectivity': sel_mean2,
+   295                  'cost': index_cost_composite(meta, t, cols),
+   296              })
+   297
+   298      index_candidates.extend(composite_candidates)
+   299
+   300      # Sort index_candidates
+   301      def cand_key(c):
+   302          return (-c['impact_score'], c['table'] + '(' + ','.join(c['columns']) + ')')
+   303      index_candidates.sort(key=cand_key)
+   304
+   305      # Temporal correlations (60s window)
+   306      # Build list of (ts, pattern)
+   307      events = []
+   308      for p in patterns:
+   309          for e in p['_entries']:
+   310              events.append((e['timestamp'], p['pattern']))
+   311      events.sort()
+   312
+   313      # Window buckets by floor(ts/60)
+   314      buckets = defaultdict(list)
+   315      for ts, pat in events:
+   316          buckets[ts // 60].append((ts, pat))
+   317
+   318      pair_counts = defaultdict(int)
+   319      pair_deltas = defaultdict(list)
+   320
+   321      for _b, evs in buckets.items():
+   322          # group by pattern timestamps
+   323          by_pat = defaultdict(list)
+   324          for ts, pat in evs:
+   325              by_pat[pat].append(ts)
+   326          pats = sorted(by_pat.keys())
+   327          for p1, p2 in combinations(pats, 2):
+   328              # count co-occurrence once per bucket if both present
+   329              pair_counts[(p1, p2)] += 1
+   330              # avg_time_delta: use minimal absolute delta between any occurrences in this bucket
+   331              deltas = []
+   332              for t1 in by_pat[p1]:
+   333                  for t2 in by_pat[p2]:
+   334                      deltas.append(abs(t1 - t2))
+   335              if deltas:
+   336                  pair_deltas[(p1, p2)].append(min(deltas))
+   337
+   338      correlations = []
+   339      for (p1, p2), cnt in pair_counts.items():
+   340          if cnt >= 3:
+   341              ds = pair_deltas.get((p1, p2), [])
+   342              avgd = sum(ds) / len(ds) if ds else 0.0
+   343              correlations.append({
+   344                  'pattern1': p1,
+   345                  'pattern2': p2,
+   346                  'correlation_strength': int(cnt),
+   347                  'avg_time_delta': r1(avgd),
+   348              })
+   349
+   350      correlations.sort(key=lambda d: (-d['correlation_strength'], d['pattern1'], d['pattern2']))
+   351      top_corr = correlations[:3]
+   352
+   353      # Recommendations: greedy by impact_score, constraints
+   354      recommended = []
+   355      used_budget = 0.0
+   356      per_table = defaultdict(int)
+   357
+   358      for c in index_candidates:
+   359          if len(recommended) >= 5:
+   360              break
+   361          if per_table[c['table']] >= 2:
+   362              continue
+   363          if used_budget + c['cost'] > budget + 1e-9:
+   364              continue
+   365          recommended.append({
+   366              **c,
+   367              'reason': 'high_impact'
+   368          })
+   369          used_budget = r1(used_budget + c['cost'])
+   370          per_table[c['table']] += 1
+   371
+   372      total_impact = r1(sum(x['impact_score'] for x in recommended))
+   373
+   374      # Text report: compute per-pattern Impact for display using S_max among indexable columns
+   375      pattern_display = []
+   376      for p in patterns:
+   377          cols_by_table = indexable_columns(p['pattern'])
+   378          smax = 0.0
+   379          for t, cols in cols_by_table.items():
+   380              tl = t.lower()
+root@d7bbc4eb0ea3:/app# python3 - <<'PY'
+> import io
+> path='/app/optimize.py'
+> text=open(path,'r',encoding='utf-8').read().splitlines(True)
+> start=None; end=None
+> for i,ln in enumerate(text):
+>     if start is None and ln.strip()=='# Temporal correlations (60s window)':
+>         start=i
+>     if start is not None and end is None and ln.strip()=='# Recommendations: greedy by impact_score, constraints':
+>         end=i
+>         break
+> if start is None or end is None or end<=start:
+>     raise SystemExit(f'Could not find block: start={start} end={end}')
+> indent=re.match(r'^(\s
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+t + '    for e in p[\'_entries\']:\n')
+> new_block.append(indent + '        events.append((e[\'timestamp\'], p[\'pattern\']))\n')
+> new_block.append(indent + 'events.sort()\n\n')
+> new_block.append(indent + 'pair_counts = defaultdict(int)\n')
+> new_block.append(indent + 'pair_deltas = defaultdict(list)\n\n')
+> new_block.append(indent + 'n = len(events)\n')
+> new_block.append(indent + 'for i in range(n):\n')
+> new_block.append(indent + '    t1, pat1 = events[i]\n')
+> new_block.append(indent + '    j = i + 1\n')
+> new_block.append(indent + '    while j < n and events[j][0] - t1 <= 60:\n')
+> new_block.append(indent + '        t2, pat2 = events[j]\n')
+> new_block.append(indent + '        if pat1 != pat2:\n')
+> new_block.append(indent + '            a, b = (pat1, pat2) if pat1 < pat2 else (pat2, pat1)\n')
+> new_block.append(indent + '            pair_counts[(a, b)] += 1\n')
+> new_block.append(indent + '            pair_deltas[(a, b)].append(abs(t2 - t1))\n')
+> new_block.append(indent + '        j += 1\n\n')
+> new_block.append(indent + 'correlations = []\n')
+> new_block.append(indent + 'for (p1, p2), cnt in pair_counts.items():\n')
+> new_block.append(indent + '    if cnt >= 3:\n')
+> new_block.append(indent + '        ds = pair_deltas.get((p1, p2), [])\n')
+> new_block.append(indent + '        avgd = sum(ds) / len(ds) if ds else 0.0\n')
+> new_block.append(indent + '        correlations.append({\n')
+> new_block.append(indent + '            \"pattern1\": p1,\n')
+> new_block.append(indent + '            \"pattern2\": p2,\n')
+> new_block.append(indent + '            \"correlation_strength\": int(cnt),\n')
+> new_block.append(indent + '            \"avg_time_delta\": r1(avgd),\n')
+> new_block.append(indent + '        })\n\n')
+> new_block.append(indent + 'correlations.sort(key=lambda d: (-d[\"correlation_strength\"], d[\"pattern1\"], d[\"pattern2\"]))\n')
+> new_block.append(indent + 'top_corr = correlations[:3]\n\n')
+> out = text[:start] + new_block + text[end:]
+> open(path,'w',encoding='utf-8').write(''.join(out))
+> print('Rewrote temporal correlation block:', start+1, 'to', end)
+> PY
+Traceback (most recent call last):
+  File "<stdin>", line 13, in <module>
+NameError: name 're' is not defined. Did you forget to import 're'?
+root@d7bbc4eb0ea3:/app# python3 /app/optimize.py
+root@d7bbc4eb0ea3:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('corr',d['temporal_correlations'])"
+corr [{'pattern1': 'SELECT * FROM ORDERS WHERE ID = ?', 'pattern2': 'SELECT * FROM ORDERS WHERE STATUS IN (?)', 'correlation_strength': 5, 'avg_time_delta': 20.
+4}, {'pattern1': 'SELECT * FROM USERS WHERE ID = ?', 'pattern2': 'SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?', 'correlation_strength': 5, 'avg_time_de
+lta': 33.0}, {'pattern1': 'SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID', 'pattern2': 'SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREATED_AT'
+, 'correlation_strength': 4, 'avg_time_delta': 10.3}]
+root@d7bbc4eb0ea3:/app# python3 -c "import json;from collections import Counter;d=json.load(open('/app/optimization.json'));print('budget',d['total_budget_used'
+],'reco',len(d['recommended_indexes']),'per_table',Counter([r['table'] for r in d['recommended_indexes']]))"
+budget 973.9 reco 5 per_table Counter({'users': 2, 'orders': 2, 'products': 1})
+root@d7bbc4eb0ea3:/app# sed -n '1,120p' /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 973.9 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 59.7, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.2, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.4, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 5):
+   - SELECT * FROM ORDERS WHERE ID = ?
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+2. Pattern Pair (Strength: 5):
+   - SELECT * FROM USERS WHERE ID = ?
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+3. Pattern Pair (Strength: 4):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE TOTAL_AMOUNT > ? ORDER BY CREA...
+
+RECOMMENDED INDEXES (5 max):
+1. users(email) - Impact: 59.7, Cost: 214.9 [high_impact]
+2. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+3. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+4. users(id) - Impact: 29.1, Cost: 214.6 [high_impact]
+5. orders(status) - Impact: 4.7, Cost: 122.0 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 182.5
+- Remaining budget: 26.1 points
+- Tables optimized: 3
+root@d7bbc4eb0ea3:/app#

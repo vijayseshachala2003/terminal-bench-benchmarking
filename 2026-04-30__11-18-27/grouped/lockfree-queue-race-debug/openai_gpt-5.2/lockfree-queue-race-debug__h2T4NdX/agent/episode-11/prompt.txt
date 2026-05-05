@@ -1,0 +1,229 @@
+New Terminal Output:
+
+root@0f3eca341fe0:/app# nl -ba stress_test.cpp | sed -n '1,220p'
+     1  #include "lockfree_queue.h"
+     2  #include <thread>
+     3  #include <vector>
+     4  #include <atomic>
+     5  #include <iostream>
+     6  #include <chrono>
+     7  #include <unordered_set>
+     8  #include <mutex>
+     9  #include <cassert>
+    10  #include <csignal>
+    11  #include <cstdlib>
+    12
+    13  constexpr int NUM_PRODUCERS = 4;
+    14  constexpr int NUM_CONSUMERS = 4;
+    15  constexpr int OPS_PER_THREAD = 1250000;  // 10M total (4 producers * 1.25M each)
+    16  constexpr uint64_t SENTINEL = UINT64_MAX;
+    17  constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+    18
+    19  std::atomic<bool> start_flag{false};
+    20  std::atomic<int> producers_done{0};
+    21  std::atomic<uint64_t> total_enqueued{0};
+    22  std::atomic<uint64_t> total_dequeued{0};
+    23  std::atomic<bool> timed_out{false};
+    24
+    25  std::mutex dequeued_mutex;
+    26  std::vector<uint64_t> all_dequeued;
+    27
+    28  void producer(LockFreeQueue& queue, int id) {
+    29      while (!start_flag.load(std::memory_order_acquire)) {
+    30          std::this_thread::yield();
+    31      }
+    32
+    33      uint64_t base = static_cast<uint64_t>(id) * OPS_PER_THREAD;
+    34
+    35      for (int i = 0; i < OPS_PER_THREAD; ++i) {
+    36          uint64_t value = base + i + 1;  // +1 to avoid 0 values
+    37          queue.enqueue(value);
+    38          total_enqueued.fetch_add(1, std::memory_order_relaxed);
+    39      }
+    40
+    41      producers_done.fetch_add(1, std::memory_order_release);
+    42  }
+    43
+    44  void consumer(LockFreeQueue& queue, std::vector<uint64_t>& local_dequeued) {
+    45      while (!start_flag.load(std::memory_order_acquire)) {
+    46          std::this_thread::yield();
+    47      }
+    48
+    49      int empty_spins = 0;
+    50      const int MAX_EMPTY_SPINS = 100000;
+    51
+    52      while (!timed_out.load(std::memory_order_relaxed)) {
+    53          uint64_t value;
+    54          if (queue.dequeue(value)) {
+    55              local_dequeued.push_back(value);
+    56              total_dequeued.fetch_add(1, std::memory_order_relaxed);
+    57              empty_spins = 0;
+    58          } else {
+    59              if (producers_done.load(std::memory_order_acquire) == NUM_PRODUCERS) {
+    60                  empty_spins++;
+    61                  if (empty_spins > MAX_EMPTY_SPINS) {
+    62                      break;
+    63                  }
+    64              }
+    65              std::this_thread::yield();
+    66          }
+    67      }
+    68  }
+    69
+    70  int main() {
+    71      std::cout << "=== Lock-Free Queue Stress Test ===" << std::endl;
+    72      std::cout << "Producers: " << NUM_PRODUCERS << std::endl;
+    73      std::cout << "Consumers: " << NUM_CONSUMERS << std::endl;
+    74      std::cout << "Operations per producer: " << OPS_PER_THREAD << std::endl;
+    75      std::cout << "Total operations: " << (NUM_PRODUCERS * OPS_PER_THREAD) << std::endl;
+    76      std::cout << std::endl;
+    77
+    78      LockFreeQueue queue;
+    79
+    80      std::vector<std::thread> producer_threads;
+    81      std::vector<std::thread> consumer_threads;
+    82      std::vector<std::vector<uint64_t>> consumer_results(NUM_CONSUMERS);
+    83
+    84      // Start consumer threads
+    85      for (int i = 0; i < NUM_CONSUMERS; ++i) {
+    86          consumer_threads.emplace_back(consumer, std::ref(queue), std::ref(consumer_results[i]));
+    87      }
+    88
+    89      // Start producer threads
+    90      for (int i = 0; i < NUM_PRODUCERS; ++i) {
+    91          producer_threads.emplace_back(producer, std::ref(queue), i);
+    92      }
+    93
+    94      auto start_time = std::chrono::high_resolution_clock::now();
+    95
+    96      // Watchdog thread: abort if we exceed wall-clock timeout
+    97      std::thread watchdog([&start_time]() {
+    98          while (true) {
+    99              std::this_thread::sleep_for(std::chrono::seconds(1));
+   100              auto now = std::chrono::high_resolution_clock::now();
+   101              auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+   102              if (elapsed >= WALL_CLOCK_TIMEOUT_SEC) {
+   103                  std::cerr << "TIMEOUT: stress test exceeded " << WALL_CLOCK_TIMEOUT_SEC
+   104                            << "s wall clock limit" << std::endl;
+   105                  timed_out.store(true, std::memory_order_relaxed);
+   106                  std::this_thread::sleep_for(std::chrono::seconds(2));
+   107                  std::cerr << "STRESS TEST FAILED" << std::endl;
+   108                  std::cerr << "  - Wall clock timeout after " << elapsed << "s" << std::endl;
+   109                  _exit(1);
+   110              }
+   111          }
+   112      });
+   113      watchdog.detach();
+   114
+   115      // Release all threads
+   116      start_flag.store(true, std::memory_order_release);
+   117
+   118      // Wait for producers
+   119      for (auto& t : producer_threads) {
+   120          t.join();
+   121      }
+   122
+   123      std::cout << "All producers finished" << std::endl;
+   124
+   125      // Wait for consumers
+   126      for (auto& t : consumer_threads) {
+   127          t.join();
+   128      }
+   129
+   130      auto end_time = std::chrono::high_resolution_clock::now();
+   131      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+   132
+   133      std::cout << "All consumers finished" << std::endl;
+   134      std::cout << "Duration: " << duration.count() << " ms" << std::endl;
+   135      std::cout << std::endl;
+   136
+   137      // Collect all dequeued values
+   138      for (const auto& results : consumer_results) {
+   139          all_dequeued.insert(all_dequeued.end(), results.begin(), results.end());
+   140      }
+   141
+   142      // Verify results
+   143      uint64_t expected_count = static_cast<uint64_t>(NUM_PRODUCERS) * OPS_PER_THREAD;
+   144
+   145      std::cout << "=== Results ===" << std::endl;
+   146      std::cout << "Expected: " << expected_count << std::endl;
+   147      std::cout << "Enqueued: " << total_enqueued.load() << std::endl;
+   148      std::cout << "Dequeued: " << all_dequeued.size() << std::endl;
+   149
+   150      // Check for duplicates and missing values
+   151      std::unordered_set<uint64_t> seen;
+   152      uint64_t duplicates = 0;
+   153      uint64_t invalid_values = 0;
+   154
+   155      for (uint64_t val : all_dequeued) {
+   156          if (val == 0 || val == SENTINEL) {
+   157              invalid_values++;
+   158              continue;
+   159          }
+   160          if (seen.count(val)) {
+   161              duplicates++;
+   162          } else {
+   163              seen.insert(val);
+   164          }
+   165      }
+   166
+   167      // Check for missing values
+   168      uint64_t missing = 0;
+   169      for (int producer_id = 0; producer_id < NUM_PRODUCERS; ++producer_id) {
+   170          uint64_t base = static_cast<uint64_t>(producer_id) * OPS_PER_THREAD;
+   171          for (int i = 0; i < OPS_PER_THREAD; ++i) {
+   172              uint64_t expected_val = base + i + 1;
+   173              if (seen.count(expected_val) == 0) {
+   174                  missing++;
+   175              }
+   176          }
+   177      }
+   178
+   179      std::cout << "Unique values: " << seen.size() << std::endl;
+   180      std::cout << "Duplicates: " << duplicates << std::endl;
+   181      std::cout << "Missing: " << missing << std::endl;
+   182      std::cout << "Invalid: " << invalid_values << std::endl;
+   183      std::cout << std::endl;
+   184
+   185      bool passed = (all_dequeued.size() == expected_count) &&
+   186                    (duplicates == 0) &&
+   187                    (missing == 0) &&
+   188                    (invalid_values == 0);
+   189
+   190      if (passed) {
+   191          std::cout << "STRESS TEST PASSED" << std::endl;
+   192          return 0;
+   193      } else {
+   194          std::cout << "STRESS TEST FAILED" << std::endl;
+   195          if (all_dequeued.size() != expected_count) {
+   196              std::cout << "  - Count mismatch: got " << all_dequeued.size()
+   197                        << ", expected " << expected_count << std::endl;
+   198          }
+   199          if (duplicates > 0) {
+   200              std::cout << "  - Found " << duplicates << " duplicate values" << std::endl;
+   201          }
+   202          if (missing > 0) {
+   203              std::cout << "  - Found " << missing << " missing values" << std::endl;
+   204          }
+   205          if (invalid_values > 0) {
+   206              std::cout << "  - Found " << invalid_values << " invalid values" << std::endl;
+   207          }
+   208          return 1;
+   209      }
+   210  }
+root@0f3eca341fe0:/app# nl -ba stress_test.cpp | sed -n '220,520p'
+root@0f3eca341fe0:/app# grep -n "TIMEOUT\|ThreadSanitizer" -n stress_test.cpp
+17:constexpr int WALL_CLOCK_TIMEOUT_SEC = 120;
+102:            if (elapsed >= WALL_CLOCK_TIMEOUT_SEC) {
+103:                std::cerr << "TIMEOUT: stress test exceeded " << WALL_CLOCK_TIMEOUT_SEC
+root@0f3eca341fe0:/app# python3 - <<'PY'
+> import json
+> p='/app/analysis.json'
+> try:
+>     json.load(open(p))
+>     print('analysis.json parse OK')
+> except Exception as e:
+>     print('analysis.json parse FAIL:', e)
+> PY
+analysis.json parse OK
+root@0f3eca341fe0:/app#

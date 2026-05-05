@@ -1,0 +1,252 @@
+New Terminal Output:
+
+root@e95b0e5c4f0e:/app# cat <<'EOF' > /app/analyze.py
+> import json
+> import re
+> import math
+> from collections import defaultdict
+> from datetime import datetime
+> import glob
+>
+> # Load metadata
+> with open('/app/query_metadata.json', 'r') as f:
+>     metadata = json.load(f)
+> budget = metadata['budget']
+> tables = metadata['tables']
+>
+> # Collect all log files
+> log_files = glob.glob('/app/mysql_slow_*.log')
+>
+> # Parse slow logs
+> def parse_logs():
+>     entries = []
+>     for log_file in log_files:
+>         with open(log_file, 'r') as f:
+>             lines = f.readlines()
+>         i = 0
+>         while i < len(lines):
+>             if lines[i].startswith('# Time: '):
+>                 ts_str = lines[i].split(' ', 2)[2].strip()
+>                 ts = datetime.fromisoformat(ts_str.replace(' ', 'T')).timestamp()
+>                 i += 1
+>                 if i < len(lines) and lines[i].startswith('# User@Host:'):
+>                     i += 1
+>                 if i < len(lines) and lines[i].startswith('# Query_time: '):
+>                     parts = lines[i].split()
+>                     query_time = float(parts[2])
+>                     i += 1
+>                     while i < len(lines) and lines[i].startswith('# '):
+>                         i += 1
+>                     query = ''
+>                     while i < len(lines) and not lines[i].strip().startswith('#') and lines[i].strip():
+>                         query += lines[i]
+>                         i += 1
+>                     query = query.strip()
+>                     if query and query_time > 1.0:
+>                         entries.append({'ts': ts, 'query_time': query_time, 'query': query})
+>             else:
+>                 i += 1
+>     return entries
+>
+> slow_entries = parse_logs()
+>
+> # Normalize query
+> def normalize_query(q):
+>     q = q.upper()
+>     q = re.sub(r'\b\d+\b', '?', q)
+>     q = re.sub(r"'[^']*'", '?', q)
+>     q = re.sub(r'IN\s*\([^)]+\)', 'IN (?)', q)
+>     return q.strip()
+>
+> # Group patterns
+> pattern_stats = defaultdict(lambda: {'count': 0, 'total_time': 0.0, 'queries': []})
+> for e in slow_entries:
+>     p = normalize_query(e['query'])
+>     pattern_stats[p]['count'] += 1
+>     pattern_stats[p]['total_time'] += e['query_time']
+>     pattern_stats[p]['queries'].append(e)
+>
+> normalized_patterns = []
+> for p, d in pattern_stats.items():
+>     freq = d['count']
+>     avg = d['total_time'] / freq if freq > 0 else 0
+>     total = d['total_time']
+>     normalized_patterns.append({
+>         'pattern': p,
+>         'frequency': freq,
+>         'avg_execution_time': round(avg, 1),
+>         'total_time': round(total, 1)
+>     })
+> normalized_patterns.sort(key=lambda x: (-x['total_time'], x['pattern']))
+>
+> # Extract indexables
+> def extract_indexables(q):
+>     indexables = defaultdict(set)
+>     tables_in_q = set(re.findall(r'\bFROM\s+(\w+)', q) + re.findall(r'\bJOIN\s+(\w+)', q))
+>     # WHERE
+>     where_match = re.search(r'WHERE\s+(.*?)(?:\s+(?:GROUP|ORDER|LIMIT)|$)', q, re.DOTALL)
+>     if where_match:
+>         where = where_match.group(1)
+>         cols = re.findall(r'(\w+)\s*[=<>!]+\s*\?', where) + re.findall(r'(\w+)\s+IN\s+\(\?\)', where)
+>         for col in cols:
+>             for t in tables_in_q:
+>                 if t in tables and col in tables[t]['columns']:
+>                     indexables[t].add(col)
+>     # ORDER BY
+>     order_match = re.search(r'ORDER BY\s+(.*?)(?:\s+(?:LIMIT)|$)', q, re.DOTALL)
+>     if order_match:
+>         order = order_match.group(1)
+>         cols = re.findall(r'(\w+)', order)
+>         for col in cols:
+>             for t in tables_in_q:
+>                 if t in tables and col in tables[t]['columns']:
+>                     indexables[t].add(col)
+>     # JOIN ON
+>     on_matches = re.findall(r'ON\s+(.*?)(?:\s+(?:WHERE|GROUP|ORDER)|$)', q, re.DOTALL)
+>     for on in on_matches:
+>         pairs = re.findall(r'(\w+)\s*=\s*(\w+)', on)
+>         for c1, c2 in pairs:
+>             for t in tables_in_q:
+>                 if t in tables:
+>                     if c1 in tables[t]['columns']:
+>                         indexables[t].add(c1)
+>                     if c2 in tables[t]['columns']:
+>                         indexables[t].add(c2)
+>     return indexables
+>
+> # Collect candidates
+> candidates = []
+> seen = set()
+> for p, d in pattern_stats.items():
+>     idx = extract_indexables(p)
+>     freq = d['count']
+>     avg = d['total_time'] / freq
+>     for t, cols in idx.items():
+>         if t in tables:
+>             for col in cols:
+>                 if col in tables[t]['columns']:
+>                     sel = tables[t]['columns'][col]['distinct_values'] / tables[t]['total_rows']
+>                     sel = round(sel, 2)
+>                     impact = freq * avg * max(sel, 0.1)
+>                     impact = round(impact, 1)
+>                     key = (t, tuple([col]))
+>                     if key not in seen:
+>                         seen.add(key)
+>                
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+posite_cols))
+>         if key not in seen:
+>             seen.add(key)
+>             candidates.append({
+>                 'table': t,
+>                 'columns': composite_cols,
+>                 'impact_score': impact,
+>                 'selectivity': sel,
+>                 'cost': cost
+>             })
+>
+> # Sort candidates
+> candidates.sort(key=lambda x: (-x['impact_score'], x['table'] + ','.join(x['columns'])))
+>
+> # Temporal correlations
+> correlations = defaultdict(lambda: {'count': 0, 'deltas': []})
+> slow_list = [{'ts': e['ts'], 'pattern': normalize_query(e['query'])} for e in slow_entries]
+> slow_list.sort(key=lambda x: x['ts'])
+> for i in range(len(slow_list)):
+>     for j in range(i + 1, len(slow_list)):
+>         if slow_list[j]['ts'] - slow_list[i]['ts'] > 60:
+>             break
+>         if slow_list[i]['pattern'] != slow_list[j]['pattern']:
+>             key = tuple(sorted([slow_list[i]['pattern'], slow_list[j]['pattern']]))
+>             correlations[key]['count'] += 1
+>             correlations[key]['deltas'].append(slow_list[j]['ts'] - slow_list[i]['ts'])
+>
+> temporal_correlations = []
+> for pair, d in correlations.items():
+>     if d['count'] >= 3:
+>         p1, p2 = pair
+>         avg_delta = sum(d['deltas']) / len(d['deltas']) if d['deltas'] else 0
+>         temporal_correlations.append({
+>             'pattern1': p1,
+>             'pattern2': p2,
+>             'correlation_strength': d['count'],
+>             'avg_time_delta': round(avg_delta, 1)
+>         })
+> temporal_correlations.sort(key=lambda x: (-x['correlation_strength'], x['pattern1'], x['pattern2']))
+>
+> # Recommendations
+> def get_sort_key(cand):
+>     return (-cand['impact_score'], cand['table'] + ','.join(cand['columns']))
+>
+> candidates.sort(key=get_sort_key)
+> recommended = []
+> used_budget = 0.0
+> table_count = defaultdict(int)
+> while candidates and len(recommended) < 5:
+>     cand = candidates.pop(0)
+>     t = cand['table']
+>     if table_count[t] >= 2:
+>         continue
+>     if used_budget + cand['cost'] > budget:
+>         continue
+>     recommended.append({**cand, 'reason': 'high_impact'})
+>     used_budget += cand['cost']
+>     table_count[t] += 1
+>
+> total_impact = sum(c['impact_score'] for c in recommended)
+>
+> # Output JSON
+> with open('/app/optimization.json', 'w') as f:
+>     json.dump({
+>         'normalized_patterns': normalized_patterns,
+>         'index_candidates': candidates,
+>         'temporal_correlations': temporal_correlations[:3],
+>         'recommended_indexes': recommended,
+>         'total_budget_used': round(used_budget, 1),
+>         'total_impact': round(total_impact, 1)
+>     }, f, indent=2)
+>
+> # Output text
+> total_slow = sum(p['frequency'] for p in normalized_patterns)
+> unique_patterns = len(normalized_patterns)
+> budget_used_rounded = round(used_budget, 1)
+> top_patterns = normalized_patterns[:5]
+>
+> with open('/app/recommendations.txt', 'w') as f:
+>     f.write('ADVANCED MYSQL OPTIMIZATION ANALYSIS\n')
+>     f.write('=' * 37 + '\n')
+>     f.write(f'Total Slow Queries: {total_slow}\n')
+>     f.write(f'Unique Query Patterns: {unique_patterns}\n')
+>     f.write(f'Total Budget: {budget} points\n')
+>     f.write(f'Budget Used: {budget_used_rounded} points\n\n')
+>     f.write('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):\n')
+>     for i, p in enumerate(top_patterns, 1):
+>         idx = extract_indexables(p['pattern'])
+>         max_s = 0.1
+>         for t, cols in idx.items():
+>             for col in cols:
+>                 if t in tables and col in tables[t]['columns']:
+>                     s = tables[t]['columns'][col]['distinct_values'] / tables[t]['total_rows']
+>                     max_s = max(max_s, s)
+>         impact = p['frequency'] * p['avg_execution_time'] * max_s
+>         impact = round(impact, 1)
+>         pattern_str = p['pattern']
+>         if len(pattern_str) > 60:
+>             pattern_str = pattern_str[:57] + '...'
+>         f.write(f'{i}. {pattern_str} (Impact: {impact}, Freq: {p["frequency"]}, Avg: {p["avg_execution_time"]}s, Total: {p["total_time"]}s)\n')
+>     f.write('\nTEMPORAL CORRELATIONS:\n')
+>     for i, corr in enumerate(temporal_correlations[:3], 1):
+>         f.write(f'{i}. Pattern Pair (Strength: {corr["correlation_strength"]}):\n')
+>         f.write(f'   - {corr["pattern1"]}\n')
+>         f.write(f'   - {corr["pattern2"]}\n')
+>     f.write('\nRECOMMENDED INDEXES (5 max):\n')
+>     for i, idx in enumerate(recommended, 1):
+>         cols_str = ','.join(idx['columns'])
+>         f.write(f'{i}. {idx["table"]}({cols_str}) - Impact: {idx["impact_score"]}, Cost: {idx["cost"]} [high_impact]\n')
+>     f.write('\nOPTIMIZATION SUMMARY:\n')
+>     f.write(f'- Estimated total impact reduction: {round(total_impact, 1)}\n')
+>     f.write(f'- Remaining budget: {round(budget - used_budget, 1)} points\n')
+>     f.write(f'- Tables optimized: {len(set(c["table"] for c in recommended))}\n')
+> EOF
+root@e95b0e5c4f0e:/app# python3 /app/analyze.py
+root@e95b0e5c4f0e:/app#

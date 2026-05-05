@@ -1,0 +1,79 @@
+{
+  "analysis": "Resolver still SERVFAILs even after attempting to add a trust anchor, so either the trust anchor was not added correctly/parsed, or resolver still cannot validate (e.g., wrong DNSKEY chosen, syntax wrong for trust-anchors static-key, or resolver not restarted/using old config). Also, secondary is not listening on 5302 (connection refused), so zone transfers are not working; we need to start/fix secondary. Next steps: verify resolver named.conf contains trust-anchors block and check resolver log for parsing/validation errors; verify secondary named is running and its log for why it exited; then fix accordingly.",
+  "plan": "1) Check if resolver and secondary processes are running and ports listening. 2) Inspect /app/dns/resolver/named.conf to confirm trust-anchors block correctness and placement. 3) Tail resolver log for errors like 'unknown option trust-anchors' or 'bad key' or validation failures. 4) Inspect secondary log and config; start secondary if not running, fix any errors (directory/pid/session/controls). 5) After secondary is up, re-test AXFR. 6) For DNSSEC validation: if trust-anchors syntax is wrong, switch to 'trusted-keys' syntax (still accepted) or use 'managed-keys' with initial-key. We'll implement a known-working BIND syntax: `trusted-keys { \"secure.example.com\" 257 3 13 \"<base64>\"; };` by extracting the DNSKEY public key field and adding it. Restart resolver and re-test secure.example.com queries.",
+  "commands": [
+    {
+      "keystrokes": "pgrep -a named || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "echo '=== resolver named.conf ==='; nl -ba /app/dns/resolver/named.conf | sed -n '1,220p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "echo '=== resolver log tail ==='; tail -n 250 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "echo '=== secondary log tail ==='; tail -n 250 /tmp/named-secondary.log || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "echo '=== secondary named.conf ==='; nl -ba /app/dns/secondary/named.conf | sed -n '1,220p'\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':5302\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com SOA +norecurse +time=1 +tries=1\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "KSK=$(dig @127.0.0.1 -p 5301 secure.example.com DNSKEY +dnssec +norecurse | awk '/DNSKEY/ && $0 ~ / 257 / && $1 !~ /^;/ {print; exit}'); echo \"$KSK\"\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nimport subprocess,re\nout=subprocess.check_output(['dig','@127.0.0.1','-p','5301','secure.example.com','DNSKEY','+dnssec','+norecurse'],text=True)\nksk=None\nfor line in out.splitlines():\n    if line.strip().startswith(';'): continue\n    if re.search(r'\\sDNSKEY\\s', line) and re.search(r'\\s257\\s', line):\n        ksk=line.strip()\n        break\nif not ksk:\n    raise SystemExit('no ksk')\n# extract fields: name ttl class DNSKEY flags proto alg pubkey\nparts=ksk.split()\nname=parts[0]\nflags=parts[4]\nproto=parts[5]\nalg=parts[6]\npub=parts[7]\nprint(name,flags,proto,alg,pub)\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "python3 - <<'PY'\nfrom pathlib import Path\nimport subprocess,re\nconf=Path('/app/dns/resolver/named.conf')\nbase=conf.read_text().splitlines()\n# remove any prior trust-anchors/trusted-keys blocks\nout=[]\nskip=False\nfor l in base:\n    if re.match(r'^\\s*(trust-anchors|trusted-keys)\\b', l):\n        skip=True\n    if not skip:\n        out.append(l)\n    if skip and l.strip().endswith('};'):\n        skip=False\n# fetch KSK\nans=subprocess.check_output(['dig','@127.0.0.1','-p','5301','secure.example.com','DNSKEY','+dnssec','+norecurse'],text=True)\nksk=None\nfor line in ans.splitlines():\n    if line.strip().startswith(';'): continue\n    if ' DNSKEY ' in line and ' 257 ' in line:\n        ksk=line.strip(); break\nif not ksk:\n    raise SystemExit('No KSK DNSKEY')\nparts=ksk.split()\nname=parts[0].rstrip('.')\nflags=parts[4]; proto=parts[5]; alg=parts[6]; pub=parts[7]\nblock=[f'trusted-keys {{', f'    \"{name}.\" {flags} {proto} {alg} \"{pub}\";', f'}};']\n# insert before controls\nfinal=[]\ninserted=False\nfor l in out:\n    if (not inserted) and l.strip().startswith('controls'):\n        final.extend(block)\n        inserted=True\n    final.append(l)\nif not inserted:\n    final.extend(block)\nconf.write_text('\\n'.join(final)+\"\\n\")\nprint('wrote trusted-keys')\nPY\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill -f 'named -c /app/dns/resolver/named.conf' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

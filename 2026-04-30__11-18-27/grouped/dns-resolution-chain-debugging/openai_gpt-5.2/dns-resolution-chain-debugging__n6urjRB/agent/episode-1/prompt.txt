@@ -1,0 +1,237 @@
+New Terminal Output:
+
+root@719199ef6d7c:/app# ls -R /app/dns
+/app/dns:
+primary  resolver  secondary
+
+/app/dns/primary:
+keys  named.conf  zones
+
+/app/dns/primary/keys:
+transfer.key
+
+/app/dns/primary/zones:
+example.com.zone  secure.example.com.zone  secure.example.com.zone.signed
+
+/app/dns/resolver:
+named.conf
+
+/app/dns/secondary:
+keys  named.conf  zones
+
+/app/dns/secondary/keys:
+transfer.key
+
+/app/dns/secondary/zones:
+root@719199ef6d7c:/app# sed -n '1,200p' /app/dns/primary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5301 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-transfer { key "transfer-key"; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-primary.pid";
+};
+
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "PrimarySecretKey12345678901234567890ABCD==";
+};
+
+zone "example.com" {
+    type master;
+    file "/app/dns/primary/zones/example.com.zone";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+zone "secure.example.com" {
+    type master;
+    file "/app/dns/primary/zones/secure.example.com.zone.signed";
+    allow-transfer { key "transfer-key"; };
+    notify yes;
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-primary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@719199ef6d7c:/app# sed -n '1,200p' /app/dns/secondary/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5302 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    recursion no;
+    dnssec-validation auto;
+    pid-file "/var/run/named/named-secondary.pid";
+};
+
+; BUG: TSIG key has DIFFERENT secret than primary
+key "transfer-key" {
+    algorithm hmac-sha256;
+    secret "SecondaryDifferentKey999888777666555==";
+};
+
+server 127.0.0.1 {
+    keys { transfer-key; };
+};
+
+zone "example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+zone "secure.example.com" {
+    type slave;
+    file "/app/dns/secondary/zones/secure.example.com.zone";
+    masters port 5301 { 127.0.0.1 key transfer-key; };
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-secondary.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@719199ef6d7c:/app# sed -n '1,220p' /app/dns/resolver/named.conf
+options {
+    directory "/var/cache/bind";
+    listen-on port 5300 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    allow-query { any; };
+    allow-recursion { any; };
+    recursion yes;
+    forwarders {
+        127.0.0.1 port 5301;
+    };
+    forward only;
+    dnssec-validation auto;
+    ; BUG: Negative cache TTL way too high
+    max-ncache-ttl 86400;
+    pid-file "/var/run/named/named-resolver.pid";
+};
+
+logging {
+    channel default_log {
+        file "/var/log/named/named-resolver.log" versions 3 size 5m;
+        severity info;
+        print-time yes;
+    };
+    category default { default_log; };
+};
+root@719199ef6d7c:/app# pkill named || true
+root@719199ef6d7c:/app# named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &
+[1] 499
+root@719199ef6d7c:/app# named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &
+[2] 517
+[1]   Exit 1                  named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1
+root@719199ef6d7c:/app# named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &
+[3] 535
+[2]   Exit 1                  named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1
+root@719199ef6d7c:/app# ss -lntup | grep -E ':(5300|5301|5302)\b' || true
+[3]+  Exit 1                  named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1
+root@719199ef6d7c:/app# dig @127.0.0.1 -p 5301 example.com SOA +norec
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+;; communications error to 127.0.0.1#5301: connection refused
+
+; <<>> DiG 9.18.39-0ubuntu0.22.04.3-Ubuntu <<>> @127.0.0.1 -p 5301 example.com SOA +norec
+; (1 server found)
+;; global options: +cmd
+;; no servers could be reached
+root@719199ef6d7c:/app# dig @127.0.0.1 -p 5302 example.com SOA +norec
+;; communications error to 127.0.0.1#5302: connection refused
+;; communications error to 127.0.0.1#5302: connection refused
+;; communications error to 127.0.0.1#5302: connection refused
+
+; <<>> DiG 9.18.39-0ubuntu0.22.04.3-Ubuntu <<>> @127.0.0.1 -p 5302 example.com SOA +norec
+; (1 server found)
+;; global options: +cmd
+;; no servers could be reached
+root@719199ef6d7c:/app# dig @127.0.0.1 -p 5302 example.com AXFR
+;; Connection to 127.0.0.1#5302(127.0.0.1) for example.com failed: connection refused.
+;; no servers could be reached
+;; Connection to 127.0.0.1#5302(127.0.0.1) for example.com failed: connection refused.
+;; no servers could be reached
+;
+[... output limited to 10000 bytes; 71 interior bytes omitted ...]
+inux-gnu' 'CFLAGS=-g -O2 -ffile-prefix-map=/build/bind9-xkiknB/bind9-9.18.39=. -flto=auto -ffat-lto-o
+bjects -flto=auto -ffat-lto-objects -fstack-protector-strong -Wformat -Werror=format-security -fno-strict-aliasing -fno-delete-null-pointer-checks -DNO_VERSION_
+DATE -DDIG_SIGCHASE' 'LDFLAGS=-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -flto=auto -Wl,-z,relro -Wl,-z,now -ledit' 'CPPFLAGS=-Wdate-time -D_FORTIFY_
+SOURCE=2'
+30-Apr-2026 13:55:24.460 running as: named -c /app/dns/resolver/named.conf -g
+30-Apr-2026 13:55:24.460 compiled by GCC 11.4.0
+30-Apr-2026 13:55:24.460 compiled with OpenSSL version: OpenSSL 3.0.2 15 Mar 2022
+30-Apr-2026 13:55:24.460 linked to OpenSSL version: OpenSSL 3.0.2 15 Mar 2022
+30-Apr-2026 13:55:24.460 compiled with libuv version: 1.43.0
+30-Apr-2026 13:55:24.460 linked to libuv version: 1.43.0
+30-Apr-2026 13:55:24.460 compiled with libxml2 version: 2.9.13
+30-Apr-2026 13:55:24.460 linked to libxml2 version: 20913
+30-Apr-2026 13:55:24.460 compiled with json-c version: 0.15
+30-Apr-2026 13:55:24.460 linked to json-c version: 0.15
+30-Apr-2026 13:55:24.460 compiled with zlib version: 1.2.11
+30-Apr-2026 13:55:24.460 linked to zlib version: 1.2.11
+30-Apr-2026 13:55:24.460 ----------------------------------------------------
+30-Apr-2026 13:55:24.460 BIND 9 is maintained by Internet Systems Consortium,
+30-Apr-2026 13:55:24.460 Inc. (ISC), a non-profit 501(c)(3) public-benefit
+30-Apr-2026 13:55:24.460 corporation.  Support and training for BIND 9 are
+30-Apr-2026 13:55:24.460 available at https://www.isc.org/support
+30-Apr-2026 13:55:24.460 ----------------------------------------------------
+30-Apr-2026 13:55:24.460 found 4 CPUs, using 4 worker threads
+30-Apr-2026 13:55:24.460 using 4 UDP listeners per interface
+30-Apr-2026 13:55:24.480 DNSSEC algorithms: RSASHA1 NSEC3RSASHA1 RSASHA256 RSASHA512 ECDSAP256SHA256 ECDSAP384SHA384 ED25519 ED448
+30-Apr-2026 13:55:24.480 DS algorithms: SHA-1 SHA-256 SHA-384
+30-Apr-2026 13:55:24.480 HMAC algorithms: HMAC-MD5 HMAC-SHA1 HMAC-SHA224 HMAC-SHA256 HMAC-SHA384 HMAC-SHA512
+30-Apr-2026 13:55:24.480 TKEY mode 2 support (Diffie-Hellman): yes
+30-Apr-2026 13:55:24.480 TKEY mode 3 support (GSS-API): yes
+30-Apr-2026 13:55:24.480 the initial working directory is '/app'
+30-Apr-2026 13:55:24.480 loading configuration from '/app/dns/resolver/named.conf'
+30-Apr-2026 13:55:24.480 directory '/var/cache/bind' is not writable
+30-Apr-2026 13:55:24.480 /app/dns/resolver/named.conf:2: parsing failed: permission denied
+30-Apr-2026 13:55:24.490 loading configuration: permission denied
+30-Apr-2026 13:55:24.490 exiting (due to fatal error)
+root@719199ef6d7c:/app# named-checkconf /app/dns/primary/named.conf || true
+/app/dns/primary/named.conf:14: bad secret 'bad base64 encoding'
+root@719199ef6d7c:/app# named-checkconf /app/dns/secondary/named.conf || true
+/app/dns/secondary/named.conf:11: syntax error near ';'
+root@719199ef6d7c:/app# named-checkconf /app/dns/resolver/named.conf || true
+/app/dns/resolver/named.conf:13: '}' expected near ';'
+root@719199ef6d7c:/app# named-checkzone example.com /app/dns/primary/zones/example.com.zone || true
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' has no REQUIRED GLUE address records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns1.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' has no REQUIRED GLUE address records (A or AAAA)
+zone example.com/IN: sub.example.com/NS 'ns2.sub.example.com' (out of zone) has no addresses records (A or AAAA)
+zone example.com/IN: loaded serial 2024010101
+OK
+root@719199ef6d7c:/app# named-checkzone secure.example.com /app/dns/primary/zones/secure.example.com.zone || true
+zone secure.example.com/IN: loaded serial 2024010101
+OK
+root@719199ef6d7c:/app# if [ -f /app/dns/primary/zones/secure.example.com.zone.signed ]; then named-checkzone secure.example.com /app/dns/primary/zones/secure.e
+xample.com.zone.signed || true; fi
+/app/dns/primary/zones/secure.example.com.zone.signed:9: signature has expired
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:15: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:19: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:27: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:31: near eol: bad base64 encoding
+dns_rdata_fromtext: /app/dns/primary/zones/secure.example.com.zone.signed:35: near eol: bad base64 encoding
+zone secure.example.com/IN: loading from master file /app/dns/primary/zones/secure.example.com.zone.signed failed: bad base64 encoding
+zone secure.example.com/IN: not loaded due to errors.
+root@719199ef6d7c:/app# cat /app/test_queries.txt
+A example.com
+A www.example.com
+A mail.example.com
+MX example.com
+NS example.com
+A secure.example.com
+A www.secure.example.com
+root@719199ef6d7c:/app#

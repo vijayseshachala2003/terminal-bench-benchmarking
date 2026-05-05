@@ -1,0 +1,59 @@
+{
+  "analysis": "Resolver is starting and listening on 5300, but it fails DNSSEC managed-keys fetching because it was configured as a global forward-only resolver to the authoritative primary (5301), which refuses recursion. Also, BIND attempts to load /etc/bind/rndc.key for the control channel and logs permission denied; safest is to disable controls entirely. Primary/secondary still need to be confirmed running and listening on 5301/5302. Additionally, we should avoid global forwarding and instead forward only the internal zones (example.com and secure.example.com) to the primary, leaving other names unresolved (fine for the provided tests).",
+  "plan": "1) Stop all named instances to apply consistent config changes. 2) Disable the control channel in all three configs (controls { };) to stop attempts to read /etc/bind/rndc.key. 3) Reconfigure the resolver: remove global forwarders/forward-only; add per-zone forwarding stanzas for example.com and secure.example.com to the primary on port 5301. Keep dnssec-validation enabled. 4) Validate configs with named-checkconf. 5) Restart primary, secondary, and resolver; verify ports 5300/5301/5302 are listening. 6) Verify zone transfers (AXFR) from secondary and run all queries in /app/test_queries.txt against the resolver; then check DNSSEC responses for secure.example.com with +dnssec.",
+  "commands": [
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/controls\\s*\\{[^}]*\\};/controls { };/sg' /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat > /app/dns/resolver/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/resolver/cache\";\n    listen-on port 5300 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    allow-recursion { any; };\n    recursion yes;\n    dnssec-validation auto;\n    max-ncache-ttl 300;\n    pid-file \"/app/dns/resolver/cache/named.pid\";\n    session-keyfile \"/app/dns/resolver/cache/session.key\";\n};\n\nzone \"example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\nzone \"secure.example.com\" {\n    type forward;\n    forward only;\n    forwarders { 127.0.0.1 port 5301; };\n};\n\ncontrols { };\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf && named-checkconf /app/dns/secondary/named.conf && named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 60 /tmp/named-primary.log; echo '---'; tail -n 60 /tmp/named-secondary.log; echo '---'; tail -n 80 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read t n; do echo \"## $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 3.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +time=1 +tries=1\n",
+      "duration": 1.0
+    }
+  ],
+  "task_complete": false
+}

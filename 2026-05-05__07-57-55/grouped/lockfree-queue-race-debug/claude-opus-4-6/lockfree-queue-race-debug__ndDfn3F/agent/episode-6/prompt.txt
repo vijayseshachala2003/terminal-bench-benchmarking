@@ -1,0 +1,174 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@b0b4635a84e9:/app# cat > /app/lockfree_queue.h << 'HEADER_EOF'
+> #ifndef LOCKFREE_QUEUE_H
+> #define LOCKFREE_QUEUE_H
+>
+> #include <atomic>
+> #include <cstdint>
+>
+> class LockFreeQueue {
+> public:
+>     LockFreeQueue();
+>     ~LockFreeQueue();
+>
+>     void enqueue(uint64_t value);
+>     bool dequeue(uint64_t& value);
+>
+>     LockFreeQueue(const LockFreeQueue&) = delete;
+>     LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+>
+> private:
+>     struct Node {
+>         std::atomic<uint64_t> value;
+>         std::atomic<Node*> next;
+>         Node() : value(0), next(nullptr) {}
+>         explicit Node(uint64_t val) : value(val), next(nullptr) {}
+>     };
+>
+>     std::atomic<Node*> head_;
+>     std::atomic<Node*> tail_;
+>
+>     // Retired nodes - kept alive to prevent use-after-free,
+>     // cleaned up in destructor
+>     std::atomic<Node*> retired_list_;
+>
+>     void retire_node(Node* node);
+> };
+>
+> #endif
+> HEADER_EOF
+root@b0b4635a84e9:/app# cat > /app/lockfree_queue.cpp << 'IMPL_EOF'
+> #include "lockfree_queue.h"
+ if (next == nullptr) {
+                // Inconsistent read, retry
+                continue;
+            }
+            // Read value before CAS
+            uint64_t result = next->value.load(std::memory_order_acquire);
+
+            // Try to swing head to next
+            if (head_.compare_exchange_weak(head, next,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                value = result;
+                // Retire old dummy node - don't delete it because
+                // other threads might still be reading it
+                retire_node(head);
+                return true;
+            }
+        }
+    }
+}
+IMPL_EOF
+> #include <new>
+>
+> LockFreeQueue::LockFreeQueue() {
+>     Node* dummy = new Node();
+>     head_.store(dummy, std::memory_order_release);
+>     tail_.store(dummy, std::memory_order_release);
+>     retired_list_.store(nullptr, std::memory_order_relaxed);
+> }
+>
+> LockFreeQueue::~LockFreeQueue() {
+>     // Drain remaining items
+>     uint64_t dummy;
+>     while (dequeue(dummy)) {}
+>
+>     // Delete the sentinel node
+>     Node* head = head_.load(std::memory_order_acquire);
+>     delete head;
+>
+>     // Delete all retired nodes
+>     Node* retired = retired_list_.load(std::memory_order_acquire);
+>     while (retired) {
+>         Node* next = retired->next.load(std::memory_order_relaxed);
+>         delete retired;
+>         retired = next;
+>     }
+> }
+>
+> void LockFreeQueue::retire_node(Node* node) {
+>     // Push node onto retired list (lock-free stack push).
+>     // Nodes are never reused, only cleaned up in destructor.
+>     // This prevents use-after-free and ABA (no address recycling).
+>     Node* old_head = retired_list_.load(std::memory_order_relaxed);
+>     do {
+>         node->next.store(old_head, std::memory_order_relaxed);
+>     } while (!retired_list_.compare_exchange_weak(old_head, node,
+>                 std::memory_order_release, std::memory_order_relaxed));
+> }
+>
+> void LockFreeQueue::enqueue(uint64_t value) {
+>     Node* new_node = new Node(value);
+>
+>     while (true) {
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = tail->next.load(std::memory_order_acquire);
+>
+>         // Re-read tail to check consistency
+>         if (tail != tail_.load(std::memory_order_acquire))
+>             continue;
+>
+>         if (next == nullptr) {
+>             // Try to link new_node at the end
+>             if (tail->next.compare_exchange_weak(next, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed)) {
+>                 // Try to swing tail to new_node (ok if it fails,
+>                 // another thread will help)
+>                 tail_.compare_exchange_strong(tail, new_node,
+>                     std::memory_order_release, std::memory_order_relaxed);
+>                 return;
+>             }
+>         } else {
+>             // Tail is behind, try to advance it
+>             tail_.compare_exchange_strong(tail, next,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         }
+>     }
+> }
+>
+> bool LockFreeQueue::dequeue(uint64_t& value) {
+>     while (true) {
+>         Node* head = head_.load(std::memory_order_acquire);
+>         Node* tail = tail_.load(std::memory_order_acquire);
+>         Node* next = head->next.load(std::memory_order_acquire);
+>
+>         // Re-read head to check consistency
+>         if (head != head_.load(std::memory_order_acquire))
+>             continue;
+>
+>         if (head == tail) {
+>             if (next == nullptr) {
+>                 return false;  // Queue is empty
+>             }
+>             // Tail is behind, advance it
+>             tail_.compare_exchange_strong(tail, next,
+>                 std::memory_order_release, std::memory_order_relaxed);
+>         } else {
+>             if (next == nullptr) {
+>                 // Inconsistent read, retry
+>                 continue;
+>             }
+>             // Read value before CAS
+>             uint64_t result = next->value.load(std::memory_order_acquire);
+>
+>             // Try to swing head to next
+>             if (head_.compare_exchange_weak(head, next,
+>                     std::memory_order_acq_rel, std::memory_order_acquire)) {
+>                 value = result;
+>                 // Retire old dummy node - don't delete it because
+>                 // other threads might still be reading it
+>                 retire_node(head);
+>                 return true;
+>             }
+>         }
+>     }
+> }
+> IMPL_EOF
+root@b0b4635a84e9:/app# cd /app && make clean && make 2>&1
+rm -f stress_test stress_test_tsan
+clang++ -std=c++17 -Wall -Wextra -O2 -pthread -o stress_test lockfree_queue.cpp stress_test.cpp
+root@b0b4635a84e9:/app#

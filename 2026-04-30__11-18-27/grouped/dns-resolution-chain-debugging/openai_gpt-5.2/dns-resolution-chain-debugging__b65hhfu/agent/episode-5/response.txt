@@ -1,0 +1,107 @@
+{
+  "analysis": "secure.example.com has been successfully re-signed; named-checkzone on the new .signed file is OK. Secondary named.conf output via nl/grep returned nothing earlier, suggesting the file may be empty or unreadable, or the command produced no output due to an issue—needs re-check. We still must: ensure secondary config contains TSIG key and zones, fix example.com zone issues (CNAME loop, negative TTL too high, missing glue for delegated sub), configure resolver trust anchor for secure.example.com DNSSEC validation, start all services, verify AXFR and all test queries. Also need to create /app/dns_health.json at end.",
+  "plan": "1) Verify secondary named.conf contents; if empty/corrupted, restore minimal correct config including TSIG key, server clause, slave zones, correct directory, and logging. 2) Fix example.com.zone: remove CNAME loop by making a/b point to valid targets (or A records), lower SOA negative TTL, and fix delegation glue by using in-zone names (ns1.sub.example.com/ns2.sub.example.com) with A records or change to ns1.example.com/ns2.example.com. Increment serial. 3) Configure resolver with a trust anchor for secure.example.com: easiest is to add a 'trusted-keys' stanza containing the KSK DNSKEY (flag 257) from the signed zone. 4) Restart named processes, confirm listening on 5300/5301/5302. 5) Verify zone transfers (AXFR) from secondary for both zones. 6) Run all queries in /app/test_queries.txt against resolver and ensure no SERVFAIL/NXDOMAIN for expected names. 7) Check DNSSEC validation by querying resolver for secure.example.com with +dnssec and confirming AD flag. 8) Write dns_health.json with issues_fixed and statuses.",
+  "commands": [
+    {
+      "keystrokes": "ls -la /app/dns/secondary && echo '---' && (wc -l /app/dns/secondary/named.conf; sed -n '1,200p' /app/dns/secondary/named.conf)\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "if [ ! -s /app/dns/secondary/named.conf ]; then cat > /app/dns/secondary/named.conf <<'EOF'\noptions {\n    directory \"/app/dns/secondary/cache\";\n    listen-on port 5302 { 127.0.0.1; };\n    listen-on-v6 { none; };\n    allow-query { any; };\n    recursion no;\n    dnssec-validation auto;\n    pid-file \"/var/run/named/named-secondary.pid\";\n};\n\nkey \"transfer-key\" {\n    algorithm hmac-sha256;\n    secret \"QJ8wmSz7+cQ7RmWjMuPpAA3b1Dq7FQ/lcG1nN7ybI80=\";\n};\n\nserver 127.0.0.1 {\n    keys { transfer-key; };\n};\n\nzone \"example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nzone \"secure.example.com\" {\n    type slave;\n    file \"/app/dns/secondary/zones/secure.example.com.zone\";\n    masters port 5301 { 127.0.0.1 key transfer-key; };\n};\n\nlogging {\n    channel default_log {\n        file \"/var/log/named/named-secondary.log\" versions 3 size 5m;\n        severity info;\n        print-time yes;\n    };\n    category default { default_log; };\n};\nEOF\nfi\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/secondary/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/(\\(\\s*\\n\\s*2024010101\\s*; Serial)/(\"\\n\")/s' /dev/null 2>/dev/null || true\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's/(\\s*2024010101\\s*; Serial)/2024010102      ; Serial/; s/(86400\\s*\\)\\s*; Negative Cache TTL.*)/300 )           ; Negative Cache TTL/;' /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -i -pe 's/^a\\s+IN\\s+CNAME\\s+b\\.example\\.com\\./a       IN      A       192.168.1.30/; s/^b\\s+IN\\s+CNAME\\s+a\\.example\\.com\\./b       IN      A       192.168.1.31/' /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "grep -n '^sub\\s' -n /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "cat >> /app/dns/primary/zones/example.com.zone <<'EOF'\n\n; Glue for delegated sub.example.com nameservers\nns1.sub IN      A       192.168.1.40\nns2.sub IN      A       192.168.1.41\nEOF\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "awk '$4==\"DNSKEY\" && $5==\"257\"{print; exit}' /app/dns/primary/zones/secure.example.com.zone.signed > /tmp/secure.ksk.dnskey && cat /tmp/secure.ksk.dnskey\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "KSKLINE=$(cat /tmp/secure.ksk.dnskey); grep -q '^trusted-keys' /app/dns/resolver/named.conf || perl -0777 -i -pe 's/\\};\\n\\nlogging/\\n\\ntrusted-keys {\\n    '\"$KSKLINE\"'\\n};\\n\\nlogging/s' /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5301 example.com SOA +noall +answer\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 example.com AXFR | head\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5302 secure.example.com AXFR | head\n",
+      "duration": 2.0
+    },
+    {
+      "keystrokes": "awk 'NF==2{print $1,$2}' /app/test_queries.txt | while read -r t n; do echo \"===== $t $n\"; dig @127.0.0.1 -p 5300 \"$n\" \"$t\" +time=1 +tries=1; done\n",
+      "duration": 6.0
+    },
+    {
+      "keystrokes": "dig @127.0.0.1 -p 5300 secure.example.com A +dnssec +noall +answer +comments | sed -n '1,80p'\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-primary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-secondary.log\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

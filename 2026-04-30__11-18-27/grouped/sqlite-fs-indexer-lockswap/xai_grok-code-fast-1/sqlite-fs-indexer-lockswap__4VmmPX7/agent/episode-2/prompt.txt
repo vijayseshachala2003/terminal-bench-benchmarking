@@ -1,0 +1,127 @@
+New Terminal Output:
+
+root@35e47bc9c202:/app# cat > app/indexer.py << 'EOF'
+e': size}
+
+    # Sort for determinism
+    sorted_entries = sorted(entries.items())
+
+    # Create temp DB
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as temp_db:
+        temp_path = temp_db.name
+
+    conn = sqlite3.connect(temp_path)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    conn.execute('PRAGMA synchronous=NORMAL;')
+    conn.execute('CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL);')
+
+    for path, data in sorted_entries:
+        conn.execute('INSERT INTO files VALUES (?, ?, ?)', (path, data['sha'], data['size']))
+
+    conn.commit()
+    conn.close()
+
+    # Atomically replace
+    os.rename(temp_path, db_path)
+EOF
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import re
+> import tempfile
+>
+> def get_ignore_patterns():
+>     patterns = []
+>     try:
+>         with open('/data/ignore.txt', 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line = line.strip()
+>                 if not line or line.startswith('#'):
+>                     continue
+>                 patterns.append(unicodedata.normalize('NFC', line))
+>     except FileNotFoundError:
+>         pass
+>     return patterns
+>
+> def matches_pattern(pattern, path):
+>     # pattern and path are NFC normalized, path uses /
+>     if '/' not in pattern:
+>         # Match any path component
+>         components = path.split('/')
+>         translated = pattern.replace('**', r'\*\*').replace('*', r'[^/]*')
+>         regex = re.compile(f'^{translated}$')
+>         return any(regex.match(comp) for comp in components)
+>     elif pattern.startswith('/'):
+>         # Match full path after stripping leading /
+>         stripped = pattern[1:]
+>         translated = stripped.replace('**', r'\*\*').replace('*', r'[^/]*')
+>         regex = re.compile(f'^{translated}$')
+>         return regex.match(path) is not None
+>     else:
+>         # Match full path or any suffix starting immediately after /
+>         translated = pattern.replace('**', r'\*\*').replace('*', r'[^/]*')
+>         # Use lookbehind for / boundary
+>         regex = re.compile(f'(^{translated}$|(?<=/){translated}$)')
+>         return regex.search(path) is not None
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>     root_dir = os.path.abspath(root_dir)
+>     ignore_patterns = get_ignore_patterns()
+>     entries = {}  # key: NFC path, value: dict with 'orig', 'sha', 'size'
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+>         # Filter out symlinked directories
+>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+>
+>         for filename in filenames:
+>             full_path = os.path.join(dirpath, filename)
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             rel_path_norm = unicodedata.normalize('NFC', rel_path.replace(os.sep, '/'))
+>
+>             if any(matches_pattern(p, rel_path_norm) for p in ignore_patterns):
+>                 continue
+>
+>             try:
+>                 with open(full_path, 'rb') as f:
+>                     data = f.read()
+>                     sha = hashlib.sha256(data).hexdigest()
+>                     size = len(data)
+>             except (OSError, IOError):
+>                 continue
+>
+>             orig_rel = rel_path.replace(os.sep, '/')
+>             if rel_path_norm in entries:
+>                 if orig_rel > entries[rel_path_norm]['orig']:
+>                     entries[rel_path_norm] = {'orig': orig_rel, 'sha': sha, 'size': size}
+>             else:
+>                 entries[rel_path_norm] = {'orig': orig_rel, 'sha': sha, 'size': size}
+>
+>     # Sort for determinism
+>     sorted_entries = sorted(entries.items())
+>
+>     # Create temp DB
+>     with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as temp_db:
+>         temp_path = temp_db.name
+>
+>     conn = sqlite3.connect(temp_path)
+>     conn.execute('PRAGMA journal_mode=WAL;')
+>     conn.execute('PRAGMA synchronous=NORMAL;')
+>     conn.execute('CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL);')
+>
+>     for path, data in sorted_entries:
+>         conn.execute('INSERT INTO files VALUES (?, ?, ?)', (path, data['sha'], data['size']))
+>
+>     conn.commit()
+>     conn.close()
+>
+>     # Atomically replace
+>     os.rename(temp_path, db_path)
+> EOF
+root@35e47bc9c202:/app# python3 -c "import app.indexer; print('Import successful')"
+Import successful
+root@35e47bc9c202:/app#

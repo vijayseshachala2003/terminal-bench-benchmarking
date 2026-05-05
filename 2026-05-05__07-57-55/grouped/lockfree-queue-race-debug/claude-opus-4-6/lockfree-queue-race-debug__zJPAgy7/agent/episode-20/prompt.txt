@@ -1,0 +1,159 @@
+Previous response had warnings:
+WARNINGS: - Extra text detected before JSON object
+
+New Terminal Output:
+
+root@1eaa284b8765:/app# echo '=== lockfree_queue.cpp ===' && cat /app/lockfree_queue.cpp && echo && echo '=== lockfree_queue.h ===' && cat /app/lockfree_queue.h
+ && echo && echo '=== analysis.json valid? ===' && python3 -c "import json; d=json.load(open('/app/analysis.json')); print(f'Bugs: {d["total_bugs_fixed"]}, TSan
+ clean: {d["tsan_clean"]}, Stress passed: {d["stress_test_passed"]}')"
+=== lockfree_queue.cpp ===
+#include "lockfree_queue.h"
+#include <new>
+
+LockFreeQueue::LockFreeQueue() {
+    Node* dummy = new Node();
+    head_.store(dummy, std::memory_order_relaxed);
+    tail_.store(dummy, std::memory_order_relaxed);
+    retired_list_.store(nullptr, std::memory_order_relaxed);
+}
+
+LockFreeQueue::~LockFreeQueue() {
+    // Drain the queue
+    uint64_t dummy;
+    while (dequeue(dummy)) {}
+
+    // Delete the sentinel node
+    Node* head = head_.load(std::memory_order_relaxed);
+    delete head;
+
+    // Delete all retired nodes
+    Node* retired = retired_list_.load(std::memory_order_relaxed);
+    while (retired) {
+        Node* next = retired->next.load(std::memory_order_relaxed);
+        delete retired;
+        retired = next;
+    }
+}
+
+LockFreeQueue::Node* LockFreeQueue::allocate_node(uint64_t value) {
+    // Always allocate fresh nodes - never reuse addresses.
+    // This prevents ABA: since each node has a unique address,
+    // a CAS on head_/tail_ cannot succeed with a stale pointer
+    // that happens to match a recycled address.
+    return new Node(value);
+}
+
+void LockFreeQueue::retire_node(Node* node) {
+    // Push onto retired list for deferred deletion at destruction.
+    // This prevents use-after-free: a thread that loaded a pointer
+    // to this node (but hasn't dereferenced it yet) won't crash
+    // because the memory remains valid.
+    Node* old_head = retired_list_.load(std::memory_order_relaxed);
+    do {
+        node->next.store(old_head, std::memory_order_relaxed);
+    } while (!retired_list_.compare_exchange_weak(old_head, node,
+                std::memory_order_release, std::memory_order_relaxed));
+}
+
+void LockFreeQueue::enqueue(uint64_t value) {
+    Node* new_node = allocate_node(value);
+
+    while (true) {
+        Node* tail = tail_.load(std::memory_order_acquire);
+        Node* next = tail->next.load(std::memory_order_acquire);
+
+        // Re-check tail consistency
+        if (tail == tail_.load(std::memory_order_acquire)) {
+            if (next == nullptr) {
+                // Try to link new node at the end of the queue
+                if (tail->next.compare_exchange_weak(next, new_node,
+                        std::memory_order_release, std::memory_order_relaxed)) {
+                    // Successfully linked; try to swing tail forward
+                    tail_.compare_exchange_strong(tail, new_node,
+                        std::memory_order_release, std::memory_order_relaxed);
+                    return;
+                }
+            } else {
+                // Tail is lagging behind; help advance it
+                tail_.compare_exchange_strong(tail, next,
+                    std::memory_order_release, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+bool LockFreeQueue::dequeue(uint64_t& value) {
+    while (true) {
+        Node* head = head_.load(std::memory_order_acquire);
+        Node* tail = tail_.load(std::memory_order_acquire);
+        Node* next = head->next.load(std::memory_order_acquire);
+
+        // Re-check head consistency
+        if (head == head_.load(std::memory_order_acquire)) {
+            if (head == tail) {
+                if (next == nullptr) {
+                    return false;  // Queue is empty
+                }
+                // Tail is lagging; help advance it
+                tail_.compare_exchange_strong(tail, next,
+                    std::memory_order_release, std::memory_order_relaxed);
+            } else {
+                // Read value before CAS, because after CAS succeeds
+                // another thread could dequeue the next node and retire it
+                value = next->value.load(std::memory_order_relaxed);
+                if (head_.compare_exchange_weak(head, next,
+                        std::memory_order_release, std::memory_order_relaxed)) {
+                    // Successfully dequeued; retire the old sentinel node.
+                    // The node is not deleted immediately because other
+                    // threads may still hold references to it.
+                    retire_node(head);
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+=== lockfree_queue.h ===
+#ifndef LOCKFREE_QUEUE_H
+#define LOCKFREE_QUEUE_H
+
+#include <atomic>
+#include <cstdint>
+
+class LockFreeQueue {
+public:
+    LockFreeQueue();
+    ~LockFreeQueue();
+
+    void enqueue(uint64_t value);
+    bool dequeue(uint64_t& value);
+
+    LockFreeQueue(const LockFreeQueue&) = delete;
+    LockFreeQueue& operator=(const LockFreeQueue&) = delete;
+
+private:
+    struct Node {
+        std::atomic<uint64_t> value;
+        std::atomic<Node*> next;
+        Node() : value(0), next(nullptr) {}
+        explicit Node(uint64_t val) : value(val), next(nullptr) {}
+    };
+
+    std::atomic<Node*> head_;
+    std::atomic<Node*> tail_;
+
+    // Retired nodes - kept alive until destruction to prevent use-after-free
+    std::atomic<Node*> retired_list_;
+
+    Node* allocate_node(uint64_t value);
+    void retire_node(Node* node);
+};
+
+#endif
+
+=== analysis.json valid? ===
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+NameError: name 'total_bugs_fixed' is not defined
+root@1eaa284b8765:/app#

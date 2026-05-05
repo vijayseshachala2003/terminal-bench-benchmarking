@@ -1,0 +1,291 @@
+New Terminal Output:
+
+root@6b59a722c62c:/app# cat > /app/solution.py <<'PY'
+> import re
+> from dataclasses import dataclass, field
+>
+> IDX_RE = re.compile(r"^[1-9][0-9]*$")
+> TX_RE = re.compile(r"^[a-z0-9]{1,8}$")
+> NONCE_RE = re.compile(r"^[A-F0-9]{8}$")
+>
+> OPS_NOARG = {"BEGIN", "PREPARE", "COMMIT", "ABORT", "END"}
+> OPS_WITHARG = {"VOTE", "FENCE", "EPOCH"}
+> ALL_OPS = OPS_NOARG | OPS_WITHARG
+>
+> OP_ORDER = {
+>     "BEGIN": 0,
+>     "PREPARE": 1,
+>     "VOTE": 2,
+>     "COMMIT": 3,
+>     "ABORT": 4,
+>     "END": 5,
+>     "FENCE": 6,
+>     "EPOCH": 7,
+> }
+>
+>
+> def _nonce_to_int(n: str) -> int:
+>     return int(n, 16)
+>
+_>
+> @dataclass
+> class TxInfo:
+>     tx: str
+     >     shard: str
+>     # per-tx observations (in file order)
+>     saw_begin: bool = False
+>     saw_prepare: bool = False
+>     saw_commit: bool = False
+>     saw_abort: bool = False
+>     saw_end: bool = False
+>
+>     # ordering flags
+>     prepare_before_begin: bool = False
+>     vote_before_prepare: bool = False
+ >
+>     # votes
+>     vote_kind: str | None = None  # "YES" or "NO"
+>     bad_vote: bool = False
+= True
+
+   >
+>     # fence monotonicity
+>     last_fence: int | None = None
+>     bad_fence: bool = False
+>
+>     # state machine for illegal transitions (excluding EPOCH)
+>     state: str = "NEW"
+ENDED"
+            else>     bad_order: bool = False
+>
+>
+> def _malformed(parts: list[str]) -> bool:
+>     # expects already split and not comment/empty
+>     if len(parts) < 3:
+>         return True
+        # sha>     idx, tx, op = parts[0], parts[1], parts[2]
+>     if not IDX_RE.match(idx):
+>         return True
+>     if not TX_RE.match(tx):
+>         return True
+>     if op not in ALL_OPS:
+>         return True
+>
+>     if op in OPS_NOARG:
+>         return len(parts) != 3
+>
+>     # ops with arg
+>     if len(parts) != 4:
+>         return True
+>     arg = parts[3]
+>     if op == "VOTE":
+>         return arg not in ("YES", "NO")
+>     if op in ("FENCE", "EPOCH"):
+>         return NONCE_RE.match(arg) is None
+>     return True
+>
+>
+> def solve(lines: list[str]) -> str:
+>     # shard-level EPOCH monotonicity
+>     shard_last_epoch: dict[str, int] = {}
+>     shard_bad_epoch: set[str] = set()
+>
+>     txs: dict[str, TxInfo] = {}
+>
+>     def get_tx(tx: str) -> TxInfo:
+>         if tx not in txs:
+>             txs[tx] = TxInfo(tx=tx, shard=tx[0])
+>         return txs[tx]
+>
+>     # process valid prefix
+>     for raw in lines:
+>         line = raw.strip("\n")
+>         if not line:
+>             continue
+>         if line.startswith("#"):
+>             continue
+>         parts = line.split(" ")
+>         if _malformed(parts):
+>             break
+>
+>         _idx, tx, op = parts[0], parts[1], parts[2]
+>         arg = parts[3] if len(parts) == 4 else None
+>
+>         info = get_tx(tx)
+>
+>         # shard-level EPOCH (still associated to a tx token in the line)
+>         if op == "EPOCH":
+>             shard = info.shard
+>             val = _nonce_to_int(arg)  # type: ignore[arg-type]
+>             if shard in shard_bad_epoch:
+>                 continue
+>             prev = shard_last_epoch.get(shard)
+>             if prev is None:
+>                 shard_last_epoch[shard] = val
+>             else:
+>                 if val <= prev:
+>                     shard_bad_epoch.add(shard)
+>                 else:
+>                     shard_last_epoch[shard] = val
+>             continue
+>
+>         # per-tx FENCE monotonicity (does not affect state)
+>         if op == "FENCE":
+>             val = _nonce_to_int(arg)  # type: ignore[arg-type]
+>             if info.last_fence is None:
+>                 info.last_fence = val
+>             else:
+>                 if val <= info.last_fence:
+>                     info.bad_fence = True
+>                 else:
+>                     info.last_fence = val
+>             continue
+>
+>         # per-tx protocol ops
+>         if op == "BEGIN":
+>             info.saw_begin = True
+>             if info.state == "NEW":
+>                 info.state = "BEGUN"
+>             else:
+>                 info.bad_order = True
+>
+>         elif op == "PREPARE":
+>             info.saw_prepare = True
+>             if not info.saw_begin:
+>                 info.prepare_before_begin = True
+>             if info.state == "BEGUN":
+>                 info.state = "PREPARED"
+>             else:
+>                 info.bad_order = True
+>
+>         elif op == "VOTE":
+>             if not info.saw_prepare:
+>                 info.vote_before_prepare = True
+>             if info.state != "PREPARED":
+>                 # illegal transition
+>                 info.bad_order = True
+>             v = arg  # type: ignore[assignment]
+>             if info.vote_kind is None:
+>                 info.vote_kind = v
+>             else:
+>                 if info.vote_kind != v:
+>                     info.bad_vote = True
+>
+>         elif op == "COMMIT":
+>             info.saw_commit = True
+>             # commit only from PREPARED and only if votes are YES or none
+>             if info.state == "PREPARED" and (info.vote_kind in (None, "YES")):
+>                 info.state = "DECIDED_COMMIT"
+>             else:
+>                 info.bad_order = True
+>
+>         elif op == "ABORT":
+>             info.saw_abort = True
+>             # abort allowed from BEGUN/PREPARED/DECIDED_ABORT
+>             if info.state in ("BEGUN", "PREPARED", "DECIDED_ABORT"):
+>                 info.state = "DECIDED_ABORT"
+>             else:
+>                 info.bad_order = True
+>
+>         elif op == "END":
+>             info.saw_end = True
+>             if info.state in ("DECIDED_COMMIT", "DECIDED_ABORT"):
+>                 info.state = "ENDED"
+>             else:
+>                 info.bad_order = True
+>
+>     bad: dict[str, str] = {}
+>     ins: list[tuple[str, str, str | None]] = []
+>
+>     for tx, info in txs.items():
+>         # shard poisoning dominates
+>         if info.shard in shard_bad_epoch:
+>             bad[tx] = "BAD_EPOCH"
+>             continue
+>         if info.bad_fence:
+>             bad[tx] = "BAD_FENCE"
+>             continue
+>         if info.bad_vote:
+>             bad[tx] = "BAD_VOTE"
+>             continue
+>
+>         # irreparable cases from spec
+>         has_decision = info.saw_commit or info.saw_abort
+>         if info.saw_end and not has_decision:
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>         if info.saw_commit and info.vote_kind == "NO":
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>         if has_decision and not info.saw_prepare:
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>         if info.bad_order:
+>             bad[tx] = "BAD_ORDER"
+>             continue
+>
+>         # minimal insertions
+>         if not info.saw_begin:
+>             ins.append((tx, "BEGIN", None))
+>         # prerequisites for prepare
+>         if info.saw_prepare:
+>             if info.prepare_before_begin and info.saw_begin:
+>                 # BEGIN existed but after PREPARE; must insert BEGIN before first event
+>                 # (we already insert only if missing; so here BEGIN exists, no insertion)
+>                 # Spec says: If tx had PREPARE but no BEGIN before it, insert BEGIN.
+>                 # BEGIN exists but too late -> still need an inserted BEGIN.
+>                 ins.append((tx, "BEGIN", None))
+>         # if any vote but no prepare before it
+>         if info.vote_before_prepare:
+>             # need BEGIN and PREPARE as needed
+>             if not info.saw_begin:
+>                 # already inserted above
+>                 pass
+>             ins.append((tx, "PREPARE", None))
+>         else:
+>             # no early vote; still if prepare missing but needed for decision insertions? not required by rules
+>             pass
+>
+>         # decision handling
+>         if not has_decision:
+>             # choose based on observed votes
+>             if info.vote_kind == "NO":
+>                 ins.append((tx, "ABORT", None))
+>             else:
+>                 ins.append((tx, "COMMIT", None))
+>
+>         # END handling
+>         if not info.saw_end:
+>             ins.append((tx, "END", None))
+>
+>     # output ordering
+>     out: list[str] = []
+>     for tx in sorted(bad):
+>         out.append(f"BAD {tx} {bad[tx]}")
+>
+>     def ins_key(t: tuple[str, str, str | None]):
+>         tx, op, arg = t
+>         return (tx, OP_ORDER[op], "" if arg is None else arg)
+>
+>     for tx, op, arg in sorted(ins, key=ins_key):
+>         if arg is None:
+>             out.append(f"INS {tx} {op}")
+>         else:
+>             out.append(f"INS {tx} {op} {arg}")
+>
+>     return "OK" if not out else "\n".join(out)
+> PY
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 EPOCH 0000000A','3 a2 BEGIN','4 a2 EPOCH 00000009','5 b1 BEGIN','
+6 b1 EPOCH 00000001']))"
+BAD a1 BAD_EPOCH
+BAD a2 BAD_EPOCH
+INS b1 COMMIT
+INS b1 END
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 c1 BEGIN','2 c1 PREPARE','3 c1 VOTE YES','4 c1 VOTE NO']))"
+BAD c1 BAD_VOTE
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 d1 BEGIN','2 d1 END']))"
+BAD d1 BAD_ORDER
+root@6b59a722c62c:/app# python -c "from solution import solve; print(solve(['1 a1 BEGIN','2 a1 PREPARE']))"
+INS a1 COMMIT
+INS a1 END
+root@6b59a722c62c:/app#

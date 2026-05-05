@@ -1,0 +1,162 @@
+Current terminal state:
+New Terminal Output:
+
+root@fbfb22bbfa4e:/app# cat << 'EOF' > /app/app/indexer.py
+> import os
+> import sqlite3
+> import hashlib
+> import unicodedata
+> import re
+> import time
+>
+> def compile_pattern(pattern):
+>     # 1. Handle literal '**'
+>     # We'll split by '**', process '*', then join with '\*\*'
+>     parts = pattern.split('**')
+>     regex_parts = []
+>     for part in parts:
+>         # Escape regex chars except '*'
+>         escaped = ''
+>         for char in part:
+>             if char == '*':
+>                 escaped += '[^/]*'
+>             elif char in '.^$+|()[]{}\\':
+>                 escaped += '\\' + char
+>             else:
+>                 escaped += char
+>         regex_parts.append(escaped)
+>
+>     return '\*\*'.join(regex_parts)
+>
+> def matches_ignore(rel_path, patterns):
+>     if not patterns:
+>         return False
+>
+>     components = rel_path.split('/')
+>
+>     for p_type, regex in patterns:
+>         if p_type == 'leading_slash':
+>             if re.fullmatch(regex, rel_path):
+>                 return True
+>         elif p_type == 'no_slash':
+>             for comp in components:
+>                 if re.fullmatch(regex, comp):
+>                     return True
+>         elif p_type == 'contains_slash':
+>             if re.fullmatch(regex, rel_path):
+>                 return True
+>             # Or any suffix that starts immediately after a '/' boundary
+>             # meaning regex matches rel_path[i:] where rel_path[i-1] == '/'
+>             # We can just check if rel_path ends with regex, but it must match exactly the suffix
+>             # Wait, re.search(r'(^|/)' + regex + r'$', rel_path)?
+>             # Yes, because it must match a suffix starting after a /
+>             if re.search(r'(?:^|/)' + regex + r'$', rel_path):
+>                 return True
+>     return False
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     ignore_file = '/data/ignore.txt'
+>     patterns = []
+>     if os.path.isfile(ignore_file):
+>         with open(ignore_file, 'r', encoding='utf-8') as f:
+>             for line in f:
+>                 line_stripped = line.lstrip()
+>                 if not line_stripped or line_stripped.startswith('#'):
+>                     continue
+>                 pattern = line.rstrip('\r\n')
+>                 pattern = unicodedata.normalize('NFC', pattern)
+>
+>                 if pattern.startswith('/'):
+>                     p_type = 'leading_slash'
+>                     regex = compile_pattern(pattern[1:])
+>                 elif '/' not in pattern:
+>                     p_type = 'no_slash'
+>                     regex = compile_pattern(pattern)
+>                 else:
+>                     p_type = 'contains_slash'
+>                     regex = compile_pattern(pattern)
+>
+>                 patterns.append((p_type, regex))
+>
+>     # Walk directory
+>     files_to_index = {}
+>
+>     for dirpath, dirnames, filenames in os.walk(root_dir):
+>         # Do not follow symlinks for directories
+>         # os.walk does not follow symlinks by default, but we should remove symlinks from dirnames
+>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+>
+>         for filename in filenames:
+>             full_path = os.path.join(dirpath, filename)
+>             if os.path.islink(full_path):
+>                 continue
+>
+>             rel_path = os.path.relpath(full_path, root_dir)
+>             # Use forward slashes
+>             rel_path = rel_path.replace(os.sep, '/')
+>             if rel_path == '.':
+>                 continue
+>
+>             if matches_ignore(unicodedata.normalize('NFC', rel_path), patterns):
+>                 continue
+>
+>             nfc_path = unicodedata.normalize('NFC', rel_path)
+>
+>             if nfc_path not in files_to_index:
+>                 files_to_index[nfc_path] = rel_path
+>             else:
+>                 if rel_path > files_to_index[nfc_path]:
+>                     files_to_index[nfc_path] = rel_path
+>
+>     results = []
+>     for nfc_path, orig_rel_path in files_to_index.items():
+>         full_path = os.path.join(root_dir, orig_rel_path.replace('/', os.sep))
+>         try:
+>             size = os.path.getsize(full_path)
+>             hasher = hashlib.sha256()
+>             with open(full_path, 'rb') as f:
+>                 for chunk in iter(lambda: f.read(4096 * 1024), b''):
+>                     hasher.update(chunk)
+>             sha256_hex = hasher.hexdigest()
+>             results.append((nfc_path, sha256_hex, size))
+>         except OSError:
+>             continue
+>
+>     # Sort results by nfc_path for determinism (though DB order handles this, good for insertion)
+>     results.sort(key=lambda x: x[0])
+>
+>     # Write to DB
+>     for _ in range(100):
+>         try:
+>             conn = sqlite3.connect(db_path, timeout=60.0)
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=NORMAL")
+>
+>             with conn:
+>                 conn.execute('''
+>                     CREATE TABLE IF NOT EXISTS files (
+>                         path TEXT PRIMARY KEY,
+>                         sha256 TEXT NOT NULL,
+>                         size INTEGER NOT NULL
+>                     )
+>                 ''')
+>
+>                 # We need to insert or replace. The test might run multiple times or concurrently.
+>                 # If multiple processes run, they might insert the same rows.
+>                 conn.executemany('''
+>                     INSERT OR REPLACE INTO files (path, sha256, size)
+>                     VALUES (?, ?, ?)
+>                 ''', results)
+>             conn.close()
+>             break
+>         except sqlite3.OperationalError as e:
+>             if 'locked' in str(e) or 'busy' in str(e):
+>                 time.sleep(0.1)
+>             else:
+>                 raise
+> EOF
+root@fbfb22bbfa4e:/app# touch /app/app/__init__.py
+root@fbfb22bbfa4e:/app#
+
+
+Are you sure you want to mark the task as complete? This will trigger your solution to be graded and you won't be able to make any further corrections. If so, include "task_complete": true in your JSON response again.

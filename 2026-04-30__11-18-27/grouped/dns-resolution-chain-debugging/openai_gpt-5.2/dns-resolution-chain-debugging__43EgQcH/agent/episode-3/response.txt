@@ -1,0 +1,59 @@
+{
+  "analysis": "named-checkconf now passes for all, but daemons still exit. Resolver log shows it can listen on 5300 but then fatally fails due to permission denied writing pid-file under /var/run/named and session.key under /run/named, and also tries to access /etc/bind/rndc.key and config logging files under /var/log/named (permission denied). Similar issues likely affect primary/secondary. We must change pid-file paths to writable locations under /app/dns/* and disable/relocate session key and control channel (or point to a writable rndc-key), and remove/adjust logging file directives (since -g already used; but still it complains checking logging configuration permission denied). Best: remove logging blocks entirely (or set to stderr only), set pid-file into cache dir, and set session-keyfile into cache dir; also disable controls { } or point to a local key file we can read. Additionally, example.com glue warning persists because ns1.sub.example.com is treated out-of-zone relative to sub.example.com delegation; we added ns1.sub A but named-checkzone still says no addresses—likely because owner name should be 'ns1.sub.example.com.' not 'ns1.sub'. Need to correct glue record names.",
+  "plan": "1) Update primary/secondary/resolver configs: set pid-file to /app/dns/<svc>/cache/named.pid; add session-keyfile \"/app/dns/<svc>/cache/session.key\"; add controls { } block to disable (controls { inet 127.0.0.1 port 953 allow { none; }; };) or just 'controls { };' to prevent rndc.key access. 2) Remove logging { ... file \"/var/log/...\" } blocks from primary/secondary/resolver to avoid permission denied when validating logging config under -g. 3) Fix example.com glue by changing records to fully-qualified names ns1.sub.example.com. and ns2.sub.example.com. and increment serial again. 4) Re-run named-checkconf and named-checkzone. 5) Restart all named instances and confirm ports. 6) Re-test AXFR and test_queries.",
+  "commands": [
+    {
+      "keystrokes": "perl -0777 -i -pe 's@pid-file\\s+\"[^\"]+\";@pid-file \"/app/dns/primary/cache/named.pid\";@g; s@pid-file\\s+\"[^\"]+\";@pid-file \"/app/dns/secondary/cache/named.pid\";@g if $ARGV=~/secondary/; s@pid-file\\s+\"[^\"]+\";@pid-file \"/app/dns/resolver/cache/named.pid\";@g if $ARGV=~/resolver/;' /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "for f in /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf; do grep -q 'session-keyfile' \"$f\" || perl -0777 -i -pe 's/options \\{/options {\\n    session-keyfile \"'\"${f%/named.conf}\"'\\/cache\\/session.key\";/' \"$f\"; done\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "for f in /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf; do grep -q '^controls' \"$f\" || printf '\\ncontrols { inet 127.0.0.1 port 953 allow { none; }; };\\n' >> \"$f\"; done\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/\\nlogging\\s*\\{.*?\\};\\n/\\n/sms' /app/dns/primary/named.conf /app/dns/secondary/named.conf /app/dns/resolver/named.conf\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkconf /app/dns/primary/named.conf && named-checkconf /app/dns/secondary/named.conf && named-checkconf /app/dns/resolver/named.conf\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "perl -0777 -i -pe 's/2024010102/2024010103/; s/^ns1\\.sub\\s+IN\\s+A\\s+/ns1.sub.example.com. IN A /m; s/^ns2\\.sub\\s+IN\\s+A\\s+/ns2.sub.example.com. IN A /m' /app/dns/primary/zones/example.com.zone\n",
+      "duration": 0.1
+    },
+    {
+      "keystrokes": "named-checkzone example.com /app/dns/primary/zones/example.com.zone\n",
+      "duration": 1.0
+    },
+    {
+      "keystrokes": "pkill named || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/primary/named.conf -g > /tmp/named-primary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/secondary/named.conf -g > /tmp/named-secondary.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "named -c /app/dns/resolver/named.conf -g > /tmp/named-resolver.log 2>&1 &\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "ss -lntup | grep -E ':(5300|5301|5302)\\b' || true\n",
+      "duration": 0.5
+    },
+    {
+      "keystrokes": "tail -n 80 /tmp/named-primary.log; echo '---'; tail -n 80 /tmp/named-secondary.log; echo '---'; tail -n 120 /tmp/named-resolver.log\n",
+      "duration": 0.1
+    }
+  ],
+  "task_complete": false
+}

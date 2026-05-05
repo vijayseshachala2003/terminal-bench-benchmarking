@@ -1,0 +1,288 @@
+New Terminal Output:
+
+root@185a6f957a1d:/app# cat > /app/app/indexer.py <<'PY'
+> import errno
+> import hashlib
+> import os
+> import sqlite3
+> import tempfile
+> import unicodedata
+> from dataclasses import dataclass
+> from typing import Dict, Iterable, List, Optional, Tuple
+>
+>
+> def _nfc(s: str) -> str:
+>     return unicodedata.normalize("NFC", s)
+>
+>
+> def _to_posix_relpath(path: str) -> str:
+>     # Ensure forward slashes regardless of platform/path source.
+>     return path.replace(os.sep, "/")
+>
+>
+> def _split_components(posix_rel: str) -> List[str]:
+>     if not posix_rel:
+>         return []
+>     return [c for c in posix_rel.split("/") if c != ""]
+>
+>
+> def _glob_match_component(pattern: str, text: str) -> bool:
+>     """Match pattern to text where '*' matches 0+ chars (not '/').
+>
+>     Pattern is matched against a single path component or a full relative path
+>     string; in either case, text will never contain '\\', and for component
+>     matches it will not contain '/'. '*' is the only wildcard; '**' is not
+>     special (it is simply two '*' wildcards).
+>     """
+>
+>     # Classic wildcard matching with only '*'.
+>     # This is linear-time greedy with backtracking on '*'.
+>     p = pattern
+>     s = text
+>     i = j = 0
+>     star_i = -1
+>     star_j = -1
+>
+>     while j < len(s):
+>         if i < len(p) and p[i] == "*":
+>             star_i = i
+>             star_j = j
+>             i += 1
+>             continue
+>         if i < len(p) and p[i] == s[j]:
+>             i += 1
+>             j += 1
+>             continue
+>         if star_i != -1:
+>             # Let the last '*' absorb one more character.
+>             star_j += 1
+>             j = star_j
+>             i = star_i + 1
+>             continue
+>         return False
+>
+>     # Consume trailing '*' in pattern.
+>     while i < len(p) and p[i] == "*":
+>         i += 1
+>
+>     return i == len(p)
+>
+>
+> @dataclass(frozen=True)
+> class _IgnorePattern:
+>     raw: str
+>     anchored: bool  # leading '/'
+>     has_slash: bool
+>
+>
+> def _load_ignore_patterns(ignore_path: str = "/data/ignore.txt") -> List[_IgnorePattern]:
+>     patterns: List[_IgnorePattern] = []
+>     try:
+>         with open(ignore_path, "r", encoding="utf-8", errors="replace") as f:
+>             for line in f:
+>                 # Strip newline but keep other whitespace for patterns; however,
+>                 # comment detection uses first non-whitespace.
+>                 stripped_nl = line.rstrip("\r\n")
+>                 if stripped_nl.strip() == "":
+>                     continue
+>                 lstripped = stripped_nl.lstrip()
+>                 if lstripped.startswith("#"):
+>                     continue
+>
+>                 pat = _nfc(stripped_nl)
+>                 anchored = pat.startswith("/")
+>                 if anchored:
+>                     pat2 = pat[1:]
+>                 else:
+>                     pat2 = pat
+>
+>                 # Empty pattern after removing leading '/' is meaningless.
+>                 if pat2 == "":
+>                     continue
+>
+>                 patterns.append(
+>                     _IgnorePattern(raw=pat2, anchored=anchored, has_slash=("/" in pat2))
+>                 )
+>     except FileNotFoundError:
+>         return []
+>     except OSError:
+>         # Malformed/unreadable ignore file should not crash the indexer.
+>         return []
+>
+>     return patterns
+>
+>
+> def _is_ignored(posix_rel_nfc: str, patterns: List[_IgnorePattern]) -> bool:
+>     # posix_rel_nfc is NFC normalized, uses '/' separators.
+>     comps = _split_components(posix_rel_nfc)
+>
+>     for pat in patterns:
+>         p = pat.raw
+>         if pat.anchored:
+>             # Match only against full relative path.
+>             if _glob_match_component(p, posix_rel_nfc):
+>                 return True
+>             continue
+>
+>         if not pat.has_slash:
+>             # Match against each component.
+>             for c in comps:
+>                 if _glob_match_component(p, c):
+>                     return True
+>             continue
+>
+>         # Contains '/' but not anchored: match full path OR any suffix starting
+>         # after a '/' boundary.
+>         if _glob_match_component(p, posix_rel_nfc):
+>             return True
+>         # Suffixes after boundaries
+>         for i in range(1, len(comps)):
+>             suffix = "/".join(comps[i:])
+>             if _glob_match_component(p, suffix):
+>                 return True
+>
+>     return False
+>
+>
+> def _iter_files(root_dir: str, patterns: List[_IgnorePattern]) -> Iterable[Tuple[str, str, str]]:
+>     """Yield (abs_path, rel_original_posix, rel_nfc_posix) for regular files."""
+>
+>     root_dir = os.path.abspath(root_dir)
+>
+>     def walk_dir(abs_dir: str, rel_dir_posix: str) -> Iterable[Tuple[str, str, str]]:
+>         try:
+>             with os.scandir(abs_dir) as it:
+>                 entries = sorted(it, key=lambda e: e.name)
+>         except FileNotFoundError:
+>             return
+>         except NotADirector
+[... output limited to 10000 bytes; 69 interior bytes omitted ...]
+>                     continue
+>
+>                 name = ent.name
+>                 rel_orig = name if rel_dir_posix == "" else f"{rel_dir_posix}/{name}"
+>                 rel_orig_posix = _to_posix_relpath(rel_orig)
+>                 rel_nfc_posix = _nfc(rel_orig_posix)
+>
+>                 # Ignore matching uses NFC normalized paths.
+>                 if _is_ignored(rel_nfc_posix, patterns):
+>                     continue
+>
+>                 if ent.is_dir(follow_symlinks=False):
+>                     yield from walk_dir(ent.path, rel_nfc_posix)
+>                 elif ent.is_file(follow_symlinks=False):
+>                     yield (ent.path, rel_orig_posix, rel_nfc_posix)
+>                 else:
+>                     # Skip non-regular (fifo, socket, device, etc.)
+>                     continue
+>             except OSError:
+>                 # If an entry disappears or is unreadable, skip.
+>                 continue
+>
+>     yield from walk_dir(root_dir, "")
+>
+>
+> def _hash_file(path: str) -> Tuple[str, int]:
+>     h = hashlib.sha256()
+>     size = 0
+>     with open(path, "rb") as f:
+>         for chunk in iter(lambda: f.read(1024 * 1024), b""):
+>             h.update(chunk)
+>             size += len(chunk)
+>     return (h.hexdigest(), size)
+>
+>
+> def build_index(root_dir: str, db_path: str) -> None:
+>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+>
+>     patterns = _load_ignore_patterns("/data/ignore.txt")
+>
+>     # First, collect the winning file for each NFC-normalized relative path.
+>     # Unicode collisions: keep only entry whose ORIGINAL relative path string
+>     # is lexicographically largest.
+>     winners: Dict[str, Tuple[str, str]] = {}
+>     # key: rel_nfc_posix -> (rel_orig_posix, abs_path)
+>
+>     for abs_path, rel_orig_posix, rel_nfc_posix in _iter_files(root_dir, patterns):
+>         prev = winners.get(rel_nfc_posix)
+>         if prev is None or rel_orig_posix > prev[0]:
+>             winners[rel_nfc_posix] = (rel_orig_posix, abs_path)
+>
+>     rows: List[Tuple[str, str, int]] = []
+>     for rel_nfc_posix in sorted(winners.keys()):
+>         abs_path = winners[rel_nfc_posix][1]
+>         try:
+>             sha, size = _hash_file(abs_path)
+>         except OSError:
+>             # If file vanished/unreadable, skip it.
+>             continue
+>         rows.append((rel_nfc_posix, sha, int(size)))
+>
+>     db_path = os.path.abspath(db_path)
+>     db_dir = os.path.dirname(db_path) or "."
+>     os.makedirs(db_dir, exist_ok=True)
+>
+>     # Concurrency strategy:
+>     # - Build a complete SQLite DB in a unique temp file in the same directory.
+>     # - Acquire an interprocess lock on db_path+'.lock' only for the final
+>     #   atomic replace. This prevents corruption and minimizes contention.
+>     lock_path = db_path + ".lock"
+>
+>     fd_lock: Optional[int] = None
+>     try:
+>         fd_lock = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+>     except OSError:
+>         fd_lock = None
+>
+>     tmp_fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(db_path) + ".tmp.", suffix=".sqlite", dir=db_dir)
+>     os.close(tmp_fd)
+>
+>     try:
+>         conn = sqlite3.connect(tmp_path, timeout=30.0)
+>         try:
+>             conn.execute("PRAGMA journal_mode=WAL")
+>             conn.execute("PRAGMA synchronous=NORMAL")
+>             conn.execute("PRAGMA temp_store=MEMORY")
+>             conn.execute("PRAGMA foreign_keys=OFF")
+>
+>             conn.execute(
+>                 "CREATE TABLE files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)"
+>             )
+>             conn.executemany("INSERT INTO files(path, sha256, size) VALUES (?, ?, ?)", rows)
+>             conn.commit()
+>         finally:
+>             conn.close()
+>
+>         # Lock and replace.
+>         if fd_lock is not None:
+>             try:
+>                 import fcntl
+>
+>                 fcntl.flock(fd_lock, fcntl.LOCK_EX)
+>             except Exception:
+>                 # If locking isn't available, proceed without it; os.replace is
+>                 # still atomic, but concurrent replaces may race.
+>                 pass
+>
+>         os.replace(tmp_path, db_path)
+>
+>     finally:
+>         # Best-effort cleanup.
+>         try:
+>             if os.path.exists(tmp_path):
+>                 os.unlink(tmp_path)
+>         except OSError:
+>             pass
+>         if fd_lock is not None:
+>             try:
+>                 os.close(fd_lock)
+>             except OSError:
+>                 pass
+> PY
+root@185a6f957a1d:/app# python3 -c "import app.indexer as i; import sqlite3, os; os.makedirs('/output', exist_ok=True); i.build_index('/data','/output/index.sql
+ite'); con=sqlite3.connect('/output/index.sqlite'); print(con.execute('SELECT name FROM sqlite_master WHERE type=\"table\"').fetchall()); print(con.execute('PRA
+GMA integrity_check').fetchone()); print(con.execute('SELECT COUNT(*) FROM files').fetchone()); con.close()"
+[('files',)]
+('ok',)
+(0,)
+root@185a6f957a1d:/app#

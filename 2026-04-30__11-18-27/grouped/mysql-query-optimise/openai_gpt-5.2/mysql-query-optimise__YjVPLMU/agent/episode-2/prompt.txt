@@ -1,0 +1,259 @@
+New Terminal Output:
+
+root@083c499aea35:/app# cat > /app/optimize.py <<'PY'
+e = wm.group(1)
+
+    for om i> import glob, re, json, math
+> from collections import defaultdict
+> from itertools import combinations
+>
+> META_PATH = '/app/query_metadata.json'
+> LOG_GLOB = '/app/mysql_slow_*.log'
+> OUT_JSON = '/app/optimization.json'
+> OUT_TXT = '/app/recommendations.txt'
+>
+> SLOW_THRESHOLD = 1.0
+> WINDOW = 60
+>
+>
+> def r1(x):
+>     return round(x + 1e-12, 1)
+>
+> def r2(x):
+>     return round(x + 1e-12, 2)
+>
+>
+> def load_meta():
+>     with open(META_PATH) as f:
+>         meta = json.load(f)
+>     # normalize table/column keys to lowercase for lookup
+>     tables = {}
+>     for t, tv in meta['tables'].items():
+>         cols = {c.lower(): {'distinct_values': tv['columns'][c]['distinct_values']} for c in tv['columns']}
+>         tables[t.lower()] = {'total_rows': tv['total_rows'], 'columns': cols}
+>     return {'budget': meta['budget'], 'tables': tables}
+>
+>
+> def parse_slow_logs():
+>     entries = []
+>     for path in sorted(glob.glob(LOG_GLOB)):
+>         with open(path, 'r', errors='ignore') as f:
+>             lines = f.readlines()
+>         i = 0
+>         while i < len(lines):
+>             line = lines[i]
+>             if line.startswith('# Query_time:'):
+>                 m = re.search(r'# Query_time: ([0-9.]+)', line)
+>                 qtime = float(m.group(1)) if m else None
+>                 # find SET timestamp
+>                 ts = None
+>                 sql = None
+>                 j = i
+>                 while j < len(lines) and sql is None:
+>                     if lines[j].startswith('SET timestamp='):
+>                         mt = re.search(r'SET timestamp=(\d+);', lines[j])
+>                         if mt:
+>                             ts = int(mt.group(1))
+>                     # SQL typically next non-comment, non-use, non-set line ending with ';'
+>                     if (not lines[j].startswith('#')) and (not lines[j].lower().startswith('use ')) and (not lines[j].lower().startswith('set timestamp=')):
+>                         cand = lines[j].strip()
+>                         if cand:
+>                             sql = cand
+>                     j += 1
+>                 if qtime is not None and ts is not None and sql is not None:
+>                     entries.append({'ts': ts, 'query_time': qtime, 'sql': sql})
+>                 i = j
+>             else:
+>                 i += 1
+>     return entries
+>
+>
+> def normalize_sql(sql: str) -> str:
+>     s = sql.strip().rstrip(';')
+>     # collapse whitespace
+>     s = re.sub(r'\s+', ' ', s)
+>
+>     # Replace IN (...) lists with IN (?) (handles nested spaces, strings, numbers)
+>     s = re.sub(r'\bIN\s*\(\s*[^\)]*\)', 'IN (?)', s, flags=re.IGNORECASE)
+>
+>     # Replace quoted strings (single quotes)
+>     s = re.sub(r"'(?:''|[^'])*'", '?', s)
+>
+>     # Replace numeric literals (ints/floats)
+>     s = re.sub(r'(?<![A-Z0-9_])[-+]?(?:\d+\.?\d*|\d*\.\d+)(?![A-Z0-9_])', '?', s, flags=re.IGNORECASE)
+>
+>     # Normalize spacing around operators
+>     s = re.sub(r'\s*=\s*', ' = ', s)
+>     s = re.sub(r'\s*>\s*', ' > ', s)
+>     s = re.sub(r'\s*<\s*', ' < ', s)
+>     s = re.sub(r'\s*<=\s*', ' <= ', s)
+>     s = re.sub(r'\s*>=\s*', ' >= ', s)
+>     s = re.sub(r'\s*,\s*', ', ', s)
+>     s = re.sub(r'\s*\(\s*', ' (', s)
+>     s = re.sub(r'\s*\)\s*', ')', s)
+>     s = re.sub(r'\s+', ' ', s).strip()
+>
+>     return s.upper()
+>
+>
+> def extract_aliases(pattern: str):
+>     # pattern is uppercase. Extract FROM and JOIN alias mappings.
+>     # Supports: FROM table [AS] alias; JOIN table [AS] alias
+>     alias_to_table = {}
+>     # FROM
+>     m = re.search(r'\bFROM\s+([A-Z0-9_]+)(?:\s+(?:AS\s+)?([A-Z0-9_]+))?', pattern)
+>     if m:
+>         table = m.group(1)
+>         alias = m.group(2) or table
+>         alias_to_table[alias] = table
+>     # JOINs
+>     for jm in re.finditer(r'\bJOIN\s+([A-Z0-9_]+)(?:\s+(?:AS\s+)?([A-Z0-9_]+))?', pattern):
+>         table = jm.group(1)
+>         alias = jm.group(2) or table
+>         alias_to_table[alias] = table
+>     return alias_to_table
+>
+>
+> def extract_indexable_columns(pattern: str, meta_tables):
+>     alias_map = extract_aliases(pattern)
+>
+>     # segments
+>     where = ''
+>     on_clauses = []
+>     order = ''
+>
+>     wm = re.search(r'\bWHERE\b(.*?)(\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)', pattern)
+>     if wm:
+>         where = wm.group(1)
+>
+>     for om in re.finditer(r'\bON\b(.*?)(\bWHERE\b|\bJOIN\b|\bORDER\s+BY\b|\bGROUP\s+BY\b|\bLIMIT\b|$)', pattern):
+>         on_clauses.append(om.group(1))
+>
+>     om = re.search(r'\bORDER\s+BY\b(.*?)(\bLIMIT\b|$)', pattern)
+>     if om:
+>         order = om.group(1)
+>
+>     candidates = []  # list of (table, col)
+>
+>     def add_ref(alias, col):
+>         t = alias_map.get(alias)
+>         if not t:
+>             return
+>         tl = t.lower()
+>         cl = col.lower()
+>         if tl in meta_tables and cl in meta_tables[tl]['columns']:
+>             candidates.append((tl, cl))
+
+[... output limited to 10000 bytes; 70 interior bytes omitted ...]
+ len(slow_entries)
+>     unique_patterns = len(normalized_patterns)
+>
+>     def trunc(p):
+>         return p if len(p) <= 60 else p[:60] + '...'
+>
+>     # top patterns (up to 5) in same order as normalized_patterns
+>     top_pats = normalized_patterns[:5]
+>
+>     # compute pattern impact for report using S_max
+>     pat_to_stats = {p['pattern']: p for p in normalized_patterns}
+>
+>     lines = []
+>     lines.append('ADVANCED MYSQL OPTIMIZATION ANALYSIS')
+>     lines.append('=====================================')
+>     lines.append(f'Total Slow Queries: {total_slow}')
+>     lines.append(f'Unique Query Patterns: {unique_patterns}')
+>     lines.append(f'Total Budget: {budget} points')
+>     lines.append(f'Budget Used: {used} points')
+>     lines.append('')
+>     lines.append('TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):')
+>     for idx, p in enumerate(top_pats, 1):
+>         pat = p['pattern']
+>         freq = p['frequency']
+>         avg = p['avg_execution_time']
+>         total = p['total_time']
+>         smax = pat_smax.get(pat, 0.1)
+>         impact = r1(freq * (avg) * max(r2(smax), 0.1))
+>         lines.append(f"{idx}. {trunc(pat)} (Impact: {impact}, Freq: {freq}, Avg: {avg}s, Total: {total}s)")
+>
+>     lines.append('')
+>     lines.append('TEMPORAL CORRELATIONS:')
+>     if correlations:
+>         for i, c in enumerate(correlations, 1):
+>             lines.append(f"{i}. Pattern Pair (Strength: {c['correlation_strength']}):")
+>             lines.append(f"   - {trunc(c['pattern1'])}")
+>             lines.append(f"   - {trunc(c['pattern2'])}")
+>     else:
+>         lines.append('1. Pattern Pair (Strength: 0):')
+>         lines.append('   - N/A')
+>         lines.append('   - N/A')
+>
+>     lines.append('')
+>     lines.append('RECOMMENDED INDEXES (5 max):')
+>     if out['recommended_indexes']:
+>         for i, r in enumerate(out['recommended_indexes'], 1):
+>             cols = ','.join(r['columns'])
+>             lines.append(f"{i}. {r['table']}({cols}) - Impact: {r['impact_score']}, Cost: {r['cost']} [{r['reason']}]")
+>     else:
+>         lines.append('1. N/A - Impact: 0.0, Cost: 0.0 [none]')
+>
+>     lines.append('')
+>     lines.append('OPTIMIZATION SUMMARY:')
+>     lines.append(f'- Estimated total impact reduction: {total_impact}')
+>     lines.append(f'- Remaining budget: {r1(budget - used)} points')
+>     lines.append(f'- Tables optimized: {len(per_table)}')
+>
+>     with open(OUT_TXT, 'w') as f:
+>         f.write('\n'.join(lines) + '\n')
+>
+>
+> if __name__ == '__main__':
+>     main()
+> PY
+root@083c499aea35:/app# python3 /app/optimize.py
+root@083c499aea35:/app# python3 -c "import json;d=json.load(open('/app/optimization.json'));print('patterns',len(d['normalized_patterns']),'cands',len(d['index_
+candidates']),'corr',len(d['temporal_correlations']),'reco',len(d['recommended_indexes']));print('budget_used',d['total_budget_used'],'impact',d['total_impact']
+)"
+patterns 18 cands 17 corr 3 reco 5
+budget_used 973.9 impact 204.0
+root@083c499aea35:/app# head -n 80 /app/recommendations.txt
+ADVANCED MYSQL OPTIMIZATION ANALYSIS
+=====================================
+Total Slow Queries: 145
+Unique Query Patterns: 18
+Total Budget: 1000 points
+Budget Used: 973.9 points
+
+TOP QUERY PATTERNS (SORTED BY TOTAL TIME DESC):
+1. SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ? (Impact: 7.0, Freq: 14, Avg: 5.0s, Total: 69.5s)
+2. SELECT * FROM USERS WHERE EMAIL = ? (Impact: 59.8, Freq: 10, Avg: 6.1s, Total: 60.9s)
+3. SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID (Impact: 55.7, Freq: 10, Avg: 5.8s, Total: 57.5s)
+4. SELECT OI.* FROM ORDER_ITEMS OI JOIN ORDERS O ON OI.ORDER_ID... (Impact: 53.8, Freq: 8, Avg: 7.0s, Total: 56.0s)
+5. SELECT * FROM ORDERS WHERE STATUS IN (?) (Impact: 5.5, Freq: 13, Avg: 4.2s, Total: 54.1s)
+
+TEMPORAL CORRELATIONS:
+1. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE CREATED_AT > ? ORDER BY ID
+   - SELECT * FROM ORDERS WHERE STATUS = ?
+2. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE COUNTRY = ?
+3. Pattern Pair (Strength: 9):
+   - SELECT * FROM ORDERS WHERE STATUS IN (?)
+   - SELECT * FROM USERS WHERE STATUS = ? AND COUNTRY = ?
+
+RECOMMENDED INDEXES (5 max):
+1. users(email) - Impact: 59.7, Cost: 214.9 [high_impact]
+2. orders(id) - Impact: 55.2, Cost: 230.8 [high_impact]
+3. users(id) - Impact: 49.9, Cost: 214.6 [high_impact]
+4. products(id) - Impact: 33.8, Cost: 191.6 [high_impact]
+5. orders(status) - Impact: 5.4, Cost: 122.0 [high_impact]
+
+OPTIMIZATION SUMMARY:
+- Estimated total impact reduction: 204.0
+- Remaining budget: 26.1 points
+- Tables optimized: 4
+root@083c499aea35:/app# python3 -c "import json,math;d=json.load(open('/app/optimization.json'));assert d['total_budget_used']<=1000+1e-6;assert len(d['recommen
+ded_indexes'])<=5;from collections import Counter;ct=Counter([r['table'] for r in d['recommended_indexes']]);assert all(v<=2 for v in ct.values());print('basic
+validation ok')"
+basic validation ok
+root@083c499aea35:/app#

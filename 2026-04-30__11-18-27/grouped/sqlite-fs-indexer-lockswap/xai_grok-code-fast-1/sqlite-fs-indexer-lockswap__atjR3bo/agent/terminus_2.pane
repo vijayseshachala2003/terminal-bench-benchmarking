@@ -1,0 +1,110 @@
+[?2004hroot@5c8cab283b8d:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@5c8cab283b8d:/app# clear
+[?2004l[H[J[3J[?2004hroot@5c8cab283b8d:/app# cat /app/app/indexer.py
+[?2004l# Implement build_index here.
+
+def build_index(root_dir: str, db_path: str) -> None:
+    """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+    raise NotImplementedError
+[?2004hroot@5c8cab283b8d:/app# cat << 'EOF' > /app/app/indexer.py
+[?2004l[?2004h> import os
+[?2004l[?2004h> import sqlite3
+[?2004l[?2004h> import hashlib
+[?2004l[?2004h> import unicodedata
+[?2004l[?2004h> import fnmatch
+[?2004l[?2004h> 
+[?2004l[?2004h> def build_index(root_dir: str, db_path: str) -> None:
+[?2004l[?2004h>     """Walk root_dir, hash files, and store results in a SQLite database at db_path."""
+[?2004l[?2004h>     # Normalize root_dir
+[?2004l[?2004h>     root_dir = os.path.abspath(root_dir)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Read ignore patterns if file exists
+[?2004l[?2004h>     ignore_patterns = []
+[?2004l[?2004h>     ignore_path = '/data/ignore.txt'
+[?2004l[?2004h>     if os.path.exists(ignore_path):
+[?2004l[?2004h>         with open(ignore_path, 'r', encoding='utf-8') as f:
+[?2004l[?2004h>             for line in f:
+[?2004l[?2004h>                 line = line.strip()
+[?2004l[?2004h>                 if not line or line.startswith('#'):
+[?2004l[?2004h>                     continue
+[?2004l[?2004h>                 # Normalize pattern to NFC
+[?2004l[?2004h>                 ignore_patterns.append(unicodedata.normalize('NFC', line))
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Function to check if path should be ignored
+[?2004l[?2004h>     def should_ignore(nfc_rel_path: str) -> bool:
+[?2004l[?2004h>         for pattern in ignore_patterns:
+[?2004l[?2004h>             if '/' in pattern:
+[?2004l[?2004h>                 if pattern.startswith('/'):
+[?2004l[?2004h>                     # Match full path after stripping leading /
+[?2004l[?2004h>                     if nfc_rel_path == pattern[1:]:
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>                 else:
+[?2004l[?2004h>                     # Match full or suffix starting after /
+[?2004l[?2004h>                     if nfc_rel_path == pattern or nfc_rel_path.endswith('/' + pattern):
+[?2004l[?2004h>                         return True
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 # Match any component
+[?2004l[?2004h>                 components = nfc_rel_path.split('/')
+[?2004l[?2004h>                 if any(fnmatch.fnmatch(comp, pattern) for comp in components):
+[?2004l[?2004h>                     return True
+[?2004l[?2004h>         return False
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Collect all entries
+[?2004l[?2004h>     entries = {}
+[?2004l[?2004h>     for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
+[?2004l[?2004h>         # Remove symlinked dirs from dirnames to not traverse
+[?2004l[?2004h>         dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+[?2004l[?2004h>         for filename in filenames:
+[?2004l[?2004h>             full_path = os.path.join(dirpath, filename)
+[?2004l[?2004h>             if os.path.islink(full_path):
+[?2004l[?2004h>                 continue  # Ignore symlinks
+[?2004l[?2004h>             rel_path = os.path.relpath(full_path, root_dir).replace(os.sep, '/')
+[?2004l[?2004h>             original_rel = rel_path
+[?2004l[?2004h>             nfc_rel = unicodedata.normalize('NFC', rel_path)
+[?2004l[?2004h>             if should_ignore(nfc_rel):
+[?2004l[?2004h>                 continue
+[?2004l[?2004h>             size = os.path.getsize(full_path)
+[?2004l[?2004h>             # Hash the file
+[?2004l[?2004h>             with open(full_path, 'rb') as f:
+[?2004l[?2004h>                 hasher = hashlib.sha256()
+[?2004l[?2004h>                 while chunk := f.read(8192):
+[?2004l[?2004h>                     hasher.update(chunk)
+[?2004l[?2004h>                 sha256 = hasher.hexdigest()
+[?2004l[?2004h>             # Store: key by nfc_rel, value (original_rel, sha256, size)
+[?2004l[?2004h>             if nfc_rel not in entries or original_rel > entries[nfc_rel][0]:
+[?2004l[?2004h>                 entries[nfc_rel] = (original_rel, sha256, size)
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Sort entries by nfc_rel for determinism
+[?2004l[?2004h>     sorted_entries = sorted(entries.items())
+[?2004l[?2004h>     
+[?2004l[?2004h>     # Now, insert into database with concurrency handling
+[?2004l[?2004h>     max_retries = 10
+[?2004l[?2004h>     retry_delay = 0.1
+[?2004l[?2004h>     for attempt in range(max_retries):
+[?2004l[?2004h>         try:
+[?2004l[?2004h>             conn = sqlite3.connect(db_path, timeout=30.0)
+[?2004l[?2004h>             conn.execute('PRAGMA journal_mode=WAL')
+[?2004l[?2004h>             conn.execute('PRAGMA synchronous=NORMAL')
+[?2004l[?2004h>             conn.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL)')
+[?2004l[?2004h>             with conn:
+[?2004l[?2004h>                 conn.executemany('INSERT OR REPLACE INTO files (path, sha256, size) VALUES (?, ?, ?)', 
+[?2004l[?2004h>                                  [(nfc_path, data[1], data[2]) for nfc_path, data in sorted_entries])
+[?2004l[?2004h>             conn.close()
+[?2004l[?2004h>             break
+[?2004l[?2004h>         except sqlite3.OperationalError as e:
+[?2004l[?2004h>             if 'locked' in str(e).lower() and attempt < max_retries - 1:
+[?2004l[?2004h>                 import time
+[?2004l[?2004h>                 time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+[?2004l[?2004h>             else:
+[?2004l[?2004h>                 raise
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@5c8cab283b8d:/app# ls -la /app/app/
+[?2004ltotal 4
+drwxr-xr-x. 1 root root   24 Apr 30 09:49 .
+drwxr-xr-x. 1 root root   17 Apr 30 09:49 ..
+-rw-r--r--. 1 root root    0 Apr 30 09:49 __init__.py
+-rw-r--r--. 1 root root 3860 Apr 30 12:13 indexer.py
+[?2004hroot@5c8cab283b8d:/app# touch /app/app/__init__.py
+[?2004l[?2004hroot@5c8cab283b8d:/app# 
