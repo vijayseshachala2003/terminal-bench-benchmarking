@@ -10,7 +10,7 @@ Each run placed the agent inside a Docker container with a broken or incomplete 
 
 ## Tasks Evaluated
 
-All 11 tasks are sourced from [terminal-bench-samples](../../Documents/ML/terminal-bench_2.0/terminal-bench-samples). Each task has its own detailed README in the subdirectories below.
+All 11 tasks are included directly in this repository. No external dependencies or additional repos are required — everything needed to browse results is self-contained here. Each task has its own detailed README in the subdirectories below.
 
 | Task | Taxonomy |
 |------|----------|
