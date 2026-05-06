@@ -41,6 +41,8 @@ Four models were evaluated. Due to two separate job runs, Claude and Gemini resu
 
 > The April 30 run included all 4 models but its Claude and Gemini results were superseded by the cleaner May 5 re-run. GPT and Grok have no May 5 data, so their April 30 results are used as-is.
 
+<b>For Claude and Gemini trials, see `results/claude_gemini.json`. For Grok and ChatGPT trials, see `results/grok_chatgpt.json`.</B>
+
 ---
 
 ## How Results Were Computed
@@ -115,6 +117,8 @@ jobs_new/
 ├── post_sanity_results/              ← per-task post-sanity summaries (JSON)
 │   └── {task_name}.json
 ├── results/
+│   ├── claude_gemini.json            ← Claude & Gemini trial reference
+│   ├── grok_chatgpt.json             ← Grok & ChatGPT trial reference
 │   └── {task_name}/README.md         ← per-task breakdown (11 files)
 ├── 2026-04-30__11-18-27/
 │   ├── config.json                   ← job configuration
